@@ -463,7 +463,7 @@ def log_act_print(login, trip_id, shipment_id, client):
 
 
 # ============================================================
-# АКТ
+# АКТ — ФИО получателя берётся из поля «Клиент»
 # ============================================================
 
 def render_act_html(trip, shipment):
@@ -473,7 +473,6 @@ def render_act_html(trip, shipment):
     car_model = shipment.get("car_model", "")
     client = shipment.get("client", "")
 
-    RECEIVER_NAME = "Дубровина Дарья Ивановна"
     LINE_LONG = "_" * 30
     LINE_SHORT = "_" * 12
 
@@ -515,7 +514,7 @@ def render_act_html(trip, shipment):
              "</span> / Сагитдинов М.Н. /</p>")
 
     p.append('<p><b>Груз принял:</b> <span class="mono">' + LINE_LONG +
-             "</span> / " + RECEIVER_NAME + " /</p>")
+             "</span> / " + client + " /</p>")
 
     p.append('<p><b>Дата вручения груза:</b> <span class="mono">' + LINE_SHORT +
              '</span> &nbsp;&nbsp; <b>Время:</b> <span class="mono">' + LINE_SHORT + "</span></p>")
@@ -537,7 +536,6 @@ def render_act_text(trip, shipment):
     car_model = shipment.get("car_model", "")
     client = shipment.get("client", "")
 
-    RECEIVER_NAME = "Дубровина Дарья Ивановна"
     LINE_LONG = "_" * 30
     LINE_SHORT = "_" * 12
 
@@ -553,7 +551,7 @@ def render_act_text(trip, shipment):
         "Дата приема груза: " + LINE_SHORT + "   Время: " + LINE_SHORT,
         "",
         "Груз сдал: " + LINE_LONG + " / Сагитдинов М.Н. /",
-        "Груз принял: " + LINE_LONG + " / " + RECEIVER_NAME + " /",
+        "Груз принял: " + LINE_LONG + " / " + client + " /",
         "Дата вручения груза: " + LINE_SHORT + "   Время: " + LINE_SHORT,
         "",
         "При подписании акта приема-передачи на момент вручения груза Стороны каких-либо претензий друг к другу не имеют.",
@@ -866,7 +864,6 @@ def main_page():
 
                         st.markdown("</div>", unsafe_allow_html=True)
 
-                    # Итоги по рейсу
                     st.markdown("---")
                     sum_cols = st.columns(4)
                     sum_cols[0].markdown("**Сумма:** " + fmt_money(total))
