@@ -121,6 +121,10 @@ def to_float(s):
         return 0.0
 
 
+def fmt_money(x):
+    return "{:,}".format(int(to_float(x))).replace(",", " ")
+
+
 def parse_date_ui(s):
     if s is None:
         return ""
@@ -701,11 +705,21 @@ def main_page():
 
             cars = [s for s in shipments if str(s.get("trip_id")) == str(trip_id)]
             total = sum(to_float(c.get("amount")) for c in cars)
+            total_advance = sum(to_float(c.get("advance")) for c in cars)
+            total_debt = total - total_advance
 
             header = tractor + " — " + driver + " — " + route + " — выезд " + dep
             if ret:
                 header += " — возврат " + ret
-            with st.expander(header + "  |  авто: " + str(len(cars)) + "/8  |  сумма: " + str(int(total))):
+
+            summary = (
+                "авто: " + str(len(cars)) + "/8"
+                + "  |  сумма: " + fmt_money(total)
+                + "  |  аванс: " + fmt_money(total_advance)
+                + "  |  задолженность: " + fmt_money(total_debt)
+            )
+
+            with st.expander(header + "  |  " + summary):
 
                 c1, c2, c3, c4 = st.columns(4)
                 if can("create_ship", role):
@@ -822,9 +836,9 @@ def main_page():
                         row_cols[0].write(str(c.get("position", "")))
                         row_cols[1].write(str(c.get("car_model", "")))
                         row_cols[2].write(str(c.get("client", "")))
-                        row_cols[3].write(str(int(amount_val)))
-                        row_cols[4].write(str(int(advance_val)))
-                        row_cols[5].write(str(int(debt_val)))
+                        row_cols[3].write(fmt_money(amount_val))
+                        row_cols[4].write(fmt_money(advance_val))
+                        row_cols[5].write(fmt_money(debt_val))
                         row_cols[6].write(date_to_display_safe(c.get("advance_date", "")))
                         row_cols[7].write(str(c.get("pay_type", "")))
                         row_cols[8].write(str(c.get("paid_to", "")))
@@ -851,6 +865,14 @@ def main_page():
                                 st.rerun()
 
                         st.markdown("</div>", unsafe_allow_html=True)
+
+                    # Итоги по рейсу
+                    st.markdown("---")
+                    sum_cols = st.columns(4)
+                    sum_cols[0].markdown("**Сумма:** " + fmt_money(total))
+                    sum_cols[1].markdown("**Аванс:** " + fmt_money(total_advance))
+                    sum_cols[2].markdown("**Задолженность:** " + fmt_money(total_debt))
+                    sum_cols[3].markdown("**Авто:** " + str(len(cars)) + "/8")
 
                     for c in sorted(cars, key=lambda x: int(to_float(x.get("position")))):
                         if st.session_state.get("edit_ship_" + str(c["id"])):
