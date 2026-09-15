@@ -19,6 +19,7 @@ SHEET_SCHEMAS = {
               "date_departure", "date_return", "created_by", "created_at"],
     "shipments": ["id", "trip_id", "position", "car_model", "client",
                   "amount", "pay_type", "date_pay", "paid_to",
+                  "delivery_city", "vin",
                   "advance", "advance_date",
                   "created_by", "created_at", "issued"],
     "audit_log": ["id", "ts", "login", "role", "action", "details"],
@@ -364,6 +365,22 @@ def create_trip(tractor, driver, route, dep, ret, created_by):
     })
 
 
+def update_trip(trip_id, tractor, driver, route, dep, ret):
+    ws = get_ws_cached("trips")
+    all_rows = ws.get_all_values()
+    headers = SHEET_SCHEMAS["trips"]
+    last_col = chr(64 + len(headers))
+    for i, row in enumerate(all_rows[1:], start=2):
+        if str(row[0]) == str(trip_id):
+            created_by = row[6] if len(row) > 6 else ""
+            created_at = row[7] if len(row) > 7 else ""
+            new_row = [trip_id, tractor, driver, route, dep, ret, created_by, created_at]
+            ws.update("A" + str(i) + ":" + last_col + str(i), [new_row])
+            invalidate_cache("trips")
+            return True
+    return False
+
+
 def delete_trip(trip_id):
     ws = get_ws_cached("trips")
     all_rows = ws.get_all_values()
@@ -384,7 +401,8 @@ def delete_trip(trip_id):
 
 
 def create_shipment(trip_id, position, car_model, client, amount, pay_type,
-                    date_pay, paid_to, advance, advance_date, created_by):
+                    date_pay, paid_to, delivery_city, vin,
+                    advance, advance_date, created_by):
     append_row("shipments", {
         "id": next_id("shipments"),
         "trip_id": trip_id,
@@ -395,6 +413,8 @@ def create_shipment(trip_id, position, car_model, client, amount, pay_type,
         "pay_type": pay_type,
         "date_pay": date_pay,
         "paid_to": paid_to,
+        "delivery_city": delivery_city,
+        "vin": vin,
         "advance": advance,
         "advance_date": advance_date,
         "created_by": created_by,
@@ -404,7 +424,7 @@ def create_shipment(trip_id, position, car_model, client, amount, pay_type,
 
 
 def update_shipment(shipment_id, position, car_model, client, amount, pay_type,
-                    date_pay, paid_to, advance, advance_date):
+                    date_pay, paid_to, delivery_city, vin, advance, advance_date):
     ws = get_ws_cached("shipments")
     all_rows = ws.get_all_values()
     headers = SHEET_SCHEMAS["shipments"]
@@ -412,13 +432,15 @@ def update_shipment(shipment_id, position, car_model, client, amount, pay_type,
     for i, row in enumerate(all_rows[1:], start=2):
         if str(row[0]) == str(shipment_id):
             trip_id = row[1] if len(row) > 1 else ""
-            created_by = row[11] if len(row) > 11 else ""
-            created_at = row[12] if len(row) > 12 else ""
-            issued_val = row[13] if len(row) > 13 else "0"
+            created_by = row[13] if len(row) > 13 else ""
+            created_at = row[14] if len(row) > 14 else ""
+            issued_val = row[15] if len(row) > 15 else "0"
             new_row = [
                 shipment_id, trip_id, position, car_model, client,
                 amount, pay_type, date_pay, paid_to,
-                advance, advance_date, created_by, created_at, issued_val,
+                delivery_city, vin,
+                advance, advance_date,
+                created_by, created_at, issued_val,
             ]
             ws.update("A" + str(i) + ":" + last_col + str(i), [new_row])
             invalidate_cache("shipments")
@@ -432,7 +454,7 @@ def toggle_issued(shipment_id, current_value):
     for i, row in enumerate(all_rows[1:], start=2):
         if str(row[0]) == str(shipment_id):
             new_val = "0" if str(current_value) == "1" else "1"
-            ws.update_cell(i, 14, new_val)
+            ws.update_cell(i, 16, new_val)
             invalidate_cache("shipments")
             return new_val
     return current_value
@@ -463,7 +485,7 @@ def log_act_print(login, trip_id, shipment_id, client):
 
 
 # ============================================================
-# АКТ — ФИО получателя берётся из поля «Клиент»
+# АКТ
 # ============================================================
 
 def render_act_html(trip, shipment):
@@ -472,6 +494,7 @@ def render_act_html(trip, shipment):
     route = trip.get("route", "")
     car_model = shipment.get("car_model", "")
     client = shipment.get("client", "")
+    vin = str(shipment.get("vin", ""))[:17]
 
     LINE_LONG = "_" * 30
     LINE_SHORT = "_" * 12
@@ -501,6 +524,10 @@ def render_act_html(trip, shipment):
     p.append("<p><b>Заказчик / Получатель:</b> " + client + "</p>")
     p.append("<p><b>Марка автомобиля:</b> " + car_model +
              " &nbsp;&nbsp; <b>Гос номер тягача:</b> " + tractor + "</p>")
+
+    if vin:
+        p.append("<p><b>VIN:</b> " + vin + "</p>")
+
     p.append("<p><b>Водитель:</b> " + driver +
              " &nbsp;&nbsp; <b>Маршрут:</b> " + route + "</p>")
 
@@ -535,6 +562,7 @@ def render_act_text(trip, shipment):
     route = trip.get("route", "")
     car_model = shipment.get("car_model", "")
     client = shipment.get("client", "")
+    vin = str(shipment.get("vin", ""))[:17]
 
     LINE_LONG = "_" * 30
     LINE_SHORT = "_" * 12
@@ -545,6 +573,10 @@ def render_act_text(trip, shipment):
         "Перевозчик: ИП Сагитдинов Максим Наильевич, тел. 8-987-131-00-62",
         "Заказчик / Получатель: " + client,
         "Марка автомобиля: " + car_model + "   Гос номер тягача: " + tractor,
+    ]
+    if vin:
+        lines.append("VIN: " + vin)
+    lines.extend([
         "Водитель: " + driver + "   Маршрут: " + route,
         "",
         "Дата выдачи: " + LINE_LONG + "   Место приемки: " + LINE_LONG,
@@ -555,7 +587,7 @@ def render_act_text(trip, shipment):
         "Дата вручения груза: " + LINE_SHORT + "   Время: " + LINE_SHORT,
         "",
         "При подписании акта приема-передачи на момент вручения груза Стороны каких-либо претензий друг к другу не имеют.",
-    ]
+    ])
     return "\n".join(lines)
 
 
@@ -723,9 +755,46 @@ def main_page():
                 if can("create_ship", role):
                     if c1.button("Добавить авто", key="btn_show_addcar_" + str(trip_id)):
                         st.session_state["open_addcar_" + str(trip_id)] = True
+                if can("edit_trip", role):
+                    if c2.button("Редактировать рейс", key="btn_show_edittrip_" + str(trip_id)):
+                        st.session_state["open_edittrip_" + str(trip_id)] = True
                 if can("delete_trip", role):
                     if c4.button("Удалить рейс", key="btn_show_deltrip_" + str(trip_id)):
                         st.session_state["open_deltrip_" + str(trip_id)] = True
+
+                # Форма редактирования рейса
+                if st.session_state.get("open_edittrip_" + str(trip_id)):
+                    with st.form("edit_trip_" + str(trip_id)):
+                        st.markdown("**Редактировать рейс**")
+                        ec1, ec2 = st.columns(2)
+                        e_tractor = ec1.text_input("Гос номер тягача", value=tractor)
+                        e_driver = ec2.text_input("Водитель ФИО", value=driver)
+                        ec3, ec4 = st.columns(2)
+                        e_route = ec3.text_input("Маршрут", value=route)
+                        e_dep = ec4.text_input("Дата выезда (ДД.ММ.ГГГГ)", value=dep)
+                        ec5, ec6 = st.columns(2)
+                        e_ret = ec5.text_input("Дата возвращения (можно пусто)", value=ret)
+                        e_ok = st.form_submit_button("Сохранить рейс")
+                        e_cancel = st.form_submit_button("Отмена")
+                    if e_cancel:
+                        st.session_state.pop("open_edittrip_" + str(trip_id), None)
+                        st.rerun()
+                    if e_ok:
+                        if not e_tractor or not e_driver or not e_dep:
+                            st.error("Заполните: гос номер, водителя, дату выезда")
+                        else:
+                            try:
+                                e_dep_fmt = parse_date_ui(e_dep)
+                                e_ret_fmt = parse_date_ui(e_ret)
+                            except ValueError as ex:
+                                st.error(str(ex))
+                            else:
+                                update_trip(trip_id, e_tractor, e_driver, e_route, e_dep_fmt, e_ret_fmt)
+                                log_action(u["login"], role, "edit_trip",
+                                           e_tractor + " " + e_driver + " " + e_dep_fmt)
+                                st.session_state.pop("open_edittrip_" + str(trip_id), None)
+                                st.success("Рейс обновлён")
+                                st.rerun()
 
                 if st.session_state.get("open_deltrip_" + str(trip_id)):
                     st.warning("Удалить рейс «" + tractor + " — " + driver + "» вместе со всеми авто?")
@@ -749,16 +818,19 @@ def main_page():
                         car_model = cc2.text_input("Марка / модель авто")
                         cc3, cc4 = st.columns(2)
                         client = cc3.text_input("ФИО клиента")
-                        amount = cc4.text_input("Сумма за перевозку")
+                        vin = cc4.text_input("VIN (до 17 символов)")
+                        cc_city = st.text_input("Город доставки")
                         cc5, cc6 = st.columns(2)
-                        pay_type = cc5.selectbox("Тип оплаты", ["нал", "эквайринг"])
-                        date_pay = cc6.text_input("Дата оплаты (ДД.ММ.ГГГГ)",
-                                                  placeholder="15.05.2026")
-                        paid_to = st.text_input("Кому произведён перевод")
+                        amount = cc5.text_input("Сумма за перевозку")
+                        pay_type = cc6.selectbox("Тип оплаты", ["нал", "эквайринг"])
                         cc7, cc8 = st.columns(2)
-                        advance = cc7.text_input("Аванс (сумма)")
-                        advance_date = cc8.text_input("Дата аванса (ДД.ММ.ГГГГ)",
-                                                      placeholder="10.05.2026")
+                        date_pay = cc7.text_input("Дата оплаты (ДД.ММ.ГГГГ)",
+                                                  placeholder="15.05.2026")
+                        paid_to = cc8.text_input("Кому произведён перевод")
+                        cc9, cc10 = st.columns(2)
+                        advance = cc9.text_input("Аванс (сумма)")
+                        advance_date = cc10.text_input("Дата аванса (ДД.ММ.ГГГГ)",
+                                                       placeholder="10.05.2026")
                         ok = st.form_submit_button("Сохранить авто")
                         cancel = st.form_submit_button("Отмена")
                     if cancel:
@@ -779,6 +851,7 @@ def main_page():
                                 create_shipment(
                                     trip_id, position, car_model, client,
                                     to_float(amount), pay_type, dp, paid_to,
+                                    delivery_city, str(vin)[:17],
                                     to_float(advance), dpa,
                                     u["login"])
                                 log_action(u["login"], role, "create_ship",
@@ -790,20 +863,21 @@ def main_page():
                 if cars:
                     st.markdown("**Список автомобилей в рейсе**")
 
-                    hc = st.columns([1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1])
+                    hc = st.columns([1, 3, 3, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1])
                     hc[0].markdown("**№**")
                     hc[1].markdown("**Марка / модель**")
                     hc[2].markdown("**Клиент**")
-                    hc[3].markdown("**Сумма**")
-                    hc[4].markdown("**Аванс**")
-                    hc[5].markdown("**Задолженность**")
-                    hc[6].markdown("**Дата аванса**")
-                    hc[7].markdown("**Оплата**")
-                    hc[8].markdown("**Кому перевод**")
-                    hc[9].markdown("**Выдан**")
-                    hc[10].markdown("**Акт**")
-                    hc[11].markdown("**✏**")
-                    hc[12].markdown("**🗑**")
+                    hc[3].markdown("**VIN**")
+                    hc[4].markdown("**Сумма**")
+                    hc[5].markdown("**Аванс**")
+                    hc[6].markdown("**Задолж.**")
+                    hc[7].markdown("**Город доставки**")
+                    hc[8].markdown("**Дата аванса**")
+                    hc[9].markdown("**Оплата**")
+                    hc[10].markdown("**Кому перевод**")
+                    hc[11].markdown("**Выдан**")
+                    hc[12].markdown("**Акт**")
+                    hc[13].markdown("**✏ 🗑**")
 
                     for c in sorted(cars, key=lambda x: int(to_float(x.get("position")))):
                         amount_val = to_float(c.get("amount"))
@@ -830,33 +904,35 @@ def main_page():
                             unsafe_allow_html=True
                         )
 
-                        row_cols = st.columns([1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1])
+                        row_cols = st.columns([1, 3, 3, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1])
                         row_cols[0].write(str(c.get("position", "")))
                         row_cols[1].write(str(c.get("car_model", "")))
                         row_cols[2].write(str(c.get("client", "")))
-                        row_cols[3].write(fmt_money(amount_val))
-                        row_cols[4].write(fmt_money(advance_val))
-                        row_cols[5].write(fmt_money(debt_val))
-                        row_cols[6].write(date_to_display_safe(c.get("advance_date", "")))
-                        row_cols[7].write(str(c.get("pay_type", "")))
-                        row_cols[8].write(str(c.get("paid_to", "")))
+                        row_cols[3].write(str(c.get("vin", ""))[:17])
+                        row_cols[4].write(fmt_money(amount_val))
+                        row_cols[5].write(fmt_money(advance_val))
+                        row_cols[6].write(fmt_money(debt_val))
+                        row_cols[7].write(str(c.get("delivery_city", "")))
+                        row_cols[8].write(date_to_display_safe(c.get("advance_date", "")))
+                        row_cols[9].write(str(c.get("pay_type", "")))
+                        row_cols[10].write(str(c.get("paid_to", "")))
 
                         issued_label = "Снять" if is_issued else "Выдан"
-                        if row_cols[9].button(issued_label, key="btn_issued_" + str(c["id"])):
+                        if row_cols[11].button(issued_label, key="btn_issued_" + str(c["id"])):
                             toggle_issued(c["id"], issued_val)
                             log_action(u["login"], role, "toggle_issued",
                                        "рейс " + str(trip_id) + ", поз " + str(c.get("position")))
                             st.rerun()
 
-                        if row_cols[10].button("Акт", key="btn_act_inline_" + str(c["id"])):
+                        if row_cols[12].button("Акт", key="btn_act_inline_" + str(c["id"])):
                             st.session_state["show_act_for"] = c["id"]
                             st.rerun()
 
-                        if row_cols[11].button("✏", key="btn_edit_" + str(c["id"])):
+                        if row_cols[13].button("✏", key="btn_edit_" + str(c["id"])):
                             st.session_state["edit_ship_" + str(c["id"])] = True
 
                         if can("delete_ship", role):
-                            if row_cols[12].button("🗑", key="btn_delship_" + str(c["id"])):
+                            if row_cols[13].button("🗑", key="btn_delship_" + str(c["id"])):
                                 delete_shipment(c["id"])
                                 log_action(u["login"], role, "delete_ship",
                                            "рейс " + str(trip_id) + ", поз " + str(c.get("position")))
@@ -887,27 +963,34 @@ def main_page():
                                 e_client = ec3.text_input("ФИО клиента",
                                                           value=c.get("client", ""),
                                                           key="ecli_" + str(c["id"]))
-                                e_amount = ec4.text_input("Сумма за перевозку",
+                                e_vin = ec4.text_input("VIN (до 17 символов)",
+                                                       value=str(c.get("vin", ""))[:17],
+                                                       key="evin_" + str(c["id"]))
+                                e_city = st.text_input("Город доставки",
+                                                       value=c.get("delivery_city", ""),
+                                                       key="ecity_" + str(c["id"]))
+                                ec5, ec6 = st.columns(2)
+                                e_amount = ec5.text_input("Сумма за перевозку",
                                                           value=str(int(to_float(c.get("amount")))),
                                                           key="eamt_" + str(c["id"]))
-                                ec5, ec6 = st.columns(2)
-                                e_pay_type = ec5.selectbox(
+                                e_pay_type = ec6.selectbox(
                                     "Тип оплаты", ["нал", "эквайринг"],
                                     index=0 if c.get("pay_type") != "эквайринг" else 1,
                                     key="ept_" + str(c["id"]))
-                                e_date_pay = ec6.text_input(
+                                ec7, ec8 = st.columns(2)
+                                e_date_pay = ec7.text_input(
                                     "Дата оплаты (ДД.ММ.ГГГГ)",
                                     value=date_to_display_safe(c.get("date_pay", "")),
                                     key="edp_" + str(c["id"]))
-                                e_paid_to = st.text_input("Кому произведён перевод",
-                                                          value=c.get("paid_to", ""),
-                                                          key="epto_" + str(c["id"]))
-                                ec7, ec8 = st.columns(2)
-                                e_advance = ec7.text_input(
+                                e_paid_to = ec8.text_input("Кому произведён перевод",
+                                                           value=c.get("paid_to", ""),
+                                                           key="epto_" + str(c["id"]))
+                                ec9, ec10 = st.columns(2)
+                                e_advance = ec9.text_input(
                                     "Аванс (сумма)",
                                     value=str(int(to_float(c.get("advance")))),
                                     key="eadv_" + str(c["id"]))
-                                e_advance_date = ec8.text_input(
+                                e_advance_date = ec10.text_input(
                                     "Дата аванса (ДД.ММ.ГГГГ)",
                                     value=date_to_display_safe(c.get("advance_date", "")),
                                     key="eadvd_" + str(c["id"]))
@@ -930,6 +1013,7 @@ def main_page():
                                         update_shipment(
                                             c["id"], e_position, e_car_model, e_client,
                                             to_float(e_amount), e_pay_type, e_dp, e_paid_to,
+                                            e_city, str(e_vin)[:17],
                                             to_float(e_advance), e_dpa)
                                         log_action(u["login"], role, "edit_ship",
                                                    "рейс " + str(trip_id) + ", поз " + str(e_position))
