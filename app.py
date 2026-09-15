@@ -485,7 +485,7 @@ def log_act_print(login, trip_id, shipment_id, client):
 
 
 # ============================================================
-# АКТ
+# АКТ — с обязательной строкой VIN
 # ============================================================
 
 def render_act_html(trip, shipment):
@@ -494,7 +494,7 @@ def render_act_html(trip, shipment):
     route = trip.get("route", "")
     car_model = shipment.get("car_model", "")
     client = shipment.get("client", "")
-    vin = str(shipment.get("vin", ""))[:17]
+    vin = str(shipment.get("vin", "")).strip()[:17]
 
     LINE_LONG = "_" * 30
     LINE_SHORT = "_" * 12
@@ -525,8 +525,7 @@ def render_act_html(trip, shipment):
     p.append("<p><b>Марка автомобиля:</b> " + car_model +
              " &nbsp;&nbsp; <b>Гос номер тягача:</b> " + tractor + "</p>")
 
-    if vin:
-        p.append("<p><b>VIN:</b> " + vin + "</p>")
+    p.append("<p><b>VIN:</b> " + (vin if vin else "_" * 20) + "</p>")
 
     p.append("<p><b>Водитель:</b> " + driver +
              " &nbsp;&nbsp; <b>Маршрут:</b> " + route + "</p>")
@@ -562,7 +561,7 @@ def render_act_text(trip, shipment):
     route = trip.get("route", "")
     car_model = shipment.get("car_model", "")
     client = shipment.get("client", "")
-    vin = str(shipment.get("vin", ""))[:17]
+    vin = str(shipment.get("vin", "")).strip()[:17]
 
     LINE_LONG = "_" * 30
     LINE_SHORT = "_" * 12
@@ -573,10 +572,7 @@ def render_act_text(trip, shipment):
         "Перевозчик: ИП Сагитдинов Максим Наильевич, тел. 8-987-131-00-62",
         "Заказчик / Получатель: " + client,
         "Марка автомобиля: " + car_model + "   Гос номер тягача: " + tractor,
-    ]
-    if vin:
-        lines.append("VIN: " + vin)
-    lines.extend([
+        "VIN: " + (vin if vin else "_" * 20),
         "Водитель: " + driver + "   Маршрут: " + route,
         "",
         "Дата выдачи: " + LINE_LONG + "   Место приемки: " + LINE_LONG,
@@ -587,7 +583,7 @@ def render_act_text(trip, shipment):
         "Дата вручения груза: " + LINE_SHORT + "   Время: " + LINE_SHORT,
         "",
         "При подписании акта приема-передачи на момент вручения груза Стороны каких-либо претензий друг к другу не имеют.",
-    ])
+    ]
     return "\n".join(lines)
 
 
@@ -762,7 +758,6 @@ def main_page():
                     if c4.button("Удалить рейс", key="btn_show_deltrip_" + str(trip_id)):
                         st.session_state["open_deltrip_" + str(trip_id)] = True
 
-                # Форма редактирования рейса
                 if st.session_state.get("open_edittrip_" + str(trip_id)):
                     with st.form("edit_trip_" + str(trip_id)):
                         st.markdown("**Редактировать рейс**")
@@ -863,7 +858,7 @@ def main_page():
                 if cars:
                     st.markdown("**Список автомобилей в рейсе**")
 
-                    hc = st.columns([1, 3, 3, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1])
+                    hc = st.columns([1, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1])
                     hc[0].markdown("**№**")
                     hc[1].markdown("**Марка / модель**")
                     hc[2].markdown("**Клиент**")
@@ -877,7 +872,8 @@ def main_page():
                     hc[10].markdown("**Кому перевод**")
                     hc[11].markdown("**Выдан**")
                     hc[12].markdown("**Акт**")
-                    hc[13].markdown("**✏ 🗑**")
+                    hc[13].markdown("**✏**")
+                    hc[14].markdown("**🗑**")
 
                     for c in sorted(cars, key=lambda x: int(to_float(x.get("position")))):
                         amount_val = to_float(c.get("amount"))
@@ -904,7 +900,7 @@ def main_page():
                             unsafe_allow_html=True
                         )
 
-                        row_cols = st.columns([1, 3, 3, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1])
+                        row_cols = st.columns([1, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1])
                         row_cols[0].write(str(c.get("position", "")))
                         row_cols[1].write(str(c.get("car_model", "")))
                         row_cols[2].write(str(c.get("client", "")))
@@ -932,7 +928,7 @@ def main_page():
                             st.session_state["edit_ship_" + str(c["id"])] = True
 
                         if can("delete_ship", role):
-                            if row_cols[13].button("🗑", key="btn_delship_" + str(c["id"])):
+                            if row_cols[14].button("🗑", key="btn_delship_" + str(c["id"])):
                                 delete_shipment(c["id"])
                                 log_action(u["login"], role, "delete_ship",
                                            "рейс " + str(trip_id) + ", поз " + str(c.get("position")))
