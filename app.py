@@ -20,7 +20,7 @@ SHEET_SCHEMAS = {
     "shipments": ["id", "trip_id", "position", "car_model", "client",
                   "amount", "pay_type", "date_pay", "paid_to",
                   "advance", "advance_date",
-                  "created_by", "created_at"],
+                  "created_by", "created_at", "issued"],
     "audit_log": ["id", "ts", "login", "role", "action", "details"],
     "act_log": ["id", "ts", "login", "trip_id", "shipment_id", "client"],
 }
@@ -395,6 +395,7 @@ def create_shipment(trip_id, position, car_model, client, amount, pay_type,
         "advance_date": advance_date,
         "created_by": created_by,
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "issued": "0",
     })
 
 
@@ -409,15 +410,28 @@ def update_shipment(shipment_id, position, car_model, client, amount, pay_type,
             trip_id = row[1] if len(row) > 1 else ""
             created_by = row[11] if len(row) > 11 else ""
             created_at = row[12] if len(row) > 12 else ""
+            issued_val = row[13] if len(row) > 13 else "0"
             new_row = [
                 shipment_id, trip_id, position, car_model, client,
                 amount, pay_type, date_pay, paid_to,
-                advance, advance_date, created_by, created_at,
+                advance, advance_date, created_by, created_at, issued_val,
             ]
             ws.update("A" + str(i) + ":" + last_col + str(i), [new_row])
             invalidate_cache("shipments")
             return True
     return False
+
+
+def toggle_issued(shipment_id, current_value):
+    ws = get_ws_cached("shipments")
+    all_rows = ws.get_all_values()
+    for i, row in enumerate(all_rows[1:], start=2):
+        if str(row[0]) == str(shipment_id):
+            new_val = "0" if str(current_value) == "1" else "1"
+            ws.update_cell(i, 14, new_val)
+            invalidate_cache("shipments")
+            return new_val
+    return current_value
 
 
 def delete_shipment(shipment_id):
@@ -445,7 +459,7 @@ def log_act_print(login, trip_id, shipment_id, client):
 
 
 # ============================================================
-# АКТ — Times New Roman 14pt, укороченные линии
+# АКТ
 # ============================================================
 
 def render_act_html(trip, shipment):
@@ -763,24 +777,48 @@ def main_page():
 
                 if cars:
                     st.markdown("**Список автомобилей в рейсе**")
-                    header_cols = st.columns([1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1])
-                    header_cols[0].markdown("**№**")
-                    header_cols[1].markdown("**Марка / модель**")
-                    header_cols[2].markdown("**Клиент**")
-                    header_cols[3].markdown("**Сумма**")
-                    header_cols[4].markdown("**Аванс**")
-                    header_cols[5].markdown("**Задолженность**")
-                    header_cols[6].markdown("**Дата аванса**")
-                    header_cols[7].markdown("**Оплата**")
-                    header_cols[8].markdown("**Кому перевод**")
-                    header_cols[9].markdown("**Акт**")
-                    header_cols[10].markdown("**✏**")
+
+                    hc = st.columns([1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1])
+                    hc[0].markdown("**№**")
+                    hc[1].markdown("**Марка / модель**")
+                    hc[2].markdown("**Клиент**")
+                    hc[3].markdown("**Сумма**")
+                    hc[4].markdown("**Аванс**")
+                    hc[5].markdown("**Задолженность**")
+                    hc[6].markdown("**Дата аванса**")
+                    hc[7].markdown("**Оплата**")
+                    hc[8].markdown("**Кому перевод**")
+                    hc[9].markdown("**Выдан**")
+                    hc[10].markdown("**Акт**")
+                    hc[11].markdown("**✏**")
+                    hc[12].markdown("**🗑**")
 
                     for c in sorted(cars, key=lambda x: int(to_float(x.get("position")))):
-                        row_cols = st.columns([1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1])
                         amount_val = to_float(c.get("amount"))
                         advance_val = to_float(c.get("advance"))
                         debt_val = amount_val - advance_val
+                        issued_val = str(c.get("issued", "0")).strip()
+                        is_issued = issued_val in ("1", "1.0", "true", "True")
+                        has_debt = debt_val > 0
+
+                        if is_issued:
+                            bg = "#c8e6c9"
+                            bd = "#4caf50"
+                        elif has_debt:
+                            bg = "#ffcdd2"
+                            bd = "#f44336"
+                        else:
+                            bg = "#ffffff"
+                            bd = "#dddddd"
+
+                        st.markdown(
+                            '<div style="background-color:' + bg +
+                            '; border:1px solid ' + bd +
+                            '; border-radius:6px; padding:6px; margin-bottom:4px;">',
+                            unsafe_allow_html=True
+                        )
+
+                        row_cols = st.columns([1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1])
                         row_cols[0].write(str(c.get("position", "")))
                         row_cols[1].write(str(c.get("car_model", "")))
                         row_cols[2].write(str(c.get("client", "")))
@@ -790,11 +828,29 @@ def main_page():
                         row_cols[6].write(date_to_display_safe(c.get("advance_date", "")))
                         row_cols[7].write(str(c.get("pay_type", "")))
                         row_cols[8].write(str(c.get("paid_to", "")))
-                        if row_cols[9].button("Акт", key="btn_act_inline_" + str(c["id"])):
+
+                        issued_label = "Снять" if is_issued else "Выдан"
+                        if row_cols[9].button(issued_label, key="btn_issued_" + str(c["id"])):
+                            toggle_issued(c["id"], issued_val)
+                            log_action(u["login"], role, "toggle_issued",
+                                       "рейс " + str(trip_id) + ", поз " + str(c.get("position")))
+                            st.rerun()
+
+                        if row_cols[10].button("Акт", key="btn_act_inline_" + str(c["id"])):
                             st.session_state["show_act_for"] = c["id"]
                             st.rerun()
-                        if row_cols[10].button("✏", key="btn_edit_" + str(c["id"])):
+
+                        if row_cols[11].button("✏", key="btn_edit_" + str(c["id"])):
                             st.session_state["edit_ship_" + str(c["id"])] = True
+
+                        if can("delete_ship", role):
+                            if row_cols[12].button("🗑", key="btn_delship_" + str(c["id"])):
+                                delete_shipment(c["id"])
+                                log_action(u["login"], role, "delete_ship",
+                                           "рейс " + str(trip_id) + ", поз " + str(c.get("position")))
+                                st.rerun()
+
+                        st.markdown("</div>", unsafe_allow_html=True)
 
                     for c in sorted(cars, key=lambda x: int(to_float(x.get("position")))):
                         if st.session_state.get("edit_ship_" + str(c["id"])):
@@ -861,18 +917,6 @@ def main_page():
                                         st.session_state.pop("edit_ship_" + str(c["id"]), None)
                                         st.success("Изменения сохранены")
                                         st.rerun()
-
-                    if can("delete_ship", role):
-                        st.markdown("**Удалить авто:**")
-                        del_cols = st.columns(min(len(cars), 4))
-                        for idx, c in enumerate(sorted(cars, key=lambda x: int(to_float(x.get("position"))))):
-                            if del_cols[idx % 4].button(
-                                    "Удалить поз. " + str(c.get("position")),
-                                    key="btn_delship_" + str(c["id"])):
-                                delete_shipment(c["id"])
-                                log_action(u["login"], role, "delete_ship",
-                                           "рейс " + str(trip_id) + ", поз " + str(c.get("position")))
-                                st.rerun()
 
                     if can("create_ship", role) and len(cars) < 8:
                         if st.button("Добавить еще авто (позиция " + str(len(cars)+1) + ")",
