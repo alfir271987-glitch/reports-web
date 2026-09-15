@@ -819,7 +819,7 @@ def main_page():
                         cc3, cc4 = st.columns(2)
                         client = cc3.text_input("ФИО клиента")
                         vin = cc4.text_input("VIN (до 17 символов)")
-                        cc_city = st.text_input("Город доставки")
+                        delivery_city = st.text_input("Город доставки")
                         cc5, cc6 = st.columns(2)
                         amount = cc5.text_input("Сумма за перевозку")
                         pay_type = cc6.selectbox("Тип оплаты", ["нал", "эквайринг"])
