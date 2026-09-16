@@ -634,7 +634,7 @@ def render_act_text(trip, shipment):
         "",
         "",
         "Груз сдал: " + LINE_LONG + " / Сагитдинов М.Н. /",
-        "Груз принят: " + LINE_LONG + " / " + receiver + " /",
+        "Груз принял: " + LINE_LONG + " / " + receiver + " /",
         "",
         "",
         "Дата вручения груза: " + LINE_SHORT + "   Время: " + LINE_SHORT,
@@ -676,11 +676,10 @@ def show_act(trip, shipment):
 
 
 # ============================================================
-# ФОРМА АВТО — вынесена отдельно, с уникальными ключами
+# ФОРМА АВТО — с уникальным ключом формы
 # ============================================================
 
 def render_shipment_form(form_key, c=None, submit_label="Сохранить авто"):
-    """Рендерит форму авто целиком внутри st.form с уникальным form_key."""
     defaults = {
         "position": 1,
         "car_model": "",
@@ -1012,7 +1011,6 @@ def main_page():
                         st.session_state.pop("open_deltrip_" + str(trip_id), None)
                         st.rerun()
 
-                # Форма ДОБАВЛЕНИЯ авто
                 if view_mode == "active" and st.session_state.get("open_addcar_" + str(trip_id)):
                     form_key = "newcar_" + str(trip_id)
                     f = render_shipment_form(form_key, c=None, submit_label="Сохранить авто")
@@ -1051,7 +1049,8 @@ def main_page():
                 if cars:
                     st.markdown("**Список автомобилей в рейсе**")
 
-                    hc = st.columns([1, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1])
+                    # заголовок таблицы — 19 колонок, добавлена "Кому перевод"
+                    hc = st.columns([1, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1])
                     hc[0].markdown("**№**")
                     hc[1].markdown("**Марка / модель**")
                     hc[2].markdown("**Клиент**")
@@ -1062,14 +1061,15 @@ def main_page():
                     hc[7].markdown("**Город доставки**")
                     hc[8].markdown("**Дата аванса**")
                     hc[9].markdown("**Способ оплаты**")
-                    hc[10].markdown("**Заказчик**")
-                    hc[11].markdown("**№ договора**")
-                    hc[12].markdown("**СДЭК**")
-                    hc[13].markdown("**НДС 22%**")
-                    hc[14].markdown("**Выдан**")
-                    hc[15].markdown("**Акт**")
-                    hc[16].markdown("**✏**")
-                    hc[17].markdown("**🗑**")
+                    hc[10].markdown("**Кому перевод**")
+                    hc[11].markdown("**Заказчик**")
+                    hc[12].markdown("**№ договора**")
+                    hc[13].markdown("**СДЭК**")
+                    hc[14].markdown("**НДС 22%**")
+                    hc[15].markdown("**Выдан**")
+                    hc[16].markdown("**Акт**")
+                    hc[17].markdown("**✏**")
+                    hc[18].markdown("**🗑**")
 
                     for c in sorted(cars, key=lambda x: int(to_float(x.get("position")))):
                         amount_val = to_float(c.get("amount"))
@@ -1097,7 +1097,7 @@ def main_page():
                             unsafe_allow_html=True
                         )
 
-                        row_cols = st.columns([1, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1])
+                        row_cols = st.columns([1, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1])
                         row_cols[0].write(str(c.get("position", "")))
                         row_cols[1].write(str(c.get("car_model", "")))
                         row_cols[2].write(str(c.get("client", "")))
@@ -1108,33 +1108,34 @@ def main_page():
                         row_cols[7].write(str(c.get("delivery_city", "")))
                         row_cols[8].write(date_to_display_safe(c.get("advance_date", "")))
                         row_cols[9].write(str(c.get("payer_type", "")))
-                        row_cols[10].write(str(c.get("customer", "")))
-                        row_cols[11].write(str(c.get("contract_number", "")))
+                        row_cols[10].write(str(c.get("paid_to", "")))
+                        row_cols[11].write(str(c.get("customer", "")))
+                        row_cols[12].write(str(c.get("contract_number", "")))
                         cdek_info = str(c.get("cdek_track", ""))
                         if c.get("cdek_date"):
                             cdek_info += " / " + date_to_display_safe(c.get("cdek_date"))
-                        row_cols[12].write(cdek_info)
-                        row_cols[13].write(fmt_money(nds_val) if nds_val > 0 else "—")
+                        row_cols[13].write(cdek_info)
+                        row_cols[14].write(fmt_money(nds_val) if nds_val > 0 else "—")
 
                         if view_mode == "active":
                             issued_label = "Снять" if is_issued else "Выдан"
-                            if row_cols[14].button(issued_label, key="btn_issued_" + str(c["id"])):
+                            if row_cols[15].button(issued_label, key="btn_issued_" + str(c["id"])):
                                 toggle_issued(c["id"], issued_val)
                                 log_action(u["login"], role, "toggle_issued",
                                            "рейс " + str(trip_id) + ", поз " + str(c.get("position")))
                                 st.rerun()
                         else:
-                            row_cols[14].write("—")
+                            row_cols[15].write("—")
 
-                        if row_cols[15].button("Акт", key="btn_act_inline_" + str(c["id"])):
+                        if row_cols[16].button("Акт", key="btn_act_inline_" + str(c["id"])):
                             st.session_state["show_act_for"] = c["id"]
                             st.rerun()
 
                         if view_mode == "active":
-                            if row_cols[16].button("✏", key="btn_edit_" + str(c["id"])):
+                            if row_cols[17].button("✏", key="btn_edit_" + str(c["id"])):
                                 st.session_state["edit_ship_" + str(c["id"])] = True
                             if can("delete_ship", role):
-                                if row_cols[17].button("🗑", key="btn_delship_" + str(c["id"])):
+                                if row_cols[18].button("🗑", key="btn_delship_" + str(c["id"])):
                                     delete_shipment(c["id"])
                                     log_action(u["login"], role, "delete_ship",
                                                "рейс " + str(trip_id) + ", поз " + str(c.get("position")))
@@ -1163,7 +1164,7 @@ def main_page():
                         else:
                             st.warning("⚠ Есть задолженность по авто — рейс нельзя отправить в архив, пока не оплачен")
 
-                    # Формы РЕДАКТИРОВАНИЯ авто — каждая со своим ключом
+                    # формы редактирования авто
                     for c in sorted(cars, key=lambda x: int(to_float(x.get("position")))):
                         if st.session_state.get("edit_ship_" + str(c["id"])):
                             form_key = "editcar_" + str(c["id"])
