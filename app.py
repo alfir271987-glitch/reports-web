@@ -556,8 +556,7 @@ def log_act_print(login, trip_id, shipment_id, client):
 
 
 # ============================================================
-# АКТ — сокращённый (без гос. номера, водителя, даты выдачи,
-# места приёмки, даты приёма груза)
+# АКТ
 # ============================================================
 
 def render_act_html(trip, shipment):
@@ -566,7 +565,6 @@ def render_act_html(trip, shipment):
     client = shipment.get("client", "")
     customer = shipment.get("customer", "")
     vin = str(shipment.get("vin", "")).strip()[:17]
-
     receiver = client if client else customer
 
     LINE_LONG = "_" * 30
@@ -592,32 +590,22 @@ def render_act_html(trip, shipment):
     p.append("<body>")
 
     p.append("<h1>Акт приема-передачи транспортного средства</h1>")
-
     p.append("<p><b>Перевозчик:</b> ИП Сагитдинов Максим Наильевич, тел. 8-987-131-00-62</p>")
     p.append("<p><b>Заказчик / Получатель:</b> " + receiver + "</p>")
     p.append("<p><b>Марка автомобиля:</b> " + car_model + "</p>")
-
     p.append("<p><b>VIN:</b> " + (vin if vin else "_" * 20) + "</p>")
-
     p.append("<p><b>Маршрут:</b> " + route + "</p>")
-
     p.append("<p>&nbsp;</p>")
-
     p.append('<p><b>Груз сдал:</b> <span class="mono">' + LINE_LONG +
              "</span> / Сагитдинов М.Н. /</p>")
-
     p.append('<p><b>Груз принял:</b> <span class="mono">' + LINE_LONG +
              "</span> / " + receiver + " /</p>")
-
     p.append("<p>&nbsp;</p>")
-
     p.append('<p><b>Дата вручения груза:</b> <span class="mono">' + LINE_SHORT +
              '</span> &nbsp;&nbsp; <b>Время:</b> <span class="mono">' + LINE_SHORT + "</span></p>")
-
     p.append('<p class="small" style="margin-top: 25px;">'
              'При подписании акта приема-передачи на момент вручения груза '
              'Стороны каких-либо претензий друг к другу не имеют.</p>')
-
     p.append("</body>")
     p.append("</html>")
 
@@ -646,7 +634,7 @@ def render_act_text(trip, shipment):
         "",
         "",
         "Груз сдал: " + LINE_LONG + " / Сагитдинов М.Н. /",
-        "Груз принял: " + LINE_LONG + " / " + receiver + " /",
+        "Груз принят: " + LINE_LONG + " / " + receiver + " /",
         "",
         "",
         "Дата вручения груза: " + LINE_SHORT + "   Время: " + LINE_SHORT,
@@ -687,7 +675,12 @@ def show_act(trip, shipment):
     st.components.v1.html(render_act_html(trip, shipment), height=850, scrolling=True)
 
 
-def shipment_form(is_edit, c=None):
+# ============================================================
+# ФОРМА АВТО — вынесена отдельно, с уникальными ключами
+# ============================================================
+
+def render_shipment_form(form_key, c=None, submit_label="Сохранить авто"):
+    """Рендерит форму авто целиком внутри st.form с уникальным form_key."""
     defaults = {
         "position": 1,
         "car_model": "",
@@ -728,46 +721,56 @@ def shipment_form(is_edit, c=None):
     except ValueError:
         payer_index = 0
 
-    col1, col2 = st.columns(2)
-    position = col1.number_input("Позиция (1–8)", min_value=1, max_value=8, step=1,
-                                 value=defaults["position"], key="fp_pos")
-    car_model = col2.text_input("Марка / модель авто", value=defaults["car_model"], key="fp_car")
+    with st.form(form_key, clear_on_submit=False):
+        st.markdown("**Данные автомобиля**")
 
-    col3, col4 = st.columns(2)
-    client = col3.text_input("ФИО клиента (если нет Заказчика)", value=defaults["client"], key="fp_client")
-    vin = col4.text_input("VIN (до 17 символов)", value=defaults["vin"], key="fp_vin")
+        col1, col2 = st.columns(2)
+        position = col1.number_input("Позиция (1–8)", min_value=1, max_value=8, step=1,
+                                     value=defaults["position"], key=form_key + "_pos")
+        car_model = col2.text_input("Марка / модель авто", value=defaults["car_model"],
+                                     key=form_key + "_car")
 
-    delivery_city = st.text_input("Город доставки", value=defaults["delivery_city"], key="fp_city")
+        col3, col4 = st.columns(2)
+        client = col3.text_input("ФИО клиента (если нет Заказчика)", value=defaults["client"],
+                                  key=form_key + "_client")
+        vin = col4.text_input("VIN (до 17 символов)", value=defaults["vin"],
+                              key=form_key + "_vin")
 
-    col5, col6 = st.columns(2)
-    amount = col5.text_input("Сумма за перевозку", value=defaults["amount"], key="fp_amount")
-    payer_type = col6.selectbox("Способ оплаты", payer_options, index=payer_index, key="fp_payer")
+        delivery_city = st.text_input("Город доставки", value=defaults["delivery_city"],
+                                      key=form_key + "_city")
 
-    col7, col8 = st.columns(2)
-    date_pay = col7.text_input("Дата оплаты (ДД.ММ.ГГГГ)", value=defaults["date_pay"], key="fp_dpay")
-    paid_to = col8.text_input("Кому произведён перевод", value=defaults["paid_to"], key="fp_paidto")
+        col5, col6 = st.columns(2)
+        amount = col5.text_input("Сумма за перевозку", value=defaults["amount"],
+                                 key=form_key + "_amount")
+        payer_type = col6.selectbox("Способ оплаты", payer_options, index=payer_index,
+                                     key=form_key + "_payer")
 
-    col9, col10 = st.columns(2)
-    advance = col9.text_input("Аванс (сумма)", value=defaults["advance"], key="fp_adv")
-    advance_date = col10.text_input("Дата аванса (ДД.ММ.ГГГГ)", value=defaults["advance_date"], key="fp_advd")
+        col7, col8 = st.columns(2)
+        date_pay = col7.text_input("Дата оплаты (ДД.ММ.ГГГГ)", value=defaults["date_pay"],
+                                    key=form_key + "_dpay")
+        paid_to = col8.text_input("Кому произведён перевод", value=defaults["paid_to"],
+                                  key=form_key + "_paidto")
 
-    st.markdown("---")
+        col9, col10 = st.columns(2)
+        advance = col9.text_input("Аванс (сумма)", value=defaults["advance"],
+                                  key=form_key + "_adv")
+        advance_date = col10.text_input("Дата аванса (ДД.ММ.ГГГГ)", value=defaults["advance_date"],
+                                         key=form_key + "_advd")
 
-    col11, col12 = st.columns(2)
-    customer = col11.text_input("Заказчик (если нет ФИО клиента)", value=defaults["customer"], key="fp_customer")
-    contract_number = col12.text_input("№ договора", value=defaults["contract_number"], key="fp_contract")
+        col11, col12 = st.columns(2)
+        customer = col11.text_input("Заказчик (если нет ФИО клиента)", value=defaults["customer"],
+                                    key=form_key + "_customer")
+        contract_number = col12.text_input("№ договора", value=defaults["contract_number"],
+                                            key=form_key + "_contract")
 
-    col13, col14 = st.columns(2)
-    cdek_track = col13.text_input("СДЭК: номер накладной", value=defaults["cdek_track"], key="fp_cdek_track")
-    cdek_date = col14.text_input("СДЭК: дата отправки (ДД.ММ.ГГГГ)", value=defaults["cdek_date"], key="fp_cdek_date")
+        col13, col14 = st.columns(2)
+        cdek_track = col13.text_input("СДЭК: номер накладной", value=defaults["cdek_track"],
+                                       key=form_key + "_cdek_track")
+        cdek_date = col14.text_input("СДЭК: дата отправки (ДД.ММ.ГГГГ)", value=defaults["cdek_date"],
+                                      key=form_key + "_cdek_date")
 
-    amount_val = to_float(amount)
-    if payer_type == "безнал с НДС 22%" and amount_val > 0:
-        nds_val, no_nds_val = calc_nds(amount_val, payer_type)
-        st.info(
-            "НДС 22%: **" + fmt_money(nds_val) + " ₽** &nbsp; | &nbsp; "
-            "Сумма без НДС: **" + fmt_money(no_nds_val) + " ₽**"
-        )
+        save = st.form_submit_button(submit_label)
+        cancel = st.form_submit_button("Отмена")
 
     return {
         "position": position,
@@ -785,6 +788,8 @@ def shipment_form(is_edit, c=None):
         "contract_number": contract_number,
         "cdek_track": cdek_track,
         "cdek_date": cdek_date,
+        "save": save,
+        "cancel": cancel,
     }
 
 
@@ -1007,16 +1012,14 @@ def main_page():
                         st.session_state.pop("open_deltrip_" + str(trip_id), None)
                         st.rerun()
 
+                # Форма ДОБАВЛЕНИЯ авто
                 if view_mode == "active" and st.session_state.get("open_addcar_" + str(trip_id)):
-                    with st.form("new_car_" + str(trip_id)):
-                        st.markdown("**Добавить автомобиль**")
-                        f = shipment_form(is_edit=False)
-                        ok = st.form_submit_button("Сохранить авто")
-                        cancel = st.form_submit_button("Отмена")
-                    if cancel:
+                    form_key = "newcar_" + str(trip_id)
+                    f = render_shipment_form(form_key, c=None, submit_label="Сохранить авто")
+                    if f["cancel"]:
                         st.session_state.pop("open_addcar_" + str(trip_id), None)
                         st.rerun()
-                    if ok:
+                    if f["save"]:
                         if len(cars) >= 8:
                             st.error("На автовозе максимум 8 авто")
                         elif not f["client"] and not f["customer"]:
@@ -1160,18 +1163,17 @@ def main_page():
                         else:
                             st.warning("⚠ Есть задолженность по авто — рейс нельзя отправить в архив, пока не оплачен")
 
+                    # Формы РЕДАКТИРОВАНИЯ авто — каждая со своим ключом
                     for c in sorted(cars, key=lambda x: int(to_float(x.get("position")))):
                         if st.session_state.get("edit_ship_" + str(c["id"])):
-                            with st.form("edit_car_" + str(c["id"])):
-                                st.markdown("**Редактировать авто (позиция " + str(c.get("position")) + ")**")
-                                f = shipment_form(is_edit=True, c=c)
-                                e_save = st.form_submit_button("Сохранить изменения")
-                                e_cancel = st.form_submit_button("Отмена")
+                            form_key = "editcar_" + str(c["id"])
+                            st.markdown("**Редактировать авто (позиция " + str(c.get("position")) + ")**")
+                            f = render_shipment_form(form_key, c=c, submit_label="Сохранить изменения")
 
-                            if e_cancel:
+                            if f["cancel"]:
                                 st.session_state.pop("edit_ship_" + str(c["id"]), None)
                                 st.rerun()
-                            if e_save:
+                            if f["save"]:
                                 if not f["client"] and not f["customer"]:
                                     st.error("Заполните хотя бы одно: ФИО клиента или Заказчик")
                                 else:
