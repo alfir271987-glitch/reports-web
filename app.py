@@ -36,14 +36,30 @@ PAYER_TYPES = ["нал", "эквайринг", "безнал с НДС 22%"]
 NDS_RATE = 0.22
 
 
+# ============ НДС и формат ============
+
 def calc_nds(amount, payer_type):
+    """НДС выделяется из суммы (сумма уже включает НДС).
+    Формула: НДС = Сумма × 22 / 122.
+    Сумма 18333 → НДС 3305,95, сумма без НДС 15027,05."""
     amount = to_float(amount)
     if payer_type == "безнал с НДС 22%":
-        nds = amount * NDS_RATE / (1 + NDS_RATE)
+        nds = amount * NDS_RATE / (1 + NDS_RATE)   # × 22/122
         amount_no_nds = amount - nds
         return nds, amount_no_nds
     return 0.0, amount
 
+
+def fmt_money(x):
+    """Формат: 18 333,33 — с копейками через запятую и пробелами."""
+    v = to_float(x)
+    s = "{:,.2f}".format(v)
+    s = s.replace(",", " ")
+    s = s.replace(".", ",")
+    return s
+
+
+# ============ Подключение ============
 
 @st.cache_resource
 def get_book():
@@ -120,7 +136,15 @@ def log_action(login, role, action, details=""):
     invalidate_cache("audit_log")
 
 
+# ============ Числа ============
+
 def to_float(s):
+    """Принимает числа, строки с запятой/точкой, разные форматы.
+    18333,33 → 18333.33
+    1.833.333,33 → 1833333.33
+    1 833 333,33 → 1833333.33
+    18333.33 → 18333.33
+    18333 → 18333.0"""
     if s is None:
         return 0.0
     if isinstance(s, (int, float)):
@@ -129,18 +153,30 @@ def to_float(s):
         s = str(s).strip()
     except Exception:
         return 0.0
-    s = s.replace(" ", "").replace(",", ".")
     if not s:
         return 0.0
+
+    # убираем все виды пробелов (обычные, неразрывные)
+    s = s.replace(" ", "").replace("\u00a0", "").replace("\u202f", "")
+
+    # есть и точка, и запятая — точка разделитель тысяч
+    if "." in s and "," in s:
+        s = s.replace(".", "").replace(",", ".")
+    else:
+        s = s.replace(",", ".")
+
     try:
         return float(s)
     except ValueError:
         return 0.0
 
 
-def fmt_money(x):
-    return "{:,}".format(int(round(to_float(x)))).replace(",", " ")
+def money_value(x):
+    """Округляет до 2 знаков. Возвращает float для сохранения."""
+    return round(to_float(x), 2)
 
+
+# ============ Даты ============
 
 def parse_date_ui(s):
     if s is None:
@@ -183,6 +219,8 @@ def date_sort_key(s):
             continue
     return datetime.min.date()
 
+
+# ============ Утилиты ============
 
 def is_active(u):
     val = u.get("active")
@@ -467,20 +505,20 @@ def create_shipment(trip_id, position, car_model, client, amount,
         "position": position,
         "car_model": car_model,
         "client": client,
-        "amount": amount,
+        "amount": money_value(amount),
         "date_pay": date_pay,
         "paid_to": paid_to,
         "delivery_city": delivery_city,
         "vin": vin,
-        "advance": advance,
+        "advance": money_value(advance),
         "advance_date": advance_date,
         "payer_type": payer_type,
         "customer": customer,
         "contract_number": contract_number,
         "cdek_track": cdek_track,
         "cdek_date": cdek_date,
-        "nds_amount": nds_amount,
-        "amount_no_nds": amount_no_nds,
+        "nds_amount": money_value(nds_amount),
+        "amount_no_nds": money_value(amount_no_nds),
         "created_by": created_by,
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "issued": "0",
@@ -505,12 +543,12 @@ def update_shipment(shipment_id, position, car_model, client, amount,
             archived_val = row[22] if len(row) > 22 else "0"
             new_row = [
                 shipment_id, trip_id, position, car_model, client,
-                amount, date_pay, paid_to,
+                money_value(amount), date_pay, paid_to,
                 delivery_city, vin,
-                advance, advance_date,
+                money_value(advance), advance_date,
                 payer_type, customer, contract_number,
                 cdek_track, cdek_date,
-                nds_amount, amount_no_nds,
+                money_value(nds_amount), money_value(amount_no_nds),
                 created_by, created_at, issued_val, archived_val,
             ]
             ws.update("A" + str(i) + ":" + last_col + str(i), [new_row])
@@ -676,7 +714,7 @@ def show_act(trip, shipment):
 
 
 # ============================================================
-# ФОРМА АВТО — с уникальным ключом формы
+# ФОРМА АВТО
 # ============================================================
 
 def render_shipment_form(form_key, c=None, submit_label="Сохранить авто"):
@@ -703,10 +741,19 @@ def render_shipment_form(form_key, c=None, submit_label="Сохранить ав
         defaults["client"] = c.get("client", "")
         defaults["vin"] = str(c.get("vin", ""))[:17]
         defaults["delivery_city"] = c.get("delivery_city", "")
-        defaults["amount"] = str(int(to_float(c.get("amount"))))
+        # показываем как есть (строкой), без округления
+        amount_raw = c.get("amount", "")
+        if amount_raw == "":
+            defaults["amount"] = ""
+        else:
+            defaults["amount"] = "{:.2f}".format(to_float(amount_raw)).replace(".", ",")
         defaults["date_pay"] = date_to_display_safe(c.get("date_pay", ""))
         defaults["paid_to"] = c.get("paid_to", "")
-        defaults["advance"] = str(int(to_float(c.get("advance"))))
+        advance_raw = c.get("advance", "")
+        if advance_raw == "":
+            defaults["advance"] = ""
+        else:
+            defaults["advance"] = "{:.2f}".format(to_float(advance_raw)).replace(".", ",")
         defaults["advance_date"] = date_to_display_safe(c.get("advance_date", ""))
         defaults["payer_type"] = c.get("payer_type", "нал") or "нал"
         defaults["customer"] = c.get("customer", "")
@@ -739,7 +786,8 @@ def render_shipment_form(form_key, c=None, submit_label="Сохранить ав
                                       key=form_key + "_city")
 
         col5, col6 = st.columns(2)
-        amount = col5.text_input("Сумма за перевозку", value=defaults["amount"],
+        amount = col5.text_input("Сумма за перевозку (пример: 18333,33)",
+                                 value=defaults["amount"],
                                  key=form_key + "_amount")
         payer_type = col6.selectbox("Способ оплаты", payer_options, index=payer_index,
                                      key=form_key + "_payer")
@@ -1030,12 +1078,14 @@ def main_page():
                             except ValueError as e:
                                 st.error(str(e))
                             else:
-                                nds_val, no_nds_val = calc_nds(to_float(f["amount"]), f["payer_type"])
+                                amt_val = money_value(f["amount"])
+                                adv_val = money_value(f["advance"])
+                                nds_val, no_nds_val = calc_nds(amt_val, f["payer_type"])
                                 create_shipment(
                                     trip_id, f["position"], f["car_model"], f["client"],
-                                    to_float(f["amount"]), dp, f["paid_to"],
+                                    amt_val, dp, f["paid_to"],
                                     f["delivery_city"], str(f["vin"])[:17],
-                                    to_float(f["advance"]), dpa,
+                                    adv_val, dpa,
                                     f["payer_type"], f["customer"], f["contract_number"],
                                     f["cdek_track"], dcdek,
                                     nds_val, no_nds_val,
@@ -1049,7 +1099,6 @@ def main_page():
                 if cars:
                     st.markdown("**Список автомобилей в рейсе**")
 
-                    # заголовок таблицы — 19 колонок, добавлена "Кому перевод"
                     hc = st.columns([1, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1])
                     hc[0].markdown("**№**")
                     hc[1].markdown("**Марка / модель**")
@@ -1164,7 +1213,6 @@ def main_page():
                         else:
                             st.warning("⚠ Есть задолженность по авто — рейс нельзя отправить в архив, пока не оплачен")
 
-                    # формы редактирования авто
                     for c in sorted(cars, key=lambda x: int(to_float(x.get("position")))):
                         if st.session_state.get("edit_ship_" + str(c["id"])):
                             form_key = "editcar_" + str(c["id"])
@@ -1185,12 +1233,14 @@ def main_page():
                                     except ValueError as ex:
                                         st.error(str(ex))
                                     else:
-                                        nds_val, no_nds_val = calc_nds(to_float(f["amount"]), f["payer_type"])
+                                        amt_val = money_value(f["amount"])
+                                        adv_val = money_value(f["advance"])
+                                        nds_val, no_nds_val = calc_nds(amt_val, f["payer_type"])
                                         update_shipment(
                                             c["id"], f["position"], f["car_model"], f["client"],
-                                            to_float(f["amount"]), e_dp, f["paid_to"],
+                                            amt_val, e_dp, f["paid_to"],
                                             f["delivery_city"], str(f["vin"])[:17],
-                                            to_float(f["advance"]), e_dpa,
+                                            adv_val, e_dpa,
                                             f["payer_type"], f["customer"], f["contract_number"],
                                             f["cdek_track"], e_dcdek,
                                             nds_val, no_nds_val)
