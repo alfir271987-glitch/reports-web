@@ -95,12 +95,37 @@ def invalidate_cache(name=None):
 
 @st.cache_resource
 def ensure_sheets_once():
+    """Создаёт отсутствующие листы и дописывает недостающие заголовки
+    в существующие (например, advance_before_paid в shipments)."""
     book = get_book()
     existing = {ws.title for ws in book.worksheets()}
     for name, headers in SHEET_SCHEMAS.items():
         if name not in existing:
             ws = book.add_worksheet(title=name, rows=1000, cols=len(headers))
             ws.append_row(headers)
+        else:
+            ws = book.worksheet(name)
+            try:
+                current = ws.row_values(1)
+            except Exception:
+                current = []
+            # какие заголовки отсутствуют
+            missing = [h for h in headers if h not in current]
+            if missing:
+                # расширяем лист, если нужно
+                needed_cols = max(len(headers), len(current) + len(missing))
+                if ws.col_count < needed_cols:
+                    try:
+                        ws.add_cols(needed_cols - ws.col_count)
+                    except Exception:
+                        pass
+                # дописываем недостающие заголовки в конец
+                start_col = len(current) + 1
+                for idx, h in enumerate(missing):
+                    try:
+                        ws.update_cell(1, start_col + idx, h)
+                    except Exception:
+                        pass
     return True
 
 
@@ -533,11 +558,9 @@ def toggle_issued(shipment_id, current_value, current_ever):
         if s(row[0]) == s(shipment_id):
             was_issued = s(current_value) == "1"
             if not was_issued:
-                # Ставим "Выдан"
                 ws.update_cell(i, 20, "1")
                 ws.update_cell(i, 21, "1")   # issued_ever = 1
             else:
-                # Снимаем "Выдан" → сбрасываем оплату, чтобы появился долг
                 ws.update_cell(i, 20, "0")
                 ws.update_cell(i, 22, "0")   # paid = 0
             invalidate_cache("shipments")
@@ -547,9 +570,18 @@ def toggle_issued(shipment_id, current_value, current_ever):
 
 def toggle_paid(shipment_id, current_paid, current_amount, current_advance):
     """Ставит/снимает paid (V=22).
-    При установке: advance := amount (задолженность = 0), advance_before_paid := старый аванс.
+    При установке: advance := amount (задолженность = 0),
+                   advance_before_paid := прежний аванс.
     При снятии: advance := advance_before_paid (задолженность возвращается)."""
     ws = get_ws_cached("shipments")
+    # Подстраховка: если колонки X нет — расширяем лист
+    try:
+        if ws.col_count < 24:
+            ws.add_cols(24 - ws.col_count)
+            ws.update_cell(1, 24, "advance_before_paid")
+    except Exception:
+        pass
+
     for i, row in enumerate(ws.get_all_values()[1:], start=2):
         if s(row[0]) == s(shipment_id):
             was_paid = s(current_paid) == "1"
@@ -558,16 +590,20 @@ def toggle_paid(shipment_id, current_paid, current_amount, current_advance):
             prev_adv = row[23] if len(row) > 23 else ""
 
             if not was_paid:
-                # Запоминаем текущий аванс, затем поднимаем его до суммы → долг = 0
-                ws.update_cell(i, 24, money_value(advance_val))   # advance_before_paid
-                ws.update_cell(i, 11, amount_val)                 # advance := amount
-                ws.update_cell(i, 22, "1")                        # paid = 1
+                try:
+                    ws.update_cell(i, 24, money_value(advance_val))  # advance_before_paid
+                except Exception:
+                    pass
+                ws.update_cell(i, 11, amount_val)                    # advance := amount
+                ws.update_cell(i, 22, "1")                           # paid = 1
             else:
-                # Возвращаем аванс, который был до оплаты
                 restore = money_value(prev_adv) if s(prev_adv).strip() != "" else 0.0
-                ws.update_cell(i, 11, restore)                    # advance := старый
-                ws.update_cell(i, 22, "0")                        # paid = 0
-                ws.update_cell(i, 24, "")                         # очищаем
+                ws.update_cell(i, 11, restore)                       # advance := старый
+                ws.update_cell(i, 22, "0")                           # paid = 0
+                try:
+                    ws.update_cell(i, 24, "")                        # очищаем
+                except Exception:
+                    pass
             invalidate_cache("shipments")
             return "1" if not was_paid else "0"
     return current_paid
@@ -1067,11 +1103,6 @@ def main_page():
                         is_ever_flag = check_issued_ever(issued_ever_val)
                         has_debt = debt_val > 0.01
 
-                        # Логика цветов:
-                        # 1) Выдан → зелёный
-                        # 2) Оплачен → жёлтый (долг при этом 0, т.к. аванс = сумма)
-                        # 3) Есть долг → красный
-                        # 4) Иначе → белый
                         if is_issued_flag:
                             bg = "#c8e6c9"; bd = "#4caf50"; status_text = "🟢 Выдан"
                         elif is_paid_flag:
@@ -1112,7 +1143,6 @@ def main_page():
                                 + status_text + '</div>',
                                 unsafe_allow_html=True)
 
-                            # Кнопка «Оплачен»
                             paid_label = "❌ Снять" if is_paid_flag else "✅ Оплачен"
                             if btn_cols[1].button(paid_label, key="btn_paid_" + s(x["id"])):
                                 toggle_paid(x["id"], paid_val, amount_val, advance_val)
@@ -1120,7 +1150,6 @@ def main_page():
                                            "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
                                 st.rerun()
 
-                            # Кнопка «Выдан» / «Снять выдан»
                             if is_issued_flag:
                                 if btn_cols[2].button("↩ Снять выдан",
                                                      key="btn_issued_" + s(x["id"])):
