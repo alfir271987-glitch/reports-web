@@ -25,7 +25,7 @@ SHEET_SCHEMAS = {
                   "payer_type", "customer", "contract_number",
                   "nds_amount", "amount_no_nds",
                   "created_by", "created_at", "issued", "issued_ever",
-                  "paid", "archived"],
+                  "paid", "archived", "advance_before_paid"],
     "audit_log": ["id", "ts", "login", "role", "action", "details"],
     "act_log": ["id", "ts", "login", "trip_id", "shipment_id", "client"],
 }
@@ -486,6 +486,7 @@ def create_shipment(trip_id, position, car_model, client, amount,
         "issued_ever": "0",
         "paid": "0",
         "archived": "0",
+        "advance_before_paid": "",
     })
 
 
@@ -506,6 +507,7 @@ def update_shipment(shipment_id, position, car_model, client, amount,
             issued_ever_val = row[20] if len(row) > 20 else "0"
             paid_val = row[21] if len(row) > 21 else "0"
             archived_val = row[22] if len(row) > 22 else "0"
+            adv_before_paid_val = row[23] if len(row) > 23 else ""
             new_row = [
                 shipment_id, trip_id, position, s(car_model), s(client),
                 money_value(amount), s(date_pay), s(paid_to),
@@ -514,7 +516,7 @@ def update_shipment(shipment_id, position, car_model, client, amount,
                 s(payer_type), s(customer), s(contract_number),
                 money_value(nds_amount), money_value(amount_no_nds),
                 created_by, created_at, issued_val, issued_ever_val,
-                paid_val, archived_val,
+                paid_val, archived_val, adv_before_paid_val,
             ]
             ws.update("A" + str(i) + ":" + last_col + str(i), [new_row])
             invalidate_cache("shipments")
@@ -525,7 +527,7 @@ def update_shipment(shipment_id, position, car_model, client, amount,
 def toggle_issued(shipment_id, current_value, current_ever):
     """Ставит/снимает issued (T=20).
     При установке: issued=1, issued_ever=1.
-    При снятии: issued=0, paid=0 (чтобы авто ушло в статус «Долг»)."""
+    При снятии: issued=0, paid=0 (авто уходит в статус «Долг»)."""
     ws = get_ws_cached("shipments")
     for i, row in enumerate(ws.get_all_values()[1:], start=2):
         if s(row[0]) == s(shipment_id):
@@ -545,15 +547,27 @@ def toggle_issued(shipment_id, current_value, current_ever):
 
 def toggle_paid(shipment_id, current_paid, current_amount, current_advance):
     """Ставит/снимает paid (V=22).
-    ВАЖНО: аванс (K=11) не трогаем — он остаётся тем, что ввёл пользователь."""
+    При установке: advance := amount (задолженность = 0), advance_before_paid := старый аванс.
+    При снятии: advance := advance_before_paid (задолженность возвращается)."""
     ws = get_ws_cached("shipments")
     for i, row in enumerate(ws.get_all_values()[1:], start=2):
         if s(row[0]) == s(shipment_id):
             was_paid = s(current_paid) == "1"
+            amount_val = money_value(current_amount)
+            advance_val = money_value(current_advance)
+            prev_adv = row[23] if len(row) > 23 else ""
+
             if not was_paid:
-                ws.update_cell(i, 22, "1")   # paid = 1
+                # Запоминаем текущий аванс, затем поднимаем его до суммы → долг = 0
+                ws.update_cell(i, 24, money_value(advance_val))   # advance_before_paid
+                ws.update_cell(i, 11, amount_val)                 # advance := amount
+                ws.update_cell(i, 22, "1")                        # paid = 1
             else:
-                ws.update_cell(i, 22, "0")   # paid = 0
+                # Возвращаем аванс, который был до оплаты
+                restore = money_value(prev_adv) if s(prev_adv).strip() != "" else 0.0
+                ws.update_cell(i, 11, restore)                    # advance := старый
+                ws.update_cell(i, 22, "0")                        # paid = 0
+                ws.update_cell(i, 24, "")                         # очищаем
             invalidate_cache("shipments")
             return "1" if not was_paid else "0"
     return current_paid
@@ -1055,12 +1069,12 @@ def main_page():
 
                         # Логика цветов:
                         # 1) Выдан → зелёный
-                        # 2) Оплачен и долга нет → жёлтый
+                        # 2) Оплачен → жёлтый (долг при этом 0, т.к. аванс = сумма)
                         # 3) Есть долг → красный
                         # 4) Иначе → белый
                         if is_issued_flag:
                             bg = "#c8e6c9"; bd = "#4caf50"; status_text = "🟢 Выдан"
-                        elif is_paid_flag and not has_debt:
+                        elif is_paid_flag:
                             bg = "#fff9c4"; bd = "#ffeb3b"; status_text = "🟡 Оплачен"
                         elif has_debt:
                             bg = "#ffcdd2"; bd = "#f44336"; status_text = "🔴 Долг"
@@ -1108,7 +1122,6 @@ def main_page():
 
                             # Кнопка «Выдан» / «Снять выдан»
                             if is_issued_flag:
-                                # Уже выдан → можно снять (при снятии авто уйдёт в «Долг»)
                                 if btn_cols[2].button("↩ Снять выдан",
                                                      key="btn_issued_" + s(x["id"])):
                                     toggle_issued(x["id"], issued_val, issued_ever_val)
@@ -1116,7 +1129,6 @@ def main_page():
                                                "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
                                     st.rerun()
                             else:
-                                # Ещё не выдан → «Выдан», активна только если оплачен
                                 clicked_issued = btn_cols[2].button(
                                     "✅ Выдан",
                                     key="btn_issued_" + s(x["id"]),
