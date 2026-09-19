@@ -526,8 +526,6 @@ def toggle_issued(shipment_id, current_value):
 
 
 def toggle_paid(shipment_id, current_paid, current_amount, current_advance):
-    """При включении 'Оплачен' — advance = amount, paid = 1.
-    При выключении — только снимаем флаг paid."""
     ws = get_ws_cached("shipments")
     for i, row in enumerate(ws.get_all_values()[1:], start=2):
         if s(row[0]) == s(shipment_id):
@@ -802,7 +800,6 @@ def main_page():
                 return
         st.session_state.pop("show_act_for", None)
 
-    # Читаем актуальные данные из Google, без кэша
     trips = get_trips(fresh=True)
     shipments = get_shipments(fresh=True)
 
@@ -1085,7 +1082,7 @@ def main_page():
                                 + status_text + '</div>',
                                 unsafe_allow_html=True)
 
-                            # Кнопка «Оплачен» — всегда кнопка
+                            # Кнопка «Оплачен» / «Снять»
                             paid_label = "❌ Снять" if is_paid_flag else "✅ Оплачен"
                             if btn_cols[1].button(paid_label, key="btn_paid_" + s(x["id"])):
                                 toggle_paid(x["id"], paid_val, amount_val, advance_val)
@@ -1093,17 +1090,26 @@ def main_page():
                                            "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
                                 st.rerun()
 
-                            # Кнопка «Выдан» — всегда кнопка, но неактивна, пока не оплачен
-                            issued_label = "↩ Снять выдан" if is_issued_flag else "✅ Выдан"
-                            clicked_issued = btn_cols[2].button(
-                                issued_label,
-                                key="btn_issued_" + s(x["id"]),
-                                disabled=not is_paid_flag)
-                            if clicked_issued and is_paid_flag:
-                                toggle_issued(x["id"], issued_val)
-                                log_action(u["login"], role, "toggle_issued",
-                                           "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
-                                st.rerun()
+                            # Кнопка «Выдан» / «Снять выдан»
+                            if is_issued_flag:
+                                # Уже выдан → «Снять выдан» — всегда активна
+                                if btn_cols[2].button("↩ Снять выдан",
+                                                     key="btn_issued_" + s(x["id"])):
+                                    toggle_issued(x["id"], issued_val)
+                                    log_action(u["login"], role, "toggle_issued",
+                                               "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
+                                    st.rerun()
+                            else:
+                                # Ещё не выдан → «Выдан» активна только если оплачен
+                                clicked_issued = btn_cols[2].button(
+                                    "✅ Выдан",
+                                    key="btn_issued_" + s(x["id"]),
+                                    disabled=not is_paid_flag)
+                                if clicked_issued and is_paid_flag:
+                                    toggle_issued(x["id"], issued_val)
+                                    log_action(u["login"], role, "toggle_issued",
+                                               "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
+                                    st.rerun()
 
                             if btn_cols[3].button("📄 Акт", key="btn_act_inline_" + s(x["id"])):
                                 st.session_state["show_act_for"] = x["id"]
