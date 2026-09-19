@@ -80,6 +80,7 @@ def read_all_cached(name):
 
 
 def read_all(name, fresh=False):
+    """Если fresh=True — сбрасывает кэш и читает заново из Google."""
     if fresh:
         read_all_cached.clear(name)
     return read_all_cached(name)
@@ -208,12 +209,12 @@ def is_archived(v):
 
 
 def check_paid(v):
-    """Проверяет, оплачено ли авто. Принимает 1, 1.0, true."""
-    return s(v).strip().lower() in ("1", "1.0", "true")
+    """Проверяет, оплачено ли авто. Принимает 1, 1.0, true, да, yes."""
+    return s(v).strip().lower() in ("1", "1.0", "true", "да", "yes")
 
 
 def check_issued(v):
-    return s(v).strip().lower() in ("1", "1.0", "true")
+    return s(v).strip().lower() in ("1", "1.0", "true", "да", "yes")
 
 
 def safe_df(rows):
@@ -516,7 +517,7 @@ def update_shipment(shipment_id, position, car_model, client, amount,
 
 
 def toggle_issued(shipment_id, current_value):
-    """Ставит/снимает флаг 'Выдан' (колонка T = 20)."""
+    """Ставит/снимает флаг 'Выдан' — колонка T=20."""
     ws = get_ws_cached("shipments")
     for i, row in enumerate(ws.get_all_values()[1:], start=2):
         if s(row[0]) == s(shipment_id):
@@ -529,18 +530,17 @@ def toggle_issued(shipment_id, current_value):
 
 def toggle_paid(shipment_id, current_paid, current_amount, current_advance):
     """При включении 'Оплачен':
-       - записываем advance = amount (обнуляем задолженность)
-       - записываем paid = 1
-       При выключении — снимаем только флаг paid."""
+       advance = amount (обнуляем задолженность), paid = 1.
+       При выключении — только снимаем флаг paid."""
     ws = get_ws_cached("shipments")
     for i, row in enumerate(ws.get_all_values()[1:], start=2):
         if s(row[0]) == s(shipment_id):
             was_paid = s(current_paid) == "1"
             if not was_paid:
-                ws.update_cell(i, 11, money_value(current_amount))  # advance
-                ws.update_cell(i, 21, "1")                          # paid
+                ws.update_cell(i, 11, money_value(current_amount))
+                ws.update_cell(i, 21, "1")
             else:
-                ws.update_cell(i, 21, "0")                          # снимаем
+                ws.update_cell(i, 21, "0")
             invalidate_cache("shipments")
             return "1" if not was_paid else "0"
     return current_paid
@@ -806,8 +806,9 @@ def main_page():
                 return
         st.session_state.pop("show_act_for", None)
 
-    trips = get_trips()
-    shipments = get_shipments()
+    # ГЛАВНОЕ: читаем актуальные данные без кэша — чтобы статусы были свежими
+    trips = get_trips(fresh=True)
+    shipments = get_shipments(fresh=True)
 
     if view_mode == "archive":
         filtered = [t for t in trips if is_archived(t.get("archived", "0"))]
@@ -1095,6 +1096,7 @@ def main_page():
                                            "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
                                 st.rerun()
 
+                            # Кнопка «Выдан» — активна только если оплачен
                             if is_paid_flag:
                                 issued_label = "↩ Снять" if is_issued_flag else "✅ Выдан"
                                 if btn_cols[2].button(issued_label, key="btn_issued_" + s(x["id"])):
@@ -1103,7 +1105,11 @@ def main_page():
                                                "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
                                     st.rerun()
                             else:
-                                btn_cols[2].write("Сначала Оплачен")
+                                btn_cols[2].markdown(
+                                    '<div style="padding:6px 10px; background:#eeeeee; '
+                                    'color:#999; border-radius:6px; text-align:center; '
+                                    'font-size:11px;">Сначала<br>Оплачен</div>',
+                                    unsafe_allow_html=True)
 
                             if btn_cols[3].button("📄 Акт", key="btn_act_inline_" + s(x["id"])):
                                 st.session_state["show_act_for"] = x["id"]
