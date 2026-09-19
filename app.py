@@ -205,11 +205,12 @@ def is_archived(v):
     return s(v).strip().lower() in ("1", "1.0", "true")
 
 
-def is_paid(v):
+def check_paid(v):
+    """Проверяет, оплачено ли авто. Функция — не путать с переменной is_paid."""
     return s(v).strip().lower() in ("1", "1.0", "true")
 
 
-def is_issued(v):
+def check_issued(v):
     return s(v).strip().lower() in ("1", "1.0", "true")
 
 
@@ -238,11 +239,8 @@ def ensure_first_admin():
                 st.error("Пароль минимум 8 символов")
             else:
                 append_row("users", {
-                    "login": login,
-                    "password_hash": hash_password(pwd),
-                    "role": "admin",
-                    "full_name": name,
-                    "active": "1",
+                    "login": login, "password_hash": hash_password(pwd),
+                    "role": "admin", "full_name": name, "active": "1",
                 })
                 st.success("Админ " + login + " создан. Войдите.")
                 st.rerun()
@@ -632,7 +630,7 @@ def render_act_text(trip, shipment):
         "VIN: " + (vin if vin else "_" * 20),
         "Маршрут: " + route, "", "",
         "Груз сдал: " + LINE_LONG + " / Сагитдинов М.Н. /",
-        "Груз принял: " + LINE_LONG + " / " + receiver + " /", "", "",
+        "Груз принят: " + LINE_LONG + " / " + receiver + " /", "", "",
         "Дата вручения груза: " + LINE_SHORT + "   Время: " + LINE_SHORT,
         "",
         "При подписании акта приема-передачи на момент вручения груза Стороны каких-либо претензий друг к другу не имеют.",
@@ -843,8 +841,7 @@ def main_page():
                 c3, c4 = st.columns(2)
                 route = c3.text_input("Маршрут")
                 dep = c4.text_input("Дата выезда (ДД.ММ.ГГГГ)", placeholder="12.05.2026")
-                c5, c6 = st.columns(2)
-                ret = c5.text_input("Дата возвращения (можно пусто)", placeholder="20.05.2026")
+                ret = st.text_input("Дата возвращения (можно пусто)", placeholder="20.05.2026")
                 ok = st.form_submit_button("Сохранить рейс")
                 cancel = st.form_submit_button("Отмена")
             if cancel:
@@ -1004,7 +1001,6 @@ def main_page():
                 if cars:
                     st.markdown("**Список автомобилей в рейсе**")
 
-                    # таблица: 15 колонок, кнопки внизу
                     hc = st.columns([1, 3, 3, 3, 2, 2, 2, 2, 2, 3, 2, 2, 1, 1, 1])
                     hc[0].markdown("**№**")
                     hc[1].markdown("**Марка / модель**")
@@ -1029,13 +1025,13 @@ def main_page():
                         nds_val = to_float(x.get("nds_amount"))
                         issued_val = s(x.get("issued", "0")).strip()
                         paid_val = s(x.get("paid", "0")).strip()
-                        is_paid = paid_val in ("1", "1.0", "true", "True")
-                        is_issued = issued_val in ("1", "1.0", "true", "True")
+                        is_paid_flag = paid_val in ("1", "1.0", "true", "True")
+                        is_issued_flag = issued_val in ("1", "1.0", "true", "True")
                         has_debt = debt_val > 0
 
-                        if is_issued:
+                        if is_issued_flag:
                             bg = "#c8e6c9"; bd = "#4caf50"
-                        elif is_paid:
+                        elif is_paid_flag:
                             bg = "#fff9c4"; bd = "#ffeb3b"
                         elif has_debt:
                             bg = "#ffcdd2"; bd = "#f44336"
@@ -1065,15 +1061,15 @@ def main_page():
                         row_cols[12].write(fmt_money(nds_val) if nds_val > 0 else "—")
 
                         if view_mode == "active":
-                            paid_label = "❌ Снять" if is_paid else "✅ Оплачен"
+                            paid_label = "❌ Снять" if is_paid_flag else "✅ Оплачен"
                             if row_cols[13].button(paid_label, key="btn_paid_" + s(x["id"])):
                                 toggle_paid(x["id"], paid_val)
                                 log_action(u["login"], role, "toggle_paid",
                                            "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
                                 st.rerun()
 
-                            if is_paid:
-                                issued_label = "↩ Снять" if is_issued else "✅ Выдан"
+                            if is_paid_flag:
+                                issued_label = "↩ Снять" if is_issued_flag else "✅ Выдан"
                                 if row_cols[14].button(issued_label, key="btn_issued_" + s(x["id"])):
                                     toggle_issued(x["id"], issued_val)
                                     log_action(u["login"], role, "toggle_issued",
@@ -1085,7 +1081,6 @@ def main_page():
                             row_cols[13].write("—")
                             row_cols[14].write("—")
 
-                        # Доп. кнопки: Акт, ✏, 🗑
                         act_cols = st.columns([1, 1, 1, 6])
                         if act_cols[0].button("📄 Акт", key="btn_act_inline_" + s(x["id"])):
                             st.session_state["show_act_for"] = x["id"]
@@ -1111,7 +1106,7 @@ def main_page():
                     sum_cols[4].markdown("**Авто:** " + s(len(cars)) + "/8")
 
                     if view_mode == "active" and can("archive", role):
-                        all_paid = all(is_paid(x.get("paid", "0")) for x in cars)
+                        all_paid = all(check_paid(x.get("paid", "0")) for x in cars)
                         if all_paid:
                             st.success("✅ Все авто оплачены — рейс можно отправить в архив")
                             if st.button("📦 Отправить рейс в архив", key="btn_arch_all_" + s(trip_id)):
