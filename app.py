@@ -24,7 +24,8 @@ SHEET_SCHEMAS = {
                   "advance", "advance_date",
                   "payer_type", "customer", "contract_number",
                   "nds_amount", "amount_no_nds",
-                  "created_by", "created_at", "issued", "paid", "archived"],
+                  "created_by", "created_at", "issued", "issued_ever",
+                  "paid", "archived"],
     "audit_log": ["id", "ts", "login", "role", "action", "details"],
     "act_log": ["id", "ts", "login", "trip_id", "shipment_id", "client"],
 }
@@ -212,6 +213,10 @@ def check_paid(v):
 
 
 def check_issued(v):
+    return s(v).strip().lower() in ("1", "1.0", "true", "да", "yes")
+
+
+def check_issued_ever(v):
     return s(v).strip().lower() in ("1", "1.0", "true", "да", "yes")
 
 
@@ -478,6 +483,7 @@ def create_shipment(trip_id, position, car_model, client, amount,
         "created_by": s(created_by),
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "issued": "0",
+        "issued_ever": "0",
         "paid": "0",
         "archived": "0",
     })
@@ -497,8 +503,9 @@ def update_shipment(shipment_id, position, car_model, client, amount,
             created_by = row[17] if len(row) > 17 else ""
             created_at = row[18] if len(row) > 18 else ""
             issued_val = row[19] if len(row) > 19 else "0"
-            paid_val = row[20] if len(row) > 20 else "0"
-            archived_val = row[21] if len(row) > 21 else "0"
+            issued_ever_val = row[20] if len(row) > 20 else "0"
+            paid_val = row[21] if len(row) > 21 else "0"
+            archived_val = row[22] if len(row) > 22 else "0"
             new_row = [
                 shipment_id, trip_id, position, s(car_model), s(client),
                 money_value(amount), s(date_pay), s(paid_to),
@@ -506,7 +513,8 @@ def update_shipment(shipment_id, position, car_model, client, amount,
                 money_value(advance), s(advance_date),
                 s(payer_type), s(customer), s(contract_number),
                 money_value(nds_amount), money_value(amount_no_nds),
-                created_by, created_at, issued_val, paid_val, archived_val,
+                created_by, created_at, issued_val, issued_ever_val,
+                paid_val, archived_val,
             ]
             ws.update("A" + str(i) + ":" + last_col + str(i), [new_row])
             invalidate_cache("shipments")
@@ -514,14 +522,22 @@ def update_shipment(shipment_id, position, car_model, client, amount,
     return False
 
 
-def toggle_issued(shipment_id, current_value):
+def toggle_issued(shipment_id, current_value, current_ever):
+    """Ставит/снимает issued (T=20). Устанавливает issued_ever=1, если выдали хотя бы раз."""
     ws = get_ws_cached("shipments")
     for i, row in enumerate(ws.get_all_values()[1:], start=2):
         if s(row[0]) == s(shipment_id):
-            new_val = "0" if s(current_value) == "1" else "1"
-            ws.update_cell(i, 20, new_val)
+            was_issued = s(current_value) == "1"
+            ever = s(current_ever) == "1"
+            if not was_issued:
+                # Ставим "Выдан"
+                ws.update_cell(i, 20, "1")
+                ws.update_cell(i, 21, "1")   # issued_ever = 1
+            else:
+                # Снимаем "Выдан" — оставляем issued_ever = 1
+                ws.update_cell(i, 20, "0")
             invalidate_cache("shipments")
-            return new_val
+            return "0" if was_issued else "1"
     return current_value
 
 
@@ -531,10 +547,10 @@ def toggle_paid(shipment_id, current_paid, current_amount, current_advance):
         if s(row[0]) == s(shipment_id):
             was_paid = s(current_paid) == "1"
             if not was_paid:
-                ws.update_cell(i, 11, money_value(current_amount))
-                ws.update_cell(i, 21, "1")
+                ws.update_cell(i, 11, money_value(current_amount))   # advance
+                ws.update_cell(i, 22, "1")                            # paid
             else:
-                ws.update_cell(i, 21, "0")
+                ws.update_cell(i, 22, "0")
             invalidate_cache("shipments")
             return "1" if not was_paid else "0"
     return current_paid
@@ -1027,19 +1043,25 @@ def main_page():
                         debt_val = amount_val - advance_val
                         nds_val = to_float(x.get("nds_amount"))
                         issued_val = s(x.get("issued", "0")).strip()
+                        issued_ever_val = s(x.get("issued_ever", "0")).strip()
                         paid_val = s(x.get("paid", "0")).strip()
                         is_paid_flag = check_paid(paid_val)
                         is_issued_flag = check_issued(issued_val)
+                        is_ever_flag = check_issued_ever(issued_ever_val)
                         has_debt = debt_val > 0.01
 
+                        # Логика цветов:
                         if is_issued_flag:
-                            bg = "#c8e6c9"; bd = "#4caf50"
+                            bg = "#c8e6c9"; bd = "#4caf50"; status_text = "🟢 Выдан"
+                        elif is_ever_flag and is_paid_flag:
+                            # Выдан снят, но оплачен → серый
+                            bg = "#f0f0f0"; bd = "#bdbdbd"; status_text = "⚪ Снят выдан"
                         elif is_paid_flag:
-                            bg = "#fff9c4"; bd = "#ffeb3b"
+                            bg = "#fff9c4"; bd = "#ffeb3b"; status_text = "🟡 Оплачен"
                         elif has_debt:
-                            bg = "#ffcdd2"; bd = "#f44336"
+                            bg = "#ffcdd2"; bd = "#f44336"; status_text = "🔴 Долг"
                         else:
-                            bg = "#ffffff"; bd = "#dddddd"
+                            bg = "#ffffff"; bd = "#dddddd"; status_text = "⚪ —"
 
                         st.markdown(
                             '<div style="background-color:' + bg +
@@ -1063,16 +1085,6 @@ def main_page():
                         row_cols[11].write(s(x.get("contract_number", "")))
                         row_cols[12].write(fmt_money(nds_val) if nds_val > 0 else "—")
 
-                        # ---- Статус + кнопки ВНИЗУ строки ----
-                        if is_issued_flag:
-                            status_text = "🟢 Выдан"
-                        elif is_paid_flag:
-                            status_text = "🟡 Оплачен"
-                        elif has_debt:
-                            status_text = "🔴 Долг"
-                        else:
-                            status_text = "⚪ —"
-
                         if view_mode == "active":
                             btn_cols = st.columns([2, 1, 1, 1, 1, 1, 5])
 
@@ -1082,7 +1094,7 @@ def main_page():
                                 + status_text + '</div>',
                                 unsafe_allow_html=True)
 
-                            # Кнопка «Оплачен» / «Снять»
+                            # Кнопка «Оплачен»
                             paid_label = "❌ Снять" if is_paid_flag else "✅ Оплачен"
                             if btn_cols[1].button(paid_label, key="btn_paid_" + s(x["id"])):
                                 toggle_paid(x["id"], paid_val, amount_val, advance_val)
@@ -1090,23 +1102,31 @@ def main_page():
                                            "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
                                 st.rerun()
 
-                            # Кнопка «Выдан» / «Снять выдан»
+                            # Кнопка «Выдан» / «Снять выдан» / «Вернуть выдан»
                             if is_issued_flag:
-                                # Уже выдан → «Снять выдан» — всегда активна
+                                # Уже выдан → можно снять
                                 if btn_cols[2].button("↩ Снять выдан",
                                                      key="btn_issued_" + s(x["id"])):
-                                    toggle_issued(x["id"], issued_val)
+                                    toggle_issued(x["id"], issued_val, issued_ever_val)
+                                    log_action(u["login"], role, "toggle_issued",
+                                               "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
+                                    st.rerun()
+                            elif is_ever_flag and is_paid_flag:
+                                # Снят выдан, но оплачен → можно вернуть
+                                if btn_cols[2].button("✅ Вернуть выдан",
+                                                     key="btn_issued_" + s(x["id"])):
+                                    toggle_issued(x["id"], issued_val, issued_ever_val)
                                     log_action(u["login"], role, "toggle_issued",
                                                "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
                                     st.rerun()
                             else:
-                                # Ещё не выдан → «Выдан» активна только если оплачен
+                                # Ещё никогда не выдавался → «Выдан», активна только если оплачен
                                 clicked_issued = btn_cols[2].button(
                                     "✅ Выдан",
                                     key="btn_issued_" + s(x["id"]),
                                     disabled=not is_paid_flag)
                                 if clicked_issued and is_paid_flag:
-                                    toggle_issued(x["id"], issued_val)
+                                    toggle_issued(x["id"], issued_val, issued_ever_val)
                                     log_action(u["login"], role, "toggle_issued",
                                                "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
                                     st.rerun()
