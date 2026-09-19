@@ -1263,10 +1263,6 @@ def main_page():
     grand_total = sum(to_float(x.get("amount")) for x in all_active_cars)
     grand_advance = sum(to_float(x.get("advance")) for x in all_active_cars)
     grand_debt = grand_total - grand_advance
-    grand_paid_amount = sum(
-        to_float(x.get("amount")) for x in all_active_cars
-        if check_paid(x.get("paid", "0"))
-    )
     grand_nds = sum(to_float(x.get("nds_amount")) for x in all_active_cars)
 
     spacer, totals = st.columns([2, 1])
@@ -1292,9 +1288,7 @@ def main_page():
             + ('<div style="display:flex; justify-content:space-between; margin:4px 0;">'
                '<span>НДС 22%:</span><b>' + fmt_money(grand_nds) + ' ₽</b></div>'
                if grand_nds > 0 else '')
-            + '<div style="display:flex; justify-content:space-between; margin:4px 0;">'
-            '<span>Оплачено (по флагу):</span><b>' + fmt_money(grand_paid_amount) + ' ₽</b></div>'
-            '</div>',
+            + '</div>',
             unsafe_allow_html=True,
         )
 
