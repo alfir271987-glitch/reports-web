@@ -524,18 +524,16 @@ def toggle_issued(shipment_id, current_value):
 
 
 def toggle_paid(shipment_id, current_paid, current_amount, current_advance):
-    """При включении 'Оплачен' — обнуляем задолженность, прибавив её к авансу.
-    При снятии — оставляем как есть (аванс не уменьшаем)."""
+    """При включении «Оплачен» — аванс = сумма (обнуляем задолженность).
+    При снятии — оставляем аванс как есть, только флаг."""
     ws = get_ws_cached("shipments")
     for i, row in enumerate(ws.get_all_values()[1:], start=2):
         if s(row[0]) == s(shipment_id):
             was_paid = s(current_paid) == "1"
             if not was_paid:
-                # включаем оплату → аванс = сумма
-                ws.update_cell(i, 11, money_value(current_amount))  # advance
-                ws.update_cell(i, 21, "1")                          # paid
+                ws.update_cell(i, 11, money_value(current_amount))
+                ws.update_cell(i, 21, "1")
             else:
-                # снимаем оплату → обнуляем аванс (или оставляем? оставляем как есть)
                 ws.update_cell(i, 21, "0")
             invalidate_cache("shipments")
             return "1" if not was_paid else "0"
@@ -1008,7 +1006,8 @@ def main_page():
                 if cars:
                     st.markdown("**Список автомобилей в рейсе**")
 
-                    hc = st.columns([1, 3, 3, 3, 2, 2, 2, 2, 2, 3, 2, 2, 1, 1])
+                    # 13 колонок — без статуса (перенесён к кнопкам)
+                    hc = st.columns([1, 3, 3, 3, 2, 2, 2, 2, 2, 3, 2, 2, 1])
                     hc[0].markdown("**№**")
                     hc[1].markdown("**Марка / модель**")
                     hc[2].markdown("**Клиент / Заказчик**")
@@ -1022,7 +1021,6 @@ def main_page():
                     hc[10].markdown("**Кому перевод**")
                     hc[11].markdown("**№ договора**")
                     hc[12].markdown("**НДС**")
-                    hc[13].markdown("**Статус**")
 
                     for x in sorted(cars, key=lambda z: int(to_float(z.get("position")))):
                         amount_val = to_float(x.get("amount"))
@@ -1051,7 +1049,7 @@ def main_page():
                             unsafe_allow_html=True)
 
                         client_display = s(x.get("client", "")) or s(x.get("customer", ""))
-                        row_cols = st.columns([1, 3, 3, 3, 2, 2, 2, 2, 2, 3, 2, 2, 1, 1])
+                        row_cols = st.columns([1, 3, 3, 3, 2, 2, 2, 2, 2, 3, 2, 2, 1])
                         row_cols[0].write(s(x.get("position", "")))
                         row_cols[1].write(s(x.get("car_model", "")))
                         row_cols[2].write(client_display)
@@ -1066,53 +1064,63 @@ def main_page():
                         row_cols[11].write(s(x.get("contract_number", "")))
                         row_cols[12].write(fmt_money(nds_val) if nds_val > 0 else "—")
 
+                        # ---- Статус + кнопки ВНИЗУ строки ----
                         if is_issued_flag:
-                            status = "🟢 Выдан"
+                            status_text = "🟢 Выдан"
                         elif is_paid_flag:
-                            status = "🟡 Оплачен"
+                            status_text = "🟡 Оплачен"
                         elif has_debt:
-                            status = "🔴 Долг"
+                            status_text = "🔴 Долг"
                         else:
-                            status = "⚪ —"
-                        row_cols[13].write(status)
+                            status_text = "⚪ —"
 
-                        # ---- Кнопки внизу строки ----
                         if view_mode == "active":
-                            btn_cols = st.columns([1, 1, 1, 1, 1, 5])
+                            btn_cols = st.columns([2, 1, 1, 1, 1, 1, 5])
 
-                            paid_label = "❌ Снять оплату" if is_paid_flag else "✅ Оплачен"
-                            if btn_cols[0].button(paid_label, key="btn_paid_" + s(x["id"])):
+                            btn_cols[0].markdown(
+                                '<div style="padding:6px 10px; background:#f0f0f0; '
+                                'border-radius:6px; text-align:center; font-weight:bold;">'
+                                + status_text + '</div>',
+                                unsafe_allow_html=True)
+
+                            paid_label = "❌ Снять" if is_paid_flag else "✅ Оплачен"
+                            if btn_cols[1].button(paid_label, key="btn_paid_" + s(x["id"])):
                                 toggle_paid(x["id"], paid_val, amount_val, advance_val)
                                 log_action(u["login"], role, "toggle_paid",
                                            "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
                                 st.rerun()
 
                             if is_paid_flag:
-                                issued_label = "↩ Снять выдан" if is_issued_flag else "✅ Выдан"
-                                if btn_cols[1].button(issued_label, key="btn_issued_" + s(x["id"])):
+                                issued_label = "↩ Снять" if is_issued_flag else "✅ Выдан"
+                                if btn_cols[2].button(issued_label, key="btn_issued_" + s(x["id"])):
                                     toggle_issued(x["id"], issued_val)
                                     log_action(u["login"], role, "toggle_issued",
                                                "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
                                     st.rerun()
                             else:
-                                btn_cols[1].write("Сначала Оплачен")
+                                btn_cols[2].write("Сначала Оплачен")
 
-                            if btn_cols[2].button("📄 Акт", key="btn_act_inline_" + s(x["id"])):
+                            if btn_cols[3].button("📄 Акт", key="btn_act_inline_" + s(x["id"])):
                                 st.session_state["show_act_for"] = x["id"]
                                 st.rerun()
 
-                            if btn_cols[3].button("✏", key="btn_edit_" + s(x["id"])):
+                            if btn_cols[4].button("✏", key="btn_edit_" + s(x["id"])):
                                 st.session_state["edit_ship_" + s(x["id"])] = True
 
                             if can("delete_ship", role):
-                                if btn_cols[4].button("🗑", key="btn_delship_" + s(x["id"])):
+                                if btn_cols[5].button("🗑", key="btn_delship_" + s(x["id"])):
                                     delete_shipment(x["id"])
                                     log_action(u["login"], role, "delete_ship",
                                                "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
                                     st.rerun()
                         else:
-                            btn_cols = st.columns([1, 1, 4])
-                            if btn_cols[0].button("📄 Акт", key="btn_act_inline_" + s(x["id"])):
+                            btn_cols = st.columns([2, 1, 5])
+                            btn_cols[0].markdown(
+                                '<div style="padding:6px 10px; background:#f0f0f0; '
+                                'border-radius:6px; text-align:center; font-weight:bold;">'
+                                + status_text + '</div>',
+                                unsafe_allow_html=True)
+                            if btn_cols[1].button("📄 Акт", key="btn_act_inline_" + s(x["id"])):
                                 st.session_state["show_act_for"] = x["id"]
                                 st.rerun()
 
