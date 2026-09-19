@@ -79,7 +79,9 @@ def read_all_cached(name):
     return ws.get_all_records()
 
 
-def read_all(name):
+def read_all(name, fresh=False):
+    if fresh:
+        read_all_cached.clear(name)
     return read_all_cached(name)
 
 
@@ -206,6 +208,7 @@ def is_archived(v):
 
 
 def check_paid(v):
+    """Проверяет, оплачено ли авто. Принимает 1, 1.0, true."""
     return s(v).strip().lower() in ("1", "1.0", "true")
 
 
@@ -366,12 +369,12 @@ def admin_panel():
             st.info("Пока пусто")
 
 
-def get_trips():
-    return read_all("trips")
+def get_trips(fresh=False):
+    return read_all("trips", fresh=fresh)
 
 
-def get_shipments():
-    return read_all("shipments")
+def get_shipments(fresh=False):
+    return read_all("shipments", fresh=fresh)
 
 
 def create_trip(tractor, driver, route, dep, ret, created_by):
@@ -513,6 +516,7 @@ def update_shipment(shipment_id, position, car_model, client, amount,
 
 
 def toggle_issued(shipment_id, current_value):
+    """Ставит/снимает флаг 'Выдан' (колонка T = 20)."""
     ws = get_ws_cached("shipments")
     for i, row in enumerate(ws.get_all_values()[1:], start=2):
         if s(row[0]) == s(shipment_id):
@@ -524,17 +528,19 @@ def toggle_issued(shipment_id, current_value):
 
 
 def toggle_paid(shipment_id, current_paid, current_amount, current_advance):
-    """При включении «Оплачен» — аванс = сумма (обнуляем задолженность).
-    При снятии — оставляем аванс как есть, только флаг."""
+    """При включении 'Оплачен':
+       - записываем advance = amount (обнуляем задолженность)
+       - записываем paid = 1
+       При выключении — снимаем только флаг paid."""
     ws = get_ws_cached("shipments")
     for i, row in enumerate(ws.get_all_values()[1:], start=2):
         if s(row[0]) == s(shipment_id):
             was_paid = s(current_paid) == "1"
             if not was_paid:
-                ws.update_cell(i, 11, money_value(current_amount))
-                ws.update_cell(i, 21, "1")
+                ws.update_cell(i, 11, money_value(current_amount))  # advance
+                ws.update_cell(i, 21, "1")                          # paid
             else:
-                ws.update_cell(i, 21, "0")
+                ws.update_cell(i, 21, "0")                          # снимаем
             invalidate_cache("shipments")
             return "1" if not was_paid else "0"
     return current_paid
@@ -786,8 +792,8 @@ def main_page():
 
     if st.session_state.get("show_act_for"):
         sid = st.session_state["show_act_for"]
-        shipments = get_shipments()
-        trips = get_trips()
+        shipments = get_shipments(fresh=True)
+        trips = get_trips(fresh=True)
         ship = next((x for x in shipments if s(x.get("id")) == s(sid)), None)
         if ship:
             trip = next((x for x in trips if s(x.get("id")) == s(ship.get("trip_id"))), None)
@@ -1006,7 +1012,6 @@ def main_page():
                 if cars:
                     st.markdown("**Список автомобилей в рейсе**")
 
-                    # 13 колонок — без статуса (перенесён к кнопкам)
                     hc = st.columns([1, 3, 3, 3, 2, 2, 2, 2, 2, 3, 2, 2, 1])
                     hc[0].markdown("**№**")
                     hc[1].markdown("**Марка / модель**")
