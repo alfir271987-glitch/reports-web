@@ -80,7 +80,6 @@ def read_all_cached(name):
 
 
 def read_all(name, fresh=False):
-    """Если fresh=True — сбрасывает кэш и читает заново из Google."""
     if fresh:
         read_all_cached.clear(name)
     return read_all_cached(name)
@@ -209,7 +208,6 @@ def is_archived(v):
 
 
 def check_paid(v):
-    """Проверяет, оплачено ли авто. Принимает 1, 1.0, true, да, yes."""
     return s(v).strip().lower() in ("1", "1.0", "true", "да", "yes")
 
 
@@ -517,7 +515,6 @@ def update_shipment(shipment_id, position, car_model, client, amount,
 
 
 def toggle_issued(shipment_id, current_value):
-    """Ставит/снимает флаг 'Выдан' — колонка T=20."""
     ws = get_ws_cached("shipments")
     for i, row in enumerate(ws.get_all_values()[1:], start=2):
         if s(row[0]) == s(shipment_id):
@@ -529,9 +526,8 @@ def toggle_issued(shipment_id, current_value):
 
 
 def toggle_paid(shipment_id, current_paid, current_amount, current_advance):
-    """При включении 'Оплачен':
-       advance = amount (обнуляем задолженность), paid = 1.
-       При выключении — только снимаем флаг paid."""
+    """При включении 'Оплачен' — advance = amount, paid = 1.
+    При выключении — только снимаем флаг paid."""
     ws = get_ws_cached("shipments")
     for i, row in enumerate(ws.get_all_values()[1:], start=2):
         if s(row[0]) == s(shipment_id):
@@ -806,7 +802,7 @@ def main_page():
                 return
         st.session_state.pop("show_act_for", None)
 
-    # ГЛАВНОЕ: читаем актуальные данные без кэша — чтобы статусы были свежими
+    # Читаем актуальные данные из Google, без кэша
     trips = get_trips(fresh=True)
     shipments = get_shipments(fresh=True)
 
@@ -1089,6 +1085,7 @@ def main_page():
                                 + status_text + '</div>',
                                 unsafe_allow_html=True)
 
+                            # Кнопка «Оплачен» — всегда кнопка
                             paid_label = "❌ Снять" if is_paid_flag else "✅ Оплачен"
                             if btn_cols[1].button(paid_label, key="btn_paid_" + s(x["id"])):
                                 toggle_paid(x["id"], paid_val, amount_val, advance_val)
@@ -1096,20 +1093,17 @@ def main_page():
                                            "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
                                 st.rerun()
 
-                            # Кнопка «Выдан» — активна только если оплачен
-                            if is_paid_flag:
-                                issued_label = "↩ Снять" if is_issued_flag else "✅ Выдан"
-                                if btn_cols[2].button(issued_label, key="btn_issued_" + s(x["id"])):
-                                    toggle_issued(x["id"], issued_val)
-                                    log_action(u["login"], role, "toggle_issued",
-                                               "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
-                                    st.rerun()
-                            else:
-                                btn_cols[2].markdown(
-                                    '<div style="padding:6px 10px; background:#eeeeee; '
-                                    'color:#999; border-radius:6px; text-align:center; '
-                                    'font-size:11px;">Сначала<br>Оплачен</div>',
-                                    unsafe_allow_html=True)
+                            # Кнопка «Выдан» — всегда кнопка, но неактивна, пока не оплачен
+                            issued_label = "↩ Снять выдан" if is_issued_flag else "✅ Выдан"
+                            clicked_issued = btn_cols[2].button(
+                                issued_label,
+                                key="btn_issued_" + s(x["id"]),
+                                disabled=not is_paid_flag)
+                            if clicked_issued and is_paid_flag:
+                                toggle_issued(x["id"], issued_val)
+                                log_action(u["login"], role, "toggle_issued",
+                                           "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
+                                st.rerun()
 
                             if btn_cols[3].button("📄 Акт", key="btn_act_inline_" + s(x["id"])):
                                 st.session_state["show_act_for"] = x["id"]
