@@ -109,17 +109,14 @@ def ensure_sheets_once():
                 current = ws.row_values(1)
             except Exception:
                 current = []
-            # какие заголовки отсутствуют
             missing = [h for h in headers if h not in current]
             if missing:
-                # расширяем лист, если нужно
                 needed_cols = max(len(headers), len(current) + len(missing))
                 if ws.col_count < needed_cols:
                     try:
                         ws.add_cols(needed_cols - ws.col_count)
                     except Exception:
                         pass
-                # дописываем недостающие заголовки в конец
                 start_col = len(current) + 1
                 for idx, h in enumerate(missing):
                     try:
@@ -574,7 +571,6 @@ def toggle_paid(shipment_id, current_paid, current_amount, current_advance):
                    advance_before_paid := прежний аванс.
     При снятии: advance := advance_before_paid (задолженность возвращается)."""
     ws = get_ws_cached("shipments")
-    # Подстраховка: если колонки X нет — расширяем лист
     try:
         if ws.col_count < 24:
             ws.add_cols(24 - ws.col_count)
@@ -591,17 +587,17 @@ def toggle_paid(shipment_id, current_paid, current_amount, current_advance):
 
             if not was_paid:
                 try:
-                    ws.update_cell(i, 24, money_value(advance_val))  # advance_before_paid
+                    ws.update_cell(i, 24, money_value(advance_val))
                 except Exception:
                     pass
-                ws.update_cell(i, 11, amount_val)                    # advance := amount
-                ws.update_cell(i, 22, "1")                           # paid = 1
+                ws.update_cell(i, 11, amount_val)
+                ws.update_cell(i, 22, "1")
             else:
                 restore = money_value(prev_adv) if s(prev_adv).strip() != "" else 0.0
-                ws.update_cell(i, 11, restore)                       # advance := старый
-                ws.update_cell(i, 22, "0")                           # paid = 0
+                ws.update_cell(i, 11, restore)
+                ws.update_cell(i, 22, "0")
                 try:
-                    ws.update_cell(i, 24, "")                        # очищаем
+                    ws.update_cell(i, 24, "")
                 except Exception:
                     pass
             invalidate_cache("shipments")
@@ -1255,6 +1251,52 @@ def main_page():
                             st.rerun()
                 else:
                     st.info("В этом рейсе ещё нет авто.")
+
+    # ============================================================
+    # ИТОГО (снизу справа) — только по АКТИВНЫМ рейсам
+    # ============================================================
+    st.markdown("---")
+
+    active_trip_ids = {s(t.get("id")) for t in trips if not is_archived(t.get("archived", "0"))}
+    all_active_cars = [x for x in shipments if s(x.get("trip_id")) in active_trip_ids]
+
+    grand_total = sum(to_float(x.get("amount")) for x in all_active_cars)
+    grand_advance = sum(to_float(x.get("advance")) for x in all_active_cars)
+    grand_debt = grand_total - grand_advance
+    grand_paid_amount = sum(
+        to_float(x.get("amount")) for x in all_active_cars
+        if check_paid(x.get("paid", "0"))
+    )
+    grand_nds = sum(to_float(x.get("nds_amount")) for x in all_active_cars)
+
+    spacer, totals = st.columns([2, 1])
+    with totals:
+        st.markdown(
+            '<div style="background:#f5f5f5; border:1px solid #cccccc; '
+            'border-radius:8px; padding:14px 18px;">'
+            '<div style="font-size:18px; font-weight:bold; margin-bottom:8px;">'
+            'Итого (активные)</div>'
+            '<div style="display:flex; justify-content:space-between; margin:4px 0;">'
+            '<span>Активных рейсов:</span><b>' + s(len(active_trip_ids)) + '</b></div>'
+            '<div style="display:flex; justify-content:space-between; margin:4px 0;">'
+            '<span>Авто:</span><b>' + s(len(all_active_cars)) + '</b></div>'
+            '<div style="display:flex; justify-content:space-between; margin:4px 0;">'
+            '<span>Общая сумма:</span><b>' + fmt_money(grand_total) + ' ₽</b></div>'
+            '<div style="display:flex; justify-content:space-between; margin:4px 0;">'
+            '<span>Общая оплата:</span><b>' + fmt_money(grand_advance) + ' ₽</b></div>'
+            '<div style="display:flex; justify-content:space-between; margin:4px 0; '
+            'border-top:1px solid #cccccc; padding-top:6px;">'
+            '<span>Общая задолженность:</span>'
+            '<b style="color:' + ("#c62828" if grand_debt > 0.01 else "#2e7d32") + ';">'
+            + fmt_money(grand_debt) + ' ₽</b></div>'
+            + ('<div style="display:flex; justify-content:space-between; margin:4px 0;">'
+               '<span>НДС 22%:</span><b>' + fmt_money(grand_nds) + ' ₽</b></div>'
+               if grand_nds > 0 else '')
+            + '<div style="display:flex; justify-content:space-between; margin:4px 0;">'
+            '<span>Оплачено (по флагу):</span><b>' + fmt_money(grand_paid_amount) + ' ₽</b></div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
 
 
 def main():
