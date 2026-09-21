@@ -17,7 +17,7 @@ SHEET_SCHEMAS = {
     "users": ["login", "password_hash", "role", "full_name", "active"],
     "trips": ["id", "tractor_number", "driver", "route",
               "date_departure", "date_return", "created_by", "created_at",
-              "archived"],
+              "archived", "completed", "completed_at"],
     "shipments": ["id", "trip_id", "position", "car_model", "client",
                   "amount", "date_pay", "paid_to",
                   "delivery_city", "vin",
@@ -95,8 +95,6 @@ def invalidate_cache(name=None):
 
 @st.cache_resource
 def ensure_sheets_once():
-    """Создаёт отсутствующие листы и дописывает недостающие заголовки
-    в существующие (например, advance_before_paid в shipments)."""
     book = get_book()
     existing = {ws.title for ws in book.worksheets()}
     for name, headers in SHEET_SCHEMAS.items():
@@ -242,6 +240,10 @@ def check_issued_ever(v):
     return s(v).strip().lower() in ("1", "1.0", "true", "да", "yes")
 
 
+def check_completed(v):
+    return s(v).strip().lower() in ("1", "1.0", "true", "да", "yes")
+
+
 def safe_df(rows):
     if not rows:
         return rows
@@ -280,14 +282,14 @@ def can(action, role):
         "admin":      {"create_trip", "edit_trip", "delete_trip",
                        "create_ship", "edit_ship", "delete_ship",
                        "export", "print_act", "manage_users", "view_log",
-                       "archive"},
+                       "archive", "complete_trip"},
         "director":   {"create_trip", "edit_trip", "delete_trip",
                        "create_ship", "edit_ship", "delete_ship",
-                       "export", "print_act", "archive"},
+                       "export", "print_act", "archive", "complete_trip"},
         "logist":     {"create_trip", "edit_trip", "create_ship", "edit_ship",
-                       "export", "print_act", "archive"},
+                       "export", "print_act", "archive", "complete_trip"},
         "dispatcher": {"create_trip", "edit_trip", "create_ship", "edit_ship",
-                       "export", "print_act", "archive"},
+                       "export", "print_act", "archive", "complete_trip"},
     }
     return action in rights.get(role, set())
 
@@ -411,6 +413,8 @@ def create_trip(tractor, driver, route, dep, ret, created_by):
         "created_by": s(created_by),
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "archived": "0",
+        "completed": "0",
+        "completed_at": "",
     })
 
 
@@ -424,8 +428,10 @@ def update_trip(trip_id, tractor, driver, route, dep, ret):
             cb = row[6] if len(row) > 6 else ""
             ca = row[7] if len(row) > 7 else ""
             arch = row[8] if len(row) > 8 else "0"
+            comp = row[9] if len(row) > 9 else "0"
+            comp_at = row[10] if len(row) > 10 else ""
             new_row = [trip_id, s(tractor), s(driver), s(route), s(dep), s(ret),
-                       cb, ca, arch]
+                       cb, ca, arch, comp, comp_at]
             ws.update("A" + str(i) + ":" + last_col + str(i), [new_row])
             invalidate_cache("trips")
             return True
@@ -441,7 +447,10 @@ def archive_trip(trip_id):
         if s(row[0]) == s(trip_id):
             cb = row[6] if len(row) > 6 else ""
             ca = row[7] if len(row) > 7 else ""
-            new_row = [trip_id, row[1], row[2], row[3], row[4], row[5], cb, ca, "1"]
+            comp = row[9] if len(row) > 9 else "0"
+            comp_at = row[10] if len(row) > 10 else ""
+            new_row = [trip_id, row[1], row[2], row[3], row[4], row[5], cb, ca, "1",
+                       comp, comp_at]
             ws.update("A" + str(i) + ":" + last_col + str(i), [new_row])
             invalidate_cache("trips")
             return True
@@ -457,7 +466,46 @@ def unarchive_trip(trip_id):
         if s(row[0]) == s(trip_id):
             cb = row[6] if len(row) > 6 else ""
             ca = row[7] if len(row) > 7 else ""
-            new_row = [trip_id, row[1], row[2], row[3], row[4], row[5], cb, ca, "0"]
+            comp = row[9] if len(row) > 9 else "0"
+            comp_at = row[10] if len(row) > 10 else ""
+            new_row = [trip_id, row[1], row[2], row[3], row[4], row[5], cb, ca, "0",
+                       comp, comp_at]
+            ws.update("A" + str(i) + ":" + last_col + str(i), [new_row])
+            invalidate_cache("trips")
+            return True
+    return False
+
+
+def complete_trip(trip_id, completed_at):
+    ws = get_ws_cached("trips")
+    all_rows = ws.get_all_values()
+    headers = SHEET_SCHEMAS["trips"]
+    last_col = chr(64 + len(headers))
+    for i, row in enumerate(all_rows[1:], start=2):
+        if s(row[0]) == s(trip_id):
+            new_row = [trip_id, row[1], row[2], row[3], row[4], row[5],
+                       row[6] if len(row) > 6 else "",
+                       row[7] if len(row) > 7 else "",
+                       row[8] if len(row) > 8 else "0",
+                       "1", s(completed_at)]
+            ws.update("A" + str(i) + ":" + last_col + str(i), [new_row])
+            invalidate_cache("trips")
+            return True
+    return False
+
+
+def uncomplete_trip(trip_id):
+    ws = get_ws_cached("trips")
+    all_rows = ws.get_all_values()
+    headers = SHEET_SCHEMAS["trips"]
+    last_col = chr(64 + len(headers))
+    for i, row in enumerate(all_rows[1:], start=2):
+        if s(row[0]) == s(trip_id):
+            new_row = [trip_id, row[1], row[2], row[3], row[4], row[5],
+                       row[6] if len(row) > 6 else "",
+                       row[7] if len(row) > 7 else "",
+                       row[8] if len(row) > 8 else "0",
+                       "0", ""]
             ws.update("A" + str(i) + ":" + last_col + str(i), [new_row])
             invalidate_cache("trips")
             return True
@@ -547,29 +595,22 @@ def update_shipment(shipment_id, position, car_model, client, amount,
 
 
 def toggle_issued(shipment_id, current_value, current_ever):
-    """Ставит/снимает issued (T=20).
-    При установке: issued=1, issued_ever=1.
-    При снятии: issued=0, paid=0 (авто уходит в статус «Долг»)."""
     ws = get_ws_cached("shipments")
     for i, row in enumerate(ws.get_all_values()[1:], start=2):
         if s(row[0]) == s(shipment_id):
             was_issued = s(current_value) == "1"
             if not was_issued:
                 ws.update_cell(i, 20, "1")
-                ws.update_cell(i, 21, "1")   # issued_ever = 1
+                ws.update_cell(i, 21, "1")
             else:
                 ws.update_cell(i, 20, "0")
-                ws.update_cell(i, 22, "0")   # paid = 0
+                ws.update_cell(i, 22, "0")
             invalidate_cache("shipments")
             return "0" if was_issued else "1"
     return current_value
 
 
 def toggle_paid(shipment_id, current_paid, current_amount, current_advance):
-    """Ставит/снимает paid (V=22).
-    При установке: advance := amount (задолженность = 0),
-                   advance_before_paid := прежний аванс.
-    При снятии: advance := advance_before_paid (задолженность возвращается)."""
     ws = get_ws_cached("shipments")
     try:
         if ws.col_count < 24:
@@ -824,12 +865,73 @@ def render_shipment_form(form_key, c=None, submit_label="Сохранить ав
     }
 
 
+# ============================================================
+# Отрисовка шапки рейса с цветом
+# ============================================================
+
+def render_trip_header(trip_id, tractor, driver, route, dep, ret,
+                       trip_completed, trip_completed_at,
+                       cars_count, total, total_advance, total_debt, total_nds):
+    """Цветная шапка рейса.
+    Красная — если есть задолженность (не оплачено).
+    Зелёная — если все авто оплачены (или нет задолженности).
+    Серая — если рейс пустой.
+    Бейдж «Рейс завершён» — в конце строки (справа)."""
+    if cars_count == 0:
+        bg, bd = "#fafafa", "#dddddd"
+    elif total_debt > 0.01:
+        bg, bd = "#ffcdd2", "#e53935"
+    else:
+        bg, bd = "#c8e6c9", "#43a047"
+
+    title = s(tractor) + " — " + s(driver) + " — " + s(route) + " — выезд " + s(dep)
+    if ret:
+        title += " — возврат " + s(ret)
+
+    stats = ("авто: " + s(cars_count) + "/8"
+             + "  |  сумма: " + fmt_money(total)
+             + "  |  аванс: " + fmt_money(total_advance)
+             + "  |  задолженность: " + fmt_money(total_debt))
+    if total_nds > 0:
+        stats += "  |  НДС: " + fmt_money(total_nds)
+
+    # Бейдж «Рейс завершён» — в конце строки
+    completed_html = ""
+    if trip_completed:
+        badge_text = "✅ Рейс завершён" + (
+            ": " + s(trip_completed_at) if trip_completed_at else "")
+        completed_html = (
+            '<span style="background:#2e7d32; color:#fff; '
+            'padding:2px 10px; border-radius:12px; font-size:12px; '
+            'font-weight:bold; white-space:nowrap;">'
+            + badge_text + '</span>')
+
+    st.markdown(
+        '<div style="background-color:' + bg +
+        '; border:2px solid ' + bd +
+        '; border-radius:8px; padding:10px 14px; margin-bottom:6px; '
+        'font-size:14px; word-wrap:break-word;">'
+        # Первая строка: название слева, бейдж справа
+        '<div style="display:flex; justify-content:space-between; '
+        'align-items:center; gap:10px; flex-wrap:wrap;">'
+        '<div style="font-weight:bold; flex:1; min-width:200px;">'
+        + title +
+        '</div>'
+        '<div>' + completed_html + '</div>'
+        '</div>'
+        # Вторая строка: статистика
+        '<div style="color:#333; margin-top:4px;">' + stats + '</div>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+
 def main_page():
     u = st.session_state["user"]
     role = u["role"]
 
     st.sidebar.markdown("**" + s(u["full_name"]) + "**  \nроль: `" + s(role) + "`")
-    if st.sidebar.button("Выйти", key="btn_logout"):
+    if st.sidebar.button("Выйти", key="btn_logout", use_container_width=True):
         logout()
 
     if role == "admin":
@@ -946,6 +1048,8 @@ def main_page():
             route = s(t.get("route", ""))
             dep = date_to_display_safe(t.get("date_departure", ""))
             ret = date_to_display_safe(t.get("date_return", ""))
+            trip_completed = check_completed(t.get("completed", "0"))
+            trip_completed_at = date_to_display_safe(t.get("completed_at", ""))
 
             cars = [x for x in shipments if s(x.get("trip_id")) == s(trip_id)]
             total = sum(to_float(x.get("amount")) for x in cars)
@@ -953,43 +1057,88 @@ def main_page():
             total_debt = total - total_advance
             total_nds = sum(to_float(x.get("nds_amount")) for x in cars)
 
-            header = s(tractor) + " — " + s(driver) + " — " + s(route) + " — выезд " + s(dep)
-            if ret:
-                header += " — возврат " + s(ret)
+            # ==== ЦВЕТНАЯ ШАПКА РЕЙСА ====
+            render_trip_header(trip_id, tractor, driver, route, dep, ret,
+                               trip_completed, trip_completed_at,
+                               len(cars), total, total_advance, total_debt, total_nds)
 
-            summary = ("авто: " + s(len(cars)) + "/8"
-                       + "  |  сумма: " + fmt_money(total)
-                       + "  |  аванс: " + fmt_money(total_advance)
-                       + "  |  задолженность: " + fmt_money(total_debt))
-            if total_nds > 0:
-                summary += "  |  НДС: " + fmt_money(total_nds)
-
-            with st.expander(header + "  |  " + summary):
-
-                c1, c2, c3, c4 = st.columns(4)
+            # Раскрывашка с деталями рейса
+            with st.expander("Подробнее ▾", expanded=False):
                 if view_mode == "active":
+                    bc1, bc2, bc3, bc4 = st.columns([1, 1, 1, 1])
                     if can("create_ship", role):
-                        if c1.button("Добавить авто", key="btn_show_addcar_" + s(trip_id)):
+                        if bc1.button("Добавить авто", key="btn_show_addcar_" + s(trip_id),
+                                      use_container_width=True):
                             st.session_state["open_addcar_" + s(trip_id)] = True
                     if can("edit_trip", role):
-                        if c2.button("Редактировать рейс", key="btn_show_edittrip_" + s(trip_id)):
+                        if bc2.button("Рейс ✏", key="btn_show_edittrip_" + s(trip_id),
+                                      use_container_width=True):
                             st.session_state["open_edittrip_" + s(trip_id)] = True
+                    if can("complete_trip", role):
+                        if trip_completed:
+                            if bc3.button("↩ Отменить завершение",
+                                          key="btn_uncomplete_" + s(trip_id),
+                                          use_container_width=True):
+                                uncomplete_trip(trip_id)
+                                log_action(u["login"], role, "uncomplete_trip",
+                                           s(tractor) + " " + s(driver))
+                                st.rerun()
+                        else:
+                            if bc3.button("✅ Завершить рейс",
+                                          key="btn_complete_" + s(trip_id),
+                                          use_container_width=True):
+                                st.session_state["open_complete_" + s(trip_id)] = True
                     if can("archive", role):
-                        if c3.button("📦 В архив", key="btn_arch_trip_" + s(trip_id)):
+                        if bc4.button("📦 В архив", key="btn_arch_trip_" + s(trip_id),
+                                      use_container_width=True):
                             archive_trip(trip_id)
-                            log_action(u["login"], role, "archive_trip", s(tractor) + " " + s(driver))
+                            log_action(u["login"], role, "archive_trip",
+                                       s(tractor) + " " + s(driver))
                             st.success("Рейс отправлен в архив")
                             st.rerun()
-                    if can("delete_trip", role):
-                        if c4.button("Удалить рейс", key="btn_show_deltrip_" + s(trip_id)):
-                            st.session_state["open_deltrip_" + s(trip_id)] = True
                 else:
+                    bc1, bc2 = st.columns([1, 1])
                     if can("archive", role):
-                        if c1.button("♻ Вернуть из архива", key="btn_unarch_trip_" + s(trip_id)):
+                        if bc1.button("♻ Вернуть из архива",
+                                      key="btn_unarch_trip_" + s(trip_id),
+                                      use_container_width=True):
                             unarchive_trip(trip_id)
-                            log_action(u["login"], role, "unarchive_trip", s(tractor) + " " + s(driver))
+                            log_action(u["login"], role, "unarchive_trip",
+                                       s(tractor) + " " + s(driver))
                             st.success("Рейс возвращён из архива")
                             st.rerun()
+
+                # Форма завершения рейса
+                if st.session_state.get("open_complete_" + s(trip_id)):
+                    with st.form("complete_" + s(trip_id)):
+                        st.markdown("**Завершение рейса**")
+                        default_date = trip_completed_at if trip_completed_at else datetime.now().strftime("%d.%m.%Y")
+                        comp_date = st.text_input("Дата завершения (ДД.ММ.ГГГГ)",
+                                                   value=default_date)
+                        c_ok = st.form_submit_button("Завершить")
+                        c_no = st.form_submit_button("Отмена")
+                    if c_no:
+                        st.session_state.pop("open_complete_" + s(trip_id), None)
+                        st.rerun()
+                    if c_ok:
+                        try:
+                            comp_fmt = parse_date_ui(comp_date)
+                        except ValueError as ex:
+                            st.error(str(ex))
+                        else:
+                            complete_trip(trip_id, comp_fmt)
+                            log_action(u["login"], role, "complete_trip",
+                                       s(tractor) + " " + s(driver) + " " + s(comp_fmt))
+                            st.session_state.pop("open_complete_" + s(trip_id), None)
+                            st.success("Рейс завершён")
+                            st.rerun()
+
+                if can("delete_trip", role) and view_mode == "active":
+                    dc1, dc2 = st.columns([5, 1])
+                    with dc2:
+                        if st.button("🗑 Удалить рейс", key="btn_show_deltrip_" + s(trip_id),
+                                     use_container_width=True):
+                            st.session_state["open_deltrip_" + s(trip_id)] = True
 
                 if st.session_state.get("open_edittrip_" + s(trip_id)):
                     with st.form("edit_trip_" + s(trip_id)):
@@ -1016,7 +1165,8 @@ def main_page():
                             except ValueError as ex:
                                 st.error(str(ex))
                             else:
-                                update_trip(trip_id, e_tractor, e_driver, e_route, e_dep_fmt, e_ret_fmt)
+                                update_trip(trip_id, e_tractor, e_driver, e_route,
+                                            e_dep_fmt, e_ret_fmt)
                                 log_action(u["login"], role, "edit_trip",
                                            s(e_tractor) + " " + s(e_driver) + " " + s(e_dep_fmt))
                                 st.session_state.pop("open_edittrip_" + s(trip_id), None)
@@ -1026,12 +1176,14 @@ def main_page():
                 if st.session_state.get("open_deltrip_" + s(trip_id)):
                     st.warning("Удалить рейс «" + s(tractor) + " — " + s(driver) + "» вместе со всеми авто?")
                     cc1, cc2 = st.columns(2)
-                    if cc1.button("Да, удалить", key="btn_yes_del_trip_" + s(trip_id)):
+                    if cc1.button("Да, удалить", key="btn_yes_del_trip_" + s(trip_id),
+                                  use_container_width=True):
                         delete_trip(trip_id)
                         log_action(u["login"], role, "delete_trip", s(tractor) + " " + s(driver))
                         st.session_state.pop("open_deltrip_" + s(trip_id), None)
                         st.rerun()
-                    if cc2.button("Отмена", key="btn_no_del_trip_" + s(trip_id)):
+                    if cc2.button("Отмена", key="btn_no_del_trip_" + s(trip_id),
+                                  use_container_width=True):
                         st.session_state.pop("open_deltrip_" + s(trip_id), None)
                         st.rerun()
 
@@ -1071,21 +1223,6 @@ def main_page():
                 if cars:
                     st.markdown("**Список автомобилей в рейсе**")
 
-                    hc = st.columns([1, 3, 3, 3, 2, 2, 2, 2, 2, 3, 2, 2, 1])
-                    hc[0].markdown("**№**")
-                    hc[1].markdown("**Марка / модель**")
-                    hc[2].markdown("**Клиент / Заказчик**")
-                    hc[3].markdown("**VIN**")
-                    hc[4].markdown("**Сумма**")
-                    hc[5].markdown("**Аванс**")
-                    hc[6].markdown("**Задолж.**")
-                    hc[7].markdown("**Город доставки**")
-                    hc[8].markdown("**Дата аванса**")
-                    hc[9].markdown("**Способ оплаты**")
-                    hc[10].markdown("**Кому перевод**")
-                    hc[11].markdown("**№ договора**")
-                    hc[12].markdown("**НДС**")
-
                     for x in sorted(cars, key=lambda z: int(to_float(z.get("position")))):
                         amount_val = to_float(x.get("amount"))
                         advance_val = to_float(x.get("advance"))
@@ -1099,10 +1236,12 @@ def main_page():
                         is_ever_flag = check_issued_ever(issued_ever_val)
                         has_debt = debt_val > 0.01
 
-                        if is_issued_flag:
+                        if is_issued_flag and not has_debt:
                             bg = "#c8e6c9"; bd = "#4caf50"; status_text = "🟢 Выдан"
-                        elif is_paid_flag:
+                        elif is_paid_flag and not has_debt:
                             bg = "#fff9c4"; bd = "#ffeb3b"; status_text = "🟡 Оплачен"
+                        elif has_debt and is_issued_flag:
+                            bg = "#ffcdd2"; bd = "#f44336"; status_text = "🔴 Выдан с долгом"
                         elif has_debt:
                             bg = "#ffcdd2"; bd = "#f44336"; status_text = "🔴 Долг"
                         else:
@@ -1111,105 +1250,95 @@ def main_page():
                         st.markdown(
                             '<div style="background-color:' + bg +
                             '; border:1px solid ' + bd +
-                            '; border-radius:6px; padding:6px; margin-bottom:4px;">',
+                            '; border-radius:6px; padding:8px; margin-bottom:6px; '
+                            'font-size:14px; word-wrap:break-word;">',
                             unsafe_allow_html=True)
 
                         client_display = s(x.get("client", "")) or s(x.get("customer", ""))
-                        row_cols = st.columns([1, 3, 3, 3, 2, 2, 2, 2, 2, 3, 2, 2, 1])
-                        row_cols[0].write(s(x.get("position", "")))
-                        row_cols[1].write(s(x.get("car_model", "")))
-                        row_cols[2].write(client_display)
-                        row_cols[3].write(s(x.get("vin", ""))[:17])
-                        row_cols[4].write(fmt_money(amount_val))
-                        row_cols[5].write(fmt_money(advance_val))
-                        row_cols[6].write(fmt_money(debt_val))
-                        row_cols[7].write(s(x.get("delivery_city", "")))
-                        row_cols[8].write(date_to_display_safe(x.get("advance_date", "")))
-                        row_cols[9].write(s(x.get("payer_type", "")))
-                        row_cols[10].write(s(x.get("paid_to", "")))
-                        row_cols[11].write(s(x.get("contract_number", "")))
-                        row_cols[12].write(fmt_money(nds_val) if nds_val > 0 else "—")
+                        st.markdown(
+                            "**Поз. " + s(x.get("position", "")) + "** · "
+                            + s(x.get("car_model", "")) + " · "
+                            + client_display + " · VIN: "
+                            + (s(x.get("vin", ""))[:17] or "—") + "  \n"
+                            "Сумма: **" + fmt_money(amount_val) + "** | "
+                            "Аванс: **" + fmt_money(advance_val) + "** | "
+                            "Задолж.: **" + fmt_money(debt_val) + "**" +
+                            (" | НДС: " + fmt_money(nds_val) if nds_val > 0 else "") +
+                            "  \nСтатус: **" + status_text + "**"
+                        )
+                        details = []
+                        if s(x.get("delivery_city", "")):
+                            details.append("Город: " + s(x.get("delivery_city", "")))
+                        if s(x.get("advance_date", "")):
+                            details.append("Дата аванса: " + date_to_display_safe(x.get("advance_date", "")))
+                        if s(x.get("payer_type", "")):
+                            details.append("Оплата: " + s(x.get("payer_type", "")))
+                        if s(x.get("paid_to", "")):
+                            details.append("Кому: " + s(x.get("paid_to", "")))
+                        if s(x.get("contract_number", "")):
+                            details.append("№ договора: " + s(x.get("contract_number", "")))
+                        if details:
+                            st.caption(" · ".join(details))
 
                         if view_mode == "active":
-                            btn_cols = st.columns([2, 1, 1, 1, 1, 1, 5])
-
-                            btn_cols[0].markdown(
-                                '<div style="padding:6px 10px; background:#f0f0f0; '
-                                'border-radius:6px; text-align:center; font-weight:bold;">'
-                                + status_text + '</div>',
-                                unsafe_allow_html=True)
-
+                            bc1, bc2, bc3, bc4 = st.columns(4)
                             paid_label = "❌ Снять" if is_paid_flag else "✅ Оплачен"
-                            if btn_cols[1].button(paid_label, key="btn_paid_" + s(x["id"])):
+                            if bc1.button(paid_label, key="btn_paid_" + s(x["id"]),
+                                          use_container_width=True):
                                 toggle_paid(x["id"], paid_val, amount_val, advance_val)
                                 log_action(u["login"], role, "toggle_paid",
                                            "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
                                 st.rerun()
 
                             if is_issued_flag:
-                                if btn_cols[2].button("↩ Снять выдан",
-                                                     key="btn_issued_" + s(x["id"])):
+                                if bc2.button("↩ Снять выдан", key="btn_issued_" + s(x["id"]),
+                                              use_container_width=True):
                                     toggle_issued(x["id"], issued_val, issued_ever_val)
                                     log_action(u["login"], role, "toggle_issued",
                                                "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
                                     st.rerun()
                             else:
-                                clicked_issued = btn_cols[2].button(
-                                    "✅ Выдан",
-                                    key="btn_issued_" + s(x["id"]),
-                                    disabled=not is_paid_flag)
-                                if clicked_issued and is_paid_flag:
+                                if bc2.button("✅ Выдан", key="btn_issued_" + s(x["id"]),
+                                              use_container_width=True):
                                     toggle_issued(x["id"], issued_val, issued_ever_val)
                                     log_action(u["login"], role, "toggle_issued",
                                                "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
                                     st.rerun()
 
-                            if btn_cols[3].button("📄 Акт", key="btn_act_inline_" + s(x["id"])):
+                            if bc3.button("📄 Акт", key="btn_act_inline_" + s(x["id"]),
+                                          use_container_width=True):
                                 st.session_state["show_act_for"] = x["id"]
                                 st.rerun()
 
-                            if btn_cols[4].button("✏", key="btn_edit_" + s(x["id"])):
+                            if bc4.button("✏ Изменить", key="btn_edit_" + s(x["id"]),
+                                          use_container_width=True):
                                 st.session_state["edit_ship_" + s(x["id"])] = True
 
                             if can("delete_ship", role):
-                                if btn_cols[5].button("🗑", key="btn_delship_" + s(x["id"])):
+                                if st.button("🗑 Удалить авто", key="btn_delship_" + s(x["id"]),
+                                             use_container_width=True):
                                     delete_shipment(x["id"])
                                     log_action(u["login"], role, "delete_ship",
                                                "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
                                     st.rerun()
                         else:
-                            btn_cols = st.columns([2, 1, 5])
-                            btn_cols[0].markdown(
-                                '<div style="padding:6px 10px; background:#f0f0f0; '
-                                'border-radius:6px; text-align:center; font-weight:bold;">'
-                                + status_text + '</div>',
-                                unsafe_allow_html=True)
-                            if btn_cols[1].button("📄 Акт", key="btn_act_inline_" + s(x["id"])):
+                            bc1, bc2 = st.columns(2)
+                            if bc1.button("📄 Акт", key="btn_act_inline_" + s(x["id"]),
+                                          use_container_width=True):
                                 st.session_state["show_act_for"] = x["id"]
                                 st.rerun()
 
                         st.markdown("</div>", unsafe_allow_html=True)
 
                     st.markdown("---")
-                    sum_cols = st.columns(5)
+                    sum_cols = st.columns(2)
                     sum_cols[0].markdown("**Сумма:** " + fmt_money(total))
                     sum_cols[1].markdown("**Аванс:** " + fmt_money(total_advance))
-                    sum_cols[2].markdown("**Задолженность:** " + fmt_money(total_debt))
-                    sum_cols[3].markdown("**НДС 22%:** " + fmt_money(total_nds))
-                    sum_cols[4].markdown("**Авто:** " + s(len(cars)) + "/8")
-
-                    if view_mode == "active" and can("archive", role):
-                        all_paid = all(check_paid(x.get("paid", "0")) for x in cars)
-                        if all_paid:
-                            st.success("✅ Все авто оплачены — рейс можно отправить в архив")
-                            if st.button("📦 Отправить рейс в архив", key="btn_arch_all_" + s(trip_id)):
-                                archive_trip(trip_id)
-                                log_action(u["login"], role, "archive_trip_full",
-                                           s(tractor) + " " + s(driver))
-                                st.success("Рейс отправлен в архив")
-                                st.rerun()
-                        else:
-                            st.warning("⚠ Есть неоплаченные авто — рейс нельзя отправить в архив, пока не оплачены")
+                    sum_cols = st.columns(2)
+                    sum_cols[0].markdown("**Задолженность:** " + fmt_money(total_debt))
+                    sum_cols[1].markdown("**Авто:** " + s(len(cars)) + "/8")
+                    if total_nds > 0:
+                        st.markdown("**НДС 22%:** " + fmt_money(total_nds))
 
                     for x in sorted(cars, key=lambda z: int(to_float(z.get("position")))):
                         if st.session_state.get("edit_ship_" + s(x["id"])):
@@ -1246,14 +1375,15 @@ def main_page():
 
                     if view_mode == "active" and can("create_ship", role) and len(cars) < 8:
                         if st.button("Добавить еще авто (позиция " + s(len(cars)+1) + ")",
-                                     key="btn_more_addcar_" + s(trip_id)):
+                                     key="btn_more_addcar_" + s(trip_id),
+                                     use_container_width=True):
                             st.session_state["open_addcar_" + s(trip_id)] = True
                             st.rerun()
                 else:
                     st.info("В этом рейсе ещё нет авто.")
 
     # ============================================================
-    # ИТОГО (снизу справа) — только по АКТИВНЫМ рейсам
+    # ИТОГО (только по АКТИВНЫМ рейсам)
     # ============================================================
     st.markdown("---")
 
@@ -1265,27 +1395,27 @@ def main_page():
     grand_debt = grand_total - grand_advance
     grand_nds = sum(to_float(x.get("nds_amount")) for x in all_active_cars)
 
-    spacer, totals = st.columns([2, 1])
+    spacer, totals = st.columns([1, 2])
     with totals:
         st.markdown(
             '<div style="background:#f5f5f5; border:1px solid #cccccc; '
-            'border-radius:8px; padding:14px 18px;">'
+            'border-radius:8px; padding:14px 18px; font-size:14px;">'
             '<div style="font-size:18px; font-weight:bold; margin-bottom:8px;">'
             'Итого (активные)</div>'
-            '<div style="display:flex; justify-content:space-between; margin:4px 0;">'
+            '<div style="display:flex; justify-content:space-between; margin:4px 0; flex-wrap:wrap;">'
             '<span>Активных рейсов:</span><b>' + s(len(active_trip_ids)) + '</b></div>'
-            '<div style="display:flex; justify-content:space-between; margin:4px 0;">'
+            '<div style="display:flex; justify-content:space-between; margin:4px 0; flex-wrap:wrap;">'
             '<span>Авто:</span><b>' + s(len(all_active_cars)) + '</b></div>'
-            '<div style="display:flex; justify-content:space-between; margin:4px 0;">'
+            '<div style="display:flex; justify-content:space-between; margin:4px 0; flex-wrap:wrap;">'
             '<span>Общая сумма:</span><b>' + fmt_money(grand_total) + ' ₽</b></div>'
-            '<div style="display:flex; justify-content:space-between; margin:4px 0;">'
+            '<div style="display:flex; justify-content:space-between; margin:4px 0; flex-wrap:wrap;">'
             '<span>Общая оплата:</span><b>' + fmt_money(grand_advance) + ' ₽</b></div>'
             '<div style="display:flex; justify-content:space-between; margin:4px 0; '
-            'border-top:1px solid #cccccc; padding-top:6px;">'
+            'border-top:1px solid #cccccc; padding-top:6px; flex-wrap:wrap;">'
             '<span>Общая задолженность:</span>'
             '<b style="color:' + ("#c62828" if grand_debt > 0.01 else "#2e7d32") + ';">'
             + fmt_money(grand_debt) + ' ₽</b></div>'
-            + ('<div style="display:flex; justify-content:space-between; margin:4px 0;">'
+            + ('<div style="display:flex; justify-content:space-between; margin:4px 0; flex-wrap:wrap;">'
                '<span>НДС 22%:</span><b>' + fmt_money(grand_nds) + ' ₽</b></div>'
                if grand_nds > 0 else '')
             + '</div>',
