@@ -895,7 +895,6 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
     if total_nds > 0:
         stats += "  |  НДС: " + fmt_money(total_nds)
 
-    # Бейдж «Рейс завершён» — в конце строки
     completed_html = ""
     if trip_completed:
         badge_text = "✅ Рейс завершён" + (
@@ -911,7 +910,6 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
         '; border:2px solid ' + bd +
         '; border-radius:8px; padding:10px 14px; margin-bottom:6px; '
         'font-size:14px; word-wrap:break-word;">'
-        # Первая строка: название слева, бейдж справа
         '<div style="display:flex; justify-content:space-between; '
         'align-items:center; gap:10px; flex-wrap:wrap;">'
         '<div style="font-weight:bold; flex:1; min-width:200px;">'
@@ -919,7 +917,6 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
         '</div>'
         '<div>' + completed_html + '</div>'
         '</div>'
-        # Вторая строка: статистика
         '<div style="color:#333; margin-top:4px;">' + stats + '</div>'
         '</div>',
         unsafe_allow_html=True,
@@ -1062,7 +1059,6 @@ def main_page():
                                trip_completed, trip_completed_at,
                                len(cars), total, total_advance, total_debt, total_nds)
 
-            # Раскрывашка с деталями рейса
             with st.expander("Подробнее ▾", expanded=False):
                 if view_mode == "active":
                     bc1, bc2, bc3, bc4 = st.columns([1, 1, 1, 1])
@@ -1108,7 +1104,6 @@ def main_page():
                             st.success("Рейс возвращён из архива")
                             st.rerun()
 
-                # Форма завершения рейса
                 if st.session_state.get("open_complete_" + s(trip_id)):
                     with st.form("complete_" + s(trip_id)):
                         st.markdown("**Завершение рейса**")
@@ -1278,7 +1273,13 @@ def main_page():
                         if s(x.get("contract_number", "")):
                             details.append("№ договора: " + s(x.get("contract_number", "")))
                         if details:
-                            st.caption(" · ".join(details))
+                            st.markdown(
+                                '<div style="font-weight:bold; font-size:14px; '
+                                'margin-top:4px; color:#222; word-wrap:break-word;">'
+                                + " · ".join(details) +
+                                '</div>',
+                                unsafe_allow_html=True,
+                            )
 
                         if view_mode == "active":
                             bc1, bc2, bc3, bc4 = st.columns(4)
