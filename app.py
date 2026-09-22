@@ -99,7 +99,6 @@ def invalidate_cache(name=None):
 
 
 def ensure_sheets_once():
-    """Создаёт листы и дописывает заголовки. Вызывается 1 раз за сессию."""
     book = get_book()
     existing = {ws.title for ws in book.worksheets()}
     for name, headers in SHEET_SCHEMAS.items():
@@ -137,7 +136,6 @@ def _ensure_cols(ws, needed):
 
 
 def _find_row_index_by_id(name, row_id):
-    """Возвращает номер строки в листе (1-based) или None. Из кэша, без API."""
     rows = read_all_cached(name)
     for idx, r in enumerate(rows):
         if s(r.get("id")) == s(row_id):
@@ -431,6 +429,44 @@ def get_shipments(fresh=False):
     return read_all("shipments", fresh=fresh)
 
 
+# ============================================================
+# Хелперы работы с активными авто
+# ============================================================
+
+def is_car_active_on_avtovoz(x):
+    """Активное авто — то, что занимает место на автовозе:
+    не выдано и не является следом переноса."""
+    if check_issued(s(x.get("issued", "0"))):
+        return False
+    if s(x.get("transferred_to_trip", "")):
+        return False
+    return True
+
+
+def count_active_cars(cars):
+    return sum(1 for x in cars if is_car_active_on_avtovoz(x))
+
+
+def count_issued_cars(cars):
+    return sum(1 for x in cars if check_issued(s(x.get("issued", "0"))))
+
+
+def next_free_position(cars):
+    """Первая свободная позиция 1..8 (не занята активным авто)."""
+    occupied = set()
+    for x in cars:
+        if not is_car_active_on_avtovoz(x):
+            continue
+        try:
+            occupied.add(int(to_float(x.get("position"))))
+        except Exception:
+            pass
+    for p in range(1, 9):
+        if p not in occupied:
+            return p
+    return None
+
+
 def create_trip(tractor, driver, route, dep, ret, created_by):
     append_row("trips", {
         "id": next_id("trips"),
@@ -531,7 +567,6 @@ def delete_trip(trip_id):
     if row_idx is not None:
         ws.delete_rows(row_idx)
         invalidate_cache("trips")
-    # Удаляем авто этого рейса
     rows = read_all_cached("shipments")
     to_del = []
     for idx, r in enumerate(rows):
@@ -856,9 +891,11 @@ def show_act(trip, shipment):
 # ФОРМА АВТО
 # ============================================================
 
-def render_shipment_form(form_key, c=None, submit_label="Сохранить авто"):
+def render_shipment_form(form_key, c=None, submit_label="Сохранить авто",
+                         default_position=None):
     defaults = {
-        "position": 1, "car_model": "", "client": "", "vin": "",
+        "position": default_position if default_position else 1,
+        "car_model": "", "client": "", "vin": "",
         "delivery_city": "", "amount": "", "date_pay": "", "paid_to": "",
         "advance": "", "advance_date": "", "payer_type": "нал",
         "customer": "", "contract_number": "",
@@ -953,10 +990,11 @@ def render_shipment_form(form_key, c=None, submit_label="Сохранить ав
 
 def render_trip_header(trip_id, tractor, driver, route, dep, ret,
                        trip_completed, trip_completed_at,
-                       cars_count, total, total_advance, total_debt, total_nds,
+                       active_count, issued_count,
+                       total, total_advance, total_debt, total_nds,
                        has_nds=False,
                        trip_invoice_number="", trip_invoice_date=""):
-    if cars_count == 0:
+    if active_count == 0 and issued_count == 0:
         bg, bd = "#fafafa", "#dddddd"
     elif total_debt > 0.01:
         bg, bd = "#ffcdd2", "#e53935"
@@ -967,10 +1005,12 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
     if ret:
         title += " — возврат " + s(ret)
 
-    stats = ("авто: " + s(cars_count) + "/8"
-             + "  |  сумма: " + fmt_money(total)
-             + "  |  аванс: " + fmt_money(total_advance)
-             + "  |  задолженность: " + fmt_money(total_debt))
+    stats = "авто: " + s(active_count) + "/8"
+    if issued_count > 0:
+        stats += "  |  выдано: " + s(issued_count)
+    stats += ("  |  сумма: " + fmt_money(total)
+              + "  |  аванс: " + fmt_money(total_advance)
+              + "  |  задолженность: " + fmt_money(total_debt))
     if total_nds > 0:
         stats += "  |  НДС: " + fmt_money(total_nds)
 
@@ -1064,7 +1104,6 @@ def main_page():
                 return
         st.session_state.pop("show_act_for", None)
 
-    # Без fresh=True — читаем из кэша, обновляется через invalidate_cache после записи
     trips = get_trips()
     shipments = get_shipments()
 
@@ -1157,13 +1196,18 @@ def main_page():
             total_debt = total - total_advance
             total_nds = sum(to_float(x.get("nds_amount")) for x in cars)
 
+            active_count = count_active_cars(cars)
+            issued_count = count_issued_cars(cars)
+            free_pos = next_free_position(cars)
+
             has_nds = any(s(x.get("payer_type", "")).strip() == NDS_PAYER
                           for x in cars
                           if not s(x.get("transferred_to_trip", "")))
 
             render_trip_header(trip_id, tractor, driver, route, dep, ret,
                                trip_completed, trip_completed_at,
-                               len(cars), total, total_advance, total_debt, total_nds,
+                               active_count, issued_count,
+                               total, total_advance, total_debt, total_nds,
                                has_nds=has_nds,
                                trip_invoice_number=trip_inv_num,
                                trip_invoice_date=trip_inv_date)
@@ -1216,7 +1260,10 @@ def main_page():
                 if view_mode == "active":
                     bc1, bc2, bc3, bc4 = st.columns([1, 1, 1, 1])
                     if can("create_ship", role):
-                        if bc1.button("Добавить авто", key="btn_show_addcar_" + s(trip_id),
+                        add_label = "Добавить авто"
+                        if free_pos:
+                            add_label += " (поз. " + s(free_pos) + ")"
+                        if bc1.button(add_label, key="btn_show_addcar_" + s(trip_id),
                                       use_container_width=True):
                             st.session_state["open_addcar_" + s(trip_id)] = True
                     if can("edit_trip", role):
@@ -1256,6 +1303,15 @@ def main_page():
                                        s(tractor) + " " + s(driver))
                             st.success("Рейс возвращён из архива")
                             st.rerun()
+
+                if active_count >= 8:
+                    st.info("ℹ️ На автовозе занято 8 мест (выданные авто места не занимают). "
+                            "Снимите статус «Выдан» у одного из авто, чтобы освободить место, "
+                            "или создайте новый рейс.")
+                elif issued_count > 0:
+                    st.info("ℹ️ Свободных мест на автовозе: "
+                            + s(8 - active_count)
+                            + " (выданные авто места не занимают).")
 
                 if st.session_state.get("open_complete_" + s(trip_id)):
                     with st.form("complete_" + s(trip_id)):
@@ -1337,13 +1393,15 @@ def main_page():
 
                 if view_mode == "active" and st.session_state.get("open_addcar_" + s(trip_id)):
                     f = render_shipment_form("newcar_" + s(trip_id), c=None,
-                                             submit_label="Сохранить авто")
+                                             submit_label="Сохранить авто",
+                                             default_position=free_pos or 1)
                     if f["cancel"]:
                         st.session_state.pop("open_addcar_" + s(trip_id), None)
                         st.rerun()
                     if f["save"]:
-                        if len(cars) >= 8:
-                            st.error("На автовозе максимум 8 авто")
+                        if active_count >= 8:
+                            st.error("На автовозе 8 активных авто. Освободите место, "
+                                     "сняв статус «Выдан» у кого-то из авто.")
                         elif not f["client"] and not f["customer"]:
                             st.error("Заполните хотя бы одно: ФИО клиента или Заказчик")
                         else:
@@ -1566,7 +1624,7 @@ def main_page():
                     sum_cols[1].markdown("**Аванс:** " + fmt_money(total_advance))
                     sum_cols = st.columns(2)
                     sum_cols[0].markdown("**Задолженность:** " + fmt_money(total_debt))
-                    sum_cols[1].markdown("**Авто:** " + s(len(cars)) + "/8")
+                    sum_cols[1].markdown("**Авто:** " + s(active_count) + "/8")
                     if total_nds > 0:
                         st.markdown("**НДС 22%:** " + fmt_money(total_nds))
 
@@ -1603,8 +1661,9 @@ def main_page():
                                         st.success("Изменения сохранены")
                                         st.rerun()
 
-                    if view_mode == "active" and can("create_ship", role) and len(cars) < 8:
-                        if st.button("Добавить еще авто (позиция " + s(len(cars)+1) + ")",
+                    if view_mode == "active" and can("create_ship", role) and active_count < 8:
+                        free_pos_btn = next_free_position(cars) or 1
+                        if st.button("Добавить еще авто (позиция " + s(free_pos_btn) + ")",
                                      key="btn_more_addcar_" + s(trip_id),
                                      use_container_width=True):
                             st.session_state["open_addcar_" + s(trip_id)] = True
@@ -1661,7 +1720,6 @@ def main_page():
 def main():
     st.set_page_config(page_title="Учёт рейсов", page_icon="🚛", layout="wide")
 
-    # ensure_sheets_once — 1 раз за сессию
     if not st.session_state.get("sheets_ready"):
         try:
             ensure_sheets_once()
