@@ -17,7 +17,8 @@ SHEET_SCHEMAS = {
     "users": ["login", "password_hash", "role", "full_name", "active"],
     "trips": ["id", "tractor_number", "driver", "route",
               "date_departure", "date_return", "created_by", "created_at",
-              "archived", "completed", "completed_at"],
+              "archived", "completed", "completed_at",
+              "invoice_number", "invoice_date"],
     "shipments": ["id", "trip_id", "position", "car_model", "client",
                   "amount", "date_pay", "paid_to",
                   "delivery_city", "vin",
@@ -25,7 +26,10 @@ SHEET_SCHEMAS = {
                   "payer_type", "customer", "contract_number",
                   "nds_amount", "amount_no_nds",
                   "created_by", "created_at", "issued", "issued_ever",
-                  "paid", "archived", "advance_before_paid"],
+                  "paid", "archived", "advance_before_paid",
+                  "invoice_number", "invoice_date",
+                  "transferred_to_trip", "transferred_at",
+                  "transferred_from_trip"],
     "audit_log": ["id", "ts", "login", "role", "action", "details"],
     "act_log": ["id", "ts", "login", "trip_id", "shipment_id", "client"],
 }
@@ -33,6 +37,7 @@ SHEET_SCHEMAS = {
 ROLES = ["admin", "director", "logist", "dispatcher"]
 PAYER_TYPES = ["нал", "эквайринг", "безнал с НДС 22%"]
 NDS_RATE = 0.22
+NDS_PAYER = "безнал с НДС 22%"
 
 
 def s(x):
@@ -43,7 +48,7 @@ def s(x):
 
 def calc_nds(amount, payer_type):
     amount = to_float(amount)
-    if payer_type == "безнал с НДС 22%":
+    if payer_type == NDS_PAYER:
         nds = amount * NDS_RATE / (1 + NDS_RATE)
         amount_no_nds = amount - nds
         return nds, amount_no_nds
@@ -282,14 +287,18 @@ def can(action, role):
         "admin":      {"create_trip", "edit_trip", "delete_trip",
                        "create_ship", "edit_ship", "delete_ship",
                        "export", "print_act", "manage_users", "view_log",
-                       "archive", "complete_trip"},
+                       "archive", "complete_trip", "transfer_ship",
+                       "edit_invoice"},
         "director":   {"create_trip", "edit_trip", "delete_trip",
                        "create_ship", "edit_ship", "delete_ship",
-                       "export", "print_act", "archive", "complete_trip"},
+                       "export", "print_act", "archive", "complete_trip",
+                       "transfer_ship", "edit_invoice"},
         "logist":     {"create_trip", "edit_trip", "create_ship", "edit_ship",
-                       "export", "print_act", "archive", "complete_trip"},
+                       "export", "print_act", "archive", "complete_trip",
+                       "transfer_ship", "edit_invoice"},
         "dispatcher": {"create_trip", "edit_trip", "create_ship", "edit_ship",
-                       "export", "print_act", "archive", "complete_trip"},
+                       "export", "print_act", "archive", "complete_trip",
+                       "transfer_ship", "edit_invoice"},
     }
     return action in rights.get(role, set())
 
@@ -415,6 +424,8 @@ def create_trip(tractor, driver, route, dep, ret, created_by):
         "archived": "0",
         "completed": "0",
         "completed_at": "",
+        "invoice_number": "",
+        "invoice_date": "",
     })
 
 
@@ -430,9 +441,28 @@ def update_trip(trip_id, tractor, driver, route, dep, ret):
             arch = row[8] if len(row) > 8 else "0"
             comp = row[9] if len(row) > 9 else "0"
             comp_at = row[10] if len(row) > 10 else ""
+            inv_num = row[11] if len(row) > 11 else ""
+            inv_date = row[12] if len(row) > 12 else ""
             new_row = [trip_id, s(tractor), s(driver), s(route), s(dep), s(ret),
-                       cb, ca, arch, comp, comp_at]
+                       cb, ca, arch, comp, comp_at, inv_num, inv_date]
             ws.update("A" + str(i) + ":" + last_col + str(i), [new_row])
+            invalidate_cache("trips")
+            return True
+    return False
+
+
+def update_trip_invoice(trip_id, invoice_number, invoice_date):
+    ws = get_ws_cached("trips")
+    all_rows = ws.get_all_values()
+    headers = SHEET_SCHEMAS["trips"]
+    last_col = chr(64 + len(headers))
+    for i, row in enumerate(all_rows[1:], start=2):
+        if s(row[0]) == s(trip_id):
+            fields = list(row) + [""] * (len(headers) - len(row))
+            fields = fields[:len(headers)]
+            fields[11] = s(invoice_number)
+            fields[12] = s(invoice_date)
+            ws.update("A" + str(i) + ":" + last_col + str(i), [fields])
             invalidate_cache("trips")
             return True
     return False
@@ -449,8 +479,10 @@ def archive_trip(trip_id):
             ca = row[7] if len(row) > 7 else ""
             comp = row[9] if len(row) > 9 else "0"
             comp_at = row[10] if len(row) > 10 else ""
+            inv_num = row[11] if len(row) > 11 else ""
+            inv_date = row[12] if len(row) > 12 else ""
             new_row = [trip_id, row[1], row[2], row[3], row[4], row[5], cb, ca, "1",
-                       comp, comp_at]
+                       comp, comp_at, inv_num, inv_date]
             ws.update("A" + str(i) + ":" + last_col + str(i), [new_row])
             invalidate_cache("trips")
             return True
@@ -468,8 +500,10 @@ def unarchive_trip(trip_id):
             ca = row[7] if len(row) > 7 else ""
             comp = row[9] if len(row) > 9 else "0"
             comp_at = row[10] if len(row) > 10 else ""
+            inv_num = row[11] if len(row) > 11 else ""
+            inv_date = row[12] if len(row) > 12 else ""
             new_row = [trip_id, row[1], row[2], row[3], row[4], row[5], cb, ca, "0",
-                       comp, comp_at]
+                       comp, comp_at, inv_num, inv_date]
             ws.update("A" + str(i) + ":" + last_col + str(i), [new_row])
             invalidate_cache("trips")
             return True
@@ -483,11 +517,13 @@ def complete_trip(trip_id, completed_at):
     last_col = chr(64 + len(headers))
     for i, row in enumerate(all_rows[1:], start=2):
         if s(row[0]) == s(trip_id):
+            inv_num = row[11] if len(row) > 11 else ""
+            inv_date = row[12] if len(row) > 12 else ""
             new_row = [trip_id, row[1], row[2], row[3], row[4], row[5],
                        row[6] if len(row) > 6 else "",
                        row[7] if len(row) > 7 else "",
                        row[8] if len(row) > 8 else "0",
-                       "1", s(completed_at)]
+                       "1", s(completed_at), inv_num, inv_date]
             ws.update("A" + str(i) + ":" + last_col + str(i), [new_row])
             invalidate_cache("trips")
             return True
@@ -501,11 +537,13 @@ def uncomplete_trip(trip_id):
     last_col = chr(64 + len(headers))
     for i, row in enumerate(all_rows[1:], start=2):
         if s(row[0]) == s(trip_id):
+            inv_num = row[11] if len(row) > 11 else ""
+            inv_date = row[12] if len(row) > 12 else ""
             new_row = [trip_id, row[1], row[2], row[3], row[4], row[5],
                        row[6] if len(row) > 6 else "",
                        row[7] if len(row) > 7 else "",
                        row[8] if len(row) > 8 else "0",
-                       "0", ""]
+                       "0", "", inv_num, inv_date]
             ws.update("A" + str(i) + ":" + last_col + str(i), [new_row])
             invalidate_cache("trips")
             return True
@@ -557,6 +595,11 @@ def create_shipment(trip_id, position, car_model, client, amount,
         "paid": "0",
         "archived": "0",
         "advance_before_paid": "",
+        "invoice_number": "",
+        "invoice_date": "",
+        "transferred_to_trip": "",
+        "transferred_at": "",
+        "transferred_from_trip": "",
     })
 
 
@@ -578,6 +621,11 @@ def update_shipment(shipment_id, position, car_model, client, amount,
             paid_val = row[21] if len(row) > 21 else "0"
             archived_val = row[22] if len(row) > 22 else "0"
             adv_before_paid_val = row[23] if len(row) > 23 else ""
+            inv_num = row[24] if len(row) > 24 else ""
+            inv_date = row[25] if len(row) > 25 else ""
+            tr_to = row[26] if len(row) > 26 else ""
+            tr_at = row[27] if len(row) > 27 else ""
+            tr_from = row[28] if len(row) > 28 else ""
             new_row = [
                 shipment_id, trip_id, position, s(car_model), s(client),
                 money_value(amount), s(date_pay), s(paid_to),
@@ -587,11 +635,79 @@ def update_shipment(shipment_id, position, car_model, client, amount,
                 money_value(nds_amount), money_value(amount_no_nds),
                 created_by, created_at, issued_val, issued_ever_val,
                 paid_val, archived_val, adv_before_paid_val,
+                inv_num, inv_date,
+                tr_to, tr_at, tr_from,
             ]
             ws.update("A" + str(i) + ":" + last_col + str(i), [new_row])
             invalidate_cache("shipments")
             return True
     return False
+
+
+def transfer_shipment_to_trip(shipment_id, target_trip_id, new_position,
+                              user_login):
+    ws = get_ws_cached("shipments")
+    all_rows = ws.get_all_values()
+    headers = SHEET_SCHEMAS["shipments"]
+    last_col = chr(64 + len(headers))
+
+    src_row = None
+    src_idx = None
+    for i, row in enumerate(all_rows[1:], start=2):
+        if s(row[0]) == s(shipment_id):
+            src_row = row
+            src_idx = i
+            break
+    if src_row is None:
+        return False
+
+    source_trip_id = src_row[1] if len(src_row) > 1 else ""
+    car_model = src_row[3] if len(src_row) > 3 else ""
+
+    fields = list(src_row) + [""] * (len(headers) - len(src_row))
+    fields = fields[:len(headers)]
+    fields[1] = target_trip_id
+    fields[2] = new_position
+    fields[26] = ""
+    fields[27] = datetime.now().strftime("%d.%m.%Y")
+    fields[28] = source_trip_id
+    ws.update("A" + str(src_idx) + ":" + last_col + str(src_idx), [fields])
+
+    trace = {
+        "id": next_id("shipments"),
+        "trip_id": source_trip_id,
+        "position": src_row[2] if len(src_row) > 2 else "",
+        "car_model": "Перенесён: " + s(car_model),
+        "client": "",
+        "amount": 0,
+        "date_pay": "",
+        "paid_to": "",
+        "delivery_city": src_row[8] if len(src_row) > 8 else "",
+        "vin": src_row[9] if len(src_row) > 9 else "",
+        "advance": 0,
+        "advance_date": "",
+        "payer_type": "",
+        "customer": "",
+        "contract_number": "",
+        "nds_amount": 0,
+        "amount_no_nds": 0,
+        "created_by": s(user_login),
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "issued": "0",
+        "issued_ever": "0",
+        "paid": "1",
+        "archived": "0",
+        "advance_before_paid": "",
+        "invoice_number": "",
+        "invoice_date": "",
+        "transferred_to_trip": s(target_trip_id),
+        "transferred_at": datetime.now().strftime("%d.%m.%Y"),
+        "transferred_from_trip": "",
+    }
+    append_row("shipments", trace)
+
+    invalidate_cache("shipments")
+    return True
 
 
 def toggle_issued(shipment_id, current_value, current_ever):
@@ -866,17 +982,14 @@ def render_shipment_form(form_key, c=None, submit_label="Сохранить ав
 
 
 # ============================================================
-# Отрисовка шапки рейса с цветом
+# Шапка рейса
 # ============================================================
 
 def render_trip_header(trip_id, tractor, driver, route, dep, ret,
                        trip_completed, trip_completed_at,
-                       cars_count, total, total_advance, total_debt, total_nds):
-    """Цветная шапка рейса.
-    Красная — если есть задолженность (не оплачено).
-    Зелёная — если все авто оплачены (или нет задолженности).
-    Серая — если рейс пустой.
-    Бейдж «Рейс завершён» — в конце строки (справа)."""
+                       cars_count, total, total_advance, total_debt, total_nds,
+                       has_nds=False,
+                       trip_invoice_number="", trip_invoice_date=""):
     if cars_count == 0:
         bg, bd = "#fafafa", "#dddddd"
     elif total_debt > 0.01:
@@ -894,6 +1007,23 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
              + "  |  задолженность: " + fmt_money(total_debt))
     if total_nds > 0:
         stats += "  |  НДС: " + fmt_money(total_nds)
+
+    inv_html = ""
+    if has_nds:
+        inv_num = s(trip_invoice_number).strip()
+        inv_date = s(trip_invoice_date).strip()
+        if inv_num or inv_date:
+            inv_html = ('<span style="background:#1976d2; color:#fff; '
+                        'padding:2px 10px; border-radius:12px; font-size:12px; '
+                        'font-weight:bold; white-space:nowrap; margin-left:6px;">'
+                        '📄 Счёт № ' + (inv_num or "—")
+                        + (' от ' + date_to_display_safe(inv_date) if inv_date else '')
+                        + '</span>')
+        else:
+            inv_html = ('<span style="background:#c62828; color:#fff; '
+                        'padding:2px 10px; border-radius:12px; font-size:12px; '
+                        'font-weight:bold; white-space:nowrap; margin-left:6px;">'
+                        '📄 Счёт: не выставлен</span>')
 
     completed_html = ""
     if trip_completed:
@@ -917,7 +1047,11 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
         '</div>'
         '<div>' + completed_html + '</div>'
         '</div>'
-        '<div style="color:#333; margin-top:4px;">' + stats + '</div>'
+        '<div style="color:#333; margin-top:4px; display:flex; '
+        'align-items:center; flex-wrap:wrap;">'
+        '<div>' + stats + '</div>'
+        '<div>' + inv_html + '</div>'
+        '</div>'
         '</div>',
         unsafe_allow_html=True,
     )
@@ -1047,6 +1181,8 @@ def main_page():
             ret = date_to_display_safe(t.get("date_return", ""))
             trip_completed = check_completed(t.get("completed", "0"))
             trip_completed_at = date_to_display_safe(t.get("completed_at", ""))
+            trip_inv_num = s(t.get("invoice_number", ""))
+            trip_inv_date = date_to_display_safe(t.get("invoice_date", ""))
 
             cars = [x for x in shipments if s(x.get("trip_id")) == s(trip_id)]
             total = sum(to_float(x.get("amount")) for x in cars)
@@ -1054,10 +1190,62 @@ def main_page():
             total_debt = total - total_advance
             total_nds = sum(to_float(x.get("nds_amount")) for x in cars)
 
-            # ==== ЦВЕТНАЯ ШАПКА РЕЙСА ====
+            # Есть ли в рейсе авто с безналом НДС (исключая следы переноса)
+            has_nds = any(s(x.get("payer_type", "")).strip() == NDS_PAYER
+                          for x in cars
+                          if not s(x.get("transferred_to_trip", "")))
+
             render_trip_header(trip_id, tractor, driver, route, dep, ret,
                                trip_completed, trip_completed_at,
-                               len(cars), total, total_advance, total_debt, total_nds)
+                               len(cars), total, total_advance, total_debt, total_nds,
+                               has_nds=has_nds,
+                               trip_invoice_number=trip_inv_num,
+                               trip_invoice_date=trip_inv_date)
+
+            # Кнопка счёта — только если в рейсе есть безнал с НДС
+            if has_nds and can("edit_invoice", role):
+                inv_key = "show_inv_form_" + s(trip_id)
+                label = ("✏ Изменить счёт" if (trip_inv_num or trip_inv_date)
+                         else "📄 Выставить счёт")
+                if st.button(label, key="btn_inv_" + s(trip_id)):
+                    st.session_state[inv_key] = not st.session_state.get(inv_key, False)
+                    st.rerun()
+
+                if st.session_state.get(inv_key):
+                    with st.form("inv_form_" + s(trip_id)):
+                        st.markdown("**Счёт по рейсу (для безнала с НДС)**")
+                        c1, c2 = st.columns(2)
+                        new_num = c1.text_input("№ счёта", value=trip_inv_num,
+                                                 key="invnum_trip_" + s(trip_id))
+                        new_date = c2.text_input("Дата счёта (ДД.ММ.ГГГГ)",
+                                                  value=trip_inv_date,
+                                                  key="invdate_trip_" + s(trip_id))
+                        save_inv = st.form_submit_button("💾 Сохранить счёт")
+                        clear_inv = st.form_submit_button("🗑 Очистить счёт")
+                        cancel_inv = st.form_submit_button("Отмена")
+                    if cancel_inv:
+                        st.session_state.pop(inv_key, None)
+                        st.rerun()
+                    if clear_inv:
+                        update_trip_invoice(trip_id, "", "")
+                        log_action(u["login"], role, "clear_trip_invoice",
+                                   s(tractor) + " " + s(driver))
+                        st.session_state.pop(inv_key, None)
+                        st.success("Счёт удалён")
+                        st.rerun()
+                    if save_inv:
+                        try:
+                            date_fmt = parse_date_ui(new_date) if s(new_date).strip() else ""
+                        except ValueError as ex:
+                            st.error(str(ex))
+                        else:
+                            update_trip_invoice(trip_id, new_num, date_fmt)
+                            log_action(u["login"], role, "edit_trip_invoice",
+                                       s(tractor) + " " + s(driver)
+                                       + " №" + s(new_num))
+                            st.session_state.pop(inv_key, None)
+                            st.success("Счёт сохранён")
+                            st.rerun()
 
             with st.expander("Подробнее ▾", expanded=False):
                 if view_mode == "active":
@@ -1231,7 +1419,15 @@ def main_page():
                         is_ever_flag = check_issued_ever(issued_ever_val)
                         has_debt = debt_val > 0.01
 
-                        if is_issued_flag and not has_debt:
+                        tr_to = s(x.get("transferred_to_trip", ""))
+                        tr_at = s(x.get("transferred_at", ""))
+                        tr_from = s(x.get("transferred_from_trip", ""))
+                        is_trace = bool(tr_to)
+
+                        if is_trace:
+                            bg = "#eeeeee"; bd = "#bdbdbd"
+                            status_text = "⚪ Перенесён"
+                        elif is_issued_flag and not has_debt:
                             bg = "#c8e6c9"; bd = "#4caf50"; status_text = "🟢 Выдан"
                         elif is_paid_flag and not has_debt:
                             bg = "#fff9c4"; bd = "#ffeb3b"; status_text = "🟡 Оплачен"
@@ -1250,38 +1446,60 @@ def main_page():
                             unsafe_allow_html=True)
 
                         client_display = s(x.get("client", "")) or s(x.get("customer", ""))
-                        st.markdown(
-                            "**Поз. " + s(x.get("position", "")) + "** · "
-                            + s(x.get("car_model", "")) + " · "
-                            + client_display + " · VIN: "
-                            + (s(x.get("vin", ""))[:17] or "—") + "  \n"
-                            "Сумма: **" + fmt_money(amount_val) + "** | "
-                            "Аванс: **" + fmt_money(advance_val) + "** | "
-                            "Задолж.: **" + fmt_money(debt_val) + "**" +
-                            (" | НДС: " + fmt_money(nds_val) if nds_val > 0 else "") +
-                            "  \nСтатус: **" + status_text + "**"
-                        )
-                        details = []
-                        if s(x.get("delivery_city", "")):
-                            details.append("Город: " + s(x.get("delivery_city", "")))
-                        if s(x.get("advance_date", "")):
-                            details.append("Дата аванса: " + date_to_display_safe(x.get("advance_date", "")))
-                        if s(x.get("payer_type", "")):
-                            details.append("Оплата: " + s(x.get("payer_type", "")))
-                        if s(x.get("paid_to", "")):
-                            details.append("Кому: " + s(x.get("paid_to", "")))
-                        if s(x.get("contract_number", "")):
-                            details.append("№ договора: " + s(x.get("contract_number", "")))
-                        if details:
-                            st.markdown(
-                                '<div style="font-weight:bold; font-size:14px; '
-                                'margin-top:4px; color:#222; word-wrap:break-word;">'
-                                + " · ".join(details) +
-                                '</div>',
-                                unsafe_allow_html=True,
-                            )
 
-                        if view_mode == "active":
+                        if is_trace:
+                            target_trip = next((tt for tt in trips
+                                                if s(tt.get("id")) == s(tr_to)), None)
+                            target_label = ""
+                            if target_trip:
+                                target_label = (s(target_trip.get("tractor_number", ""))
+                                                + " " + s(target_trip.get("route", "")))
+                            st.markdown(
+                                "**" + s(x.get("car_model", "")) + "**  \n"
+                                "Перенесён на рейс: **" + (target_label or ("#" + tr_to)) + "**"
+                                + ("  \nДата переноса: **" + s(tr_at) + "**" if tr_at else "")
+                            )
+                        else:
+                            st.markdown(
+                                "**Поз. " + s(x.get("position", "")) + "** · "
+                                + s(x.get("car_model", "")) + " · "
+                                + client_display + " · VIN: "
+                                + (s(x.get("vin", ""))[:17] or "—") + "  \n"
+                                "Сумма: **" + fmt_money(amount_val) + "** | "
+                                "Аванс: **" + fmt_money(advance_val) + "** | "
+                                "Задолж.: **" + fmt_money(debt_val) + "**" +
+                                (" | НДС: " + fmt_money(nds_val) if nds_val > 0 else "") +
+                                "  \nСтатус: **" + status_text + "**"
+                            )
+                            details = []
+                            if s(x.get("delivery_city", "")):
+                                details.append("Город: " + s(x.get("delivery_city", "")))
+                            if s(x.get("advance_date", "")):
+                                details.append("Дата аванса: " + date_to_display_safe(x.get("advance_date", "")))
+                            if s(x.get("payer_type", "")):
+                                details.append("Оплата: " + s(x.get("payer_type", "")))
+                            if s(x.get("paid_to", "")):
+                                details.append("Кому: " + s(x.get("paid_to", "")))
+                            if s(x.get("contract_number", "")):
+                                details.append("№ договора: " + s(x.get("contract_number", "")))
+                            if tr_from:
+                                src_trip = next((tt for tt in trips
+                                                 if s(tt.get("id")) == s(tr_from)), None)
+                                src_label = ""
+                                if src_trip:
+                                    src_label = (s(src_trip.get("tractor_number", ""))
+                                                 + " " + s(src_trip.get("route", "")))
+                                details.append("Перенесён с рейса: " + (src_label or ("#" + tr_from)))
+                            if details:
+                                st.markdown(
+                                    '<div style="font-weight:bold; font-size:14px; '
+                                    'margin-top:4px; color:#222; word-wrap:break-word;">'
+                                    + " · ".join(details) +
+                                    '</div>',
+                                    unsafe_allow_html=True,
+                                )
+
+                        if view_mode == "active" and not is_trace:
                             bc1, bc2, bc3, bc4 = st.columns(4)
                             paid_label = "❌ Снять" if is_paid_flag else "✅ Оплачен"
                             if bc1.button(paid_label, key="btn_paid_" + s(x["id"]),
@@ -1315,14 +1533,20 @@ def main_page():
                                           use_container_width=True):
                                 st.session_state["edit_ship_" + s(x["id"])] = True
 
+                            tc1, tc2 = st.columns(2)
+                            if can("transfer_ship", role):
+                                if tc1.button("📦 Перенести в другой рейс",
+                                              key="btn_transfer_" + s(x["id"]),
+                                              use_container_width=True):
+                                    st.session_state["open_transfer_" + s(x["id"])] = True
                             if can("delete_ship", role):
-                                if st.button("🗑 Удалить авто", key="btn_delship_" + s(x["id"]),
-                                             use_container_width=True):
+                                if tc2.button("🗑 Удалить авто", key="btn_delship_" + s(x["id"]),
+                                              use_container_width=True):
                                     delete_shipment(x["id"])
                                     log_action(u["login"], role, "delete_ship",
                                                "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
                                     st.rerun()
-                        else:
+                        elif view_mode == "archive" and not is_trace:
                             bc1, bc2 = st.columns(2)
                             if bc1.button("📄 Акт", key="btn_act_inline_" + s(x["id"]),
                                           use_container_width=True):
@@ -1330,6 +1554,46 @@ def main_page():
                                 st.rerun()
 
                         st.markdown("</div>", unsafe_allow_html=True)
+
+                        if view_mode == "active" and not is_trace and \
+                                st.session_state.get("open_transfer_" + s(x["id"])):
+                            other_trips = [tt for tt in trips
+                                           if not is_archived(tt.get("archived", "0"))
+                                           and s(tt.get("id")) != s(trip_id)]
+                            if not other_trips:
+                                st.warning("Нет других активных рейсов для переноса")
+                            else:
+                                options = []
+                                for tt in other_trips:
+                                    label = (s(tt.get("tractor_number", ""))
+                                             + " — " + s(tt.get("route", ""))
+                                             + " — выезд " + date_to_display_safe(tt.get("date_departure", "")))
+                                    options.append((label, tt.get("id")))
+                                with st.form("transfer_form_" + s(x["id"])):
+                                    st.markdown("**Перенос авто на другой рейс**")
+                                    labels = [o[0] for o in options]
+                                    chosen_label = st.selectbox("Выберите рейс",
+                                                                 labels,
+                                                                 key="sel_" + s(x["id"]))
+                                    new_pos = st.number_input("Позиция на новом рейсе",
+                                                                min_value=1, max_value=8,
+                                                                value=int(to_float(x.get("position")) or 1),
+                                                                step=1,
+                                                                key="pos_" + s(x["id"]))
+                                    tr_ok = st.form_submit_button("Перенести")
+                                    tr_no = st.form_submit_button("Отмена")
+                                if tr_no:
+                                    st.session_state.pop("open_transfer_" + s(x["id"]), None)
+                                    st.rerun()
+                                if tr_ok:
+                                    chosen_id = next(o[1] for o in options if o[0] == chosen_label)
+                                    transfer_shipment_to_trip(x["id"], chosen_id, new_pos,
+                                                              u["login"])
+                                    log_action(u["login"], role, "transfer_ship",
+                                               "shipment " + s(x["id"]) + " → trip " + s(chosen_id))
+                                    st.session_state.pop("open_transfer_" + s(x["id"]), None)
+                                    st.success("Авто перенесено")
+                                    st.rerun()
 
                     st.markdown("---")
                     sum_cols = st.columns(2)
@@ -1384,12 +1648,14 @@ def main_page():
                     st.info("В этом рейсе ещё нет авто.")
 
     # ============================================================
-    # ИТОГО (только по АКТИВНЫМ рейсам)
+    # ИТОГО
     # ============================================================
     st.markdown("---")
 
     active_trip_ids = {s(t.get("id")) for t in trips if not is_archived(t.get("archived", "0"))}
-    all_active_cars = [x for x in shipments if s(x.get("trip_id")) in active_trip_ids]
+    all_active_cars = [x for x in shipments
+                       if s(x.get("trip_id")) in active_trip_ids
+                       and not s(x.get("transferred_to_trip", ""))]
 
     grand_total = sum(to_float(x.get("amount")) for x in all_active_cars)
     grand_advance = sum(to_float(x.get("advance")) for x in all_active_cars)
