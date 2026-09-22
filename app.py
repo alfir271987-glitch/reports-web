@@ -98,8 +98,10 @@ def invalidate_cache(name=None):
         read_all_cached.clear()
 
 
-@st.cache_resource
 def ensure_sheets_once():
+    """Без @st.cache_resource — запускается каждый раз при старте.
+    Создаёт отсутствующие листы и дописывает недостающие заголовки,
+    расширяет листы при необходимости."""
     book = get_book()
     existing = {ws.title for ws in book.worksheets()}
     for name, headers in SHEET_SCHEMAS.items():
@@ -108,18 +110,19 @@ def ensure_sheets_once():
             ws.append_row(headers)
         else:
             ws = book.worksheet(name)
+            # Расширяем лист, если колонок меньше, чем нужно
+            try:
+                if ws.col_count < len(headers):
+                    ws.add_cols(len(headers) - ws.col_count)
+            except Exception:
+                pass
+            # Дописываем отсутствующие заголовки
             try:
                 current = ws.row_values(1)
             except Exception:
                 current = []
             missing = [h for h in headers if h not in current]
             if missing:
-                needed_cols = max(len(headers), len(current) + len(missing))
-                if ws.col_count < needed_cols:
-                    try:
-                        ws.add_cols(needed_cols - ws.col_count)
-                    except Exception:
-                        pass
                 start_col = len(current) + 1
                 for idx, h in enumerate(missing):
                     try:
@@ -129,9 +132,19 @@ def ensure_sheets_once():
     return True
 
 
+def _ensure_cols(ws, needed):
+    """Гарантирует, что на листе не меньше `needed` колонок."""
+    try:
+        if ws.col_count < needed:
+            ws.add_cols(needed - ws.col_count)
+    except Exception:
+        pass
+
+
 def append_row(name, row_dict):
     ws = get_ws_cached(name)
     headers = SHEET_SCHEMAS[name]
+    _ensure_cols(ws, len(headers))
     row = [row_dict.get(h, "") for h in headers]
     ws.append_row(row)
     invalidate_cache(name)
@@ -431,6 +444,7 @@ def create_trip(tractor, driver, route, dep, ret, created_by):
 
 def update_trip(trip_id, tractor, driver, route, dep, ret):
     ws = get_ws_cached("trips")
+    _ensure_cols(ws, len(SHEET_SCHEMAS["trips"]))
     all_rows = ws.get_all_values()
     headers = SHEET_SCHEMAS["trips"]
     last_col = chr(64 + len(headers))
@@ -453,6 +467,7 @@ def update_trip(trip_id, tractor, driver, route, dep, ret):
 
 def update_trip_invoice(trip_id, invoice_number, invoice_date):
     ws = get_ws_cached("trips")
+    _ensure_cols(ws, len(SHEET_SCHEMAS["trips"]))
     all_rows = ws.get_all_values()
     headers = SHEET_SCHEMAS["trips"]
     last_col = chr(64 + len(headers))
@@ -470,6 +485,7 @@ def update_trip_invoice(trip_id, invoice_number, invoice_date):
 
 def archive_trip(trip_id):
     ws = get_ws_cached("trips")
+    _ensure_cols(ws, len(SHEET_SCHEMAS["trips"]))
     all_rows = ws.get_all_values()
     headers = SHEET_SCHEMAS["trips"]
     last_col = chr(64 + len(headers))
@@ -491,6 +507,7 @@ def archive_trip(trip_id):
 
 def unarchive_trip(trip_id):
     ws = get_ws_cached("trips")
+    _ensure_cols(ws, len(SHEET_SCHEMAS["trips"]))
     all_rows = ws.get_all_values()
     headers = SHEET_SCHEMAS["trips"]
     last_col = chr(64 + len(headers))
@@ -512,6 +529,7 @@ def unarchive_trip(trip_id):
 
 def complete_trip(trip_id, completed_at):
     ws = get_ws_cached("trips")
+    _ensure_cols(ws, len(SHEET_SCHEMAS["trips"]))
     all_rows = ws.get_all_values()
     headers = SHEET_SCHEMAS["trips"]
     last_col = chr(64 + len(headers))
@@ -532,6 +550,7 @@ def complete_trip(trip_id, completed_at):
 
 def uncomplete_trip(trip_id):
     ws = get_ws_cached("trips")
+    _ensure_cols(ws, len(SHEET_SCHEMAS["trips"]))
     all_rows = ws.get_all_values()
     headers = SHEET_SCHEMAS["trips"]
     last_col = chr(64 + len(headers))
@@ -608,6 +627,7 @@ def update_shipment(shipment_id, position, car_model, client, amount,
                     payer_type, customer, contract_number,
                     nds_amount, amount_no_nds):
     ws = get_ws_cached("shipments")
+    _ensure_cols(ws, len(SHEET_SCHEMAS["shipments"]))
     all_rows = ws.get_all_values()
     headers = SHEET_SCHEMAS["shipments"]
     last_col = chr(64 + len(headers))
@@ -647,6 +667,7 @@ def update_shipment(shipment_id, position, car_model, client, amount,
 def transfer_shipment_to_trip(shipment_id, target_trip_id, new_position,
                               user_login):
     ws = get_ws_cached("shipments")
+    _ensure_cols(ws, len(SHEET_SCHEMAS["shipments"]))
     all_rows = ws.get_all_values()
     headers = SHEET_SCHEMAS["shipments"]
     last_col = chr(64 + len(headers))
@@ -712,6 +733,7 @@ def transfer_shipment_to_trip(shipment_id, target_trip_id, new_position,
 
 def toggle_issued(shipment_id, current_value, current_ever):
     ws = get_ws_cached("shipments")
+    _ensure_cols(ws, len(SHEET_SCHEMAS["shipments"]))
     for i, row in enumerate(ws.get_all_values()[1:], start=2):
         if s(row[0]) == s(shipment_id):
             was_issued = s(current_value) == "1"
@@ -728,13 +750,7 @@ def toggle_issued(shipment_id, current_value, current_ever):
 
 def toggle_paid(shipment_id, current_paid, current_amount, current_advance):
     ws = get_ws_cached("shipments")
-    try:
-        if ws.col_count < 24:
-            ws.add_cols(24 - ws.col_count)
-            ws.update_cell(1, 24, "advance_before_paid")
-    except Exception:
-        pass
-
+    _ensure_cols(ws, 24)
     for i, row in enumerate(ws.get_all_values()[1:], start=2):
         if s(row[0]) == s(shipment_id):
             was_paid = s(current_paid) == "1"
@@ -1190,7 +1206,6 @@ def main_page():
             total_debt = total - total_advance
             total_nds = sum(to_float(x.get("nds_amount")) for x in cars)
 
-            # Есть ли в рейсе авто с безналом НДС (исключая следы переноса)
             has_nds = any(s(x.get("payer_type", "")).strip() == NDS_PAYER
                           for x in cars
                           if not s(x.get("transferred_to_trip", "")))
@@ -1202,7 +1217,6 @@ def main_page():
                                trip_invoice_number=trip_inv_num,
                                trip_invoice_date=trip_inv_date)
 
-            # Кнопка счёта — только если в рейсе есть безнал с НДС
             if has_nds and can("edit_invoice", role):
                 inv_key = "show_inv_form_" + s(trip_id)
                 label = ("✏ Изменить счёт" if (trip_inv_num or trip_inv_date)
@@ -1648,11 +1662,14 @@ def main_page():
                     st.info("В этом рейсе ещё нет авто.")
 
     # ============================================================
-    # ИТОГО
+    # ИТОГО (только активные и незавершённые рейсы)
     # ============================================================
     st.markdown("---")
 
-    active_trip_ids = {s(t.get("id")) for t in trips if not is_archived(t.get("archived", "0"))}
+    active_trip_ids = {s(t.get("id")) for t in trips
+                       if not is_archived(t.get("archived", "0"))
+                       and not check_completed(t.get("completed", "0"))}
+
     all_active_cars = [x for x in shipments
                        if s(x.get("trip_id")) in active_trip_ids
                        and not s(x.get("transferred_to_trip", ""))]
@@ -1668,7 +1685,7 @@ def main_page():
             '<div style="background:#f5f5f5; border:1px solid #cccccc; '
             'border-radius:8px; padding:14px 18px; font-size:14px;">'
             '<div style="font-size:18px; font-weight:bold; margin-bottom:8px;">'
-            'Итого (активные)</div>'
+            'Итого (активные, без завершённых)</div>'
             '<div style="display:flex; justify-content:space-between; margin:4px 0; flex-wrap:wrap;">'
             '<span>Активных рейсов:</span><b>' + s(len(active_trip_ids)) + '</b></div>'
             '<div style="display:flex; justify-content:space-between; margin:4px 0; flex-wrap:wrap;">'
