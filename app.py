@@ -1289,7 +1289,6 @@ def main_page():
         with st.sidebar.expander("Админ-панель"):
             admin_panel()
 
-    # Фильтр режима
     view_mode = st.session_state.get("view_mode", "active")
     colA, colB, colC, colD = st.columns([1, 1, 1, 3])
     with colA:
@@ -1307,7 +1306,6 @@ def main_page():
 
     st.title("Учёт рейсов и перевозок")
 
-    # Акт
     if st.session_state.get("show_act_for"):
         sid = st.session_state["show_act_for"]
         shipments = get_shipments(fresh=True)
@@ -1324,7 +1322,6 @@ def main_page():
                 return
         st.session_state.pop("show_act_for", None)
 
-    # История перемещений
     if st.session_state.get("show_history_for"):
         sid = st.session_state["show_history_for"]
         shipments = get_shipments(fresh=True)
@@ -1354,7 +1351,6 @@ def main_page():
     trips = get_trips()
     shipments = get_shipments()
 
-    # Фильтрация
     if view_mode == "archive":
         filtered = [t for t in trips
                     if is_archived(t.get("archived", "0"))
@@ -1372,7 +1368,6 @@ def main_page():
                     and not is_deleted(t.get("deleted_at", ""))]
         filtered = [t for t in filtered if not check_completed(t.get("completed", "0"))]
 
-    # Сортировка и поиск
     with st.expander("Сортировка и поиск", expanded=False):
         c1, c2, c3 = st.columns(3)
         sort_by = c1.selectbox("Сортировать по", [
@@ -1397,7 +1392,6 @@ def main_page():
         filtered = sorted(filtered, key=lambda t: s(t.get("tractor_number", "")),
                           reverse=("Я-А" in sort_by))
 
-    # Новый рейс
     if view_mode == "active":
         col1, col2 = st.columns([3, 1])
         with col2:
@@ -1482,8 +1476,8 @@ def main_page():
                                trip_invoice_number=trip_inv_num,
                                trip_invoice_date=trip_inv_date)
 
-            # Счёт
-            if has_nds and can("edit_invoice", role) and view_mode == "active":
+            # === Счёт доступен и в активных, и в завершённых ===
+            if has_nds and can("edit_invoice", role) and view_mode in ("active", "completed"):
                 inv_key = "show_inv_form_" + s(trip_id)
                 label = ("✏ Изменить счёт" if (trip_inv_num or trip_inv_date)
                          else "📄 Выставить счёт")
@@ -1583,7 +1577,6 @@ def main_page():
                                        s(tractor) + " " + s(driver))
                             st.rerun()
 
-                # Завершение
                 if st.session_state.get("open_complete_" + s(trip_id)):
                     with st.form("complete_" + s(trip_id)):
                         st.markdown("**Завершение рейса**")
@@ -1608,7 +1601,6 @@ def main_page():
                             st.success("Рейс завершён")
                             st.rerun()
 
-                # Редактирование рейса
                 if st.session_state.get("open_edittrip_" + s(trip_id)):
                     with st.form("edit_trip_" + s(trip_id)):
                         st.markdown("**Редактировать рейс**")
@@ -1642,7 +1634,6 @@ def main_page():
                                 st.success("Рейс обновлён")
                                 st.rerun()
 
-                # Soft-delete
                 if role == "admin" and view_mode == "active":
                     with st.expander("Опасная зона"):
                         st.warning("Рейс будет помечен как удалённый. Данные сохранятся.")
@@ -1654,7 +1645,6 @@ def main_page():
                             st.success("Рейс помечен удалённым")
                             st.rerun()
 
-                # Форма добавления авто
                 if view_mode == "active" and st.session_state.get("open_addcar_" + s(trip_id)):
                     f = render_shipment_form("newcar_" + s(trip_id), c=None,
                                              submit_label="Сохранить авто",
@@ -1695,7 +1685,6 @@ def main_page():
                                 st.success("Авто добавлено")
                                 st.rerun()
 
-                # Список авто
                 if cars:
                     st.markdown("**Список автомобилей в рейсе**")
 
@@ -1825,7 +1814,6 @@ def main_page():
 
                         st.markdown("</div>", unsafe_allow_html=True)
 
-                        # Форма переноса
                         if view_mode == "active" and not is_trace and \
                                 st.session_state.get("open_transfer_" + s(x["id"])):
                             other_trips = [tt for tt in trips
@@ -1880,7 +1868,6 @@ def main_page():
                     if total_nds > 0:
                         st.markdown("**НДС 22%:** " + fmt_money(total_nds))
 
-                    # Редактирование авто
                     for x in sorted(cars, key=lambda z: int(to_float(z.get("position")))):
                         if st.session_state.get("edit_ship_" + s(x["id"])):
                             st.markdown("**Редактировать авто (позиция " + s(x.get("position")) + ")**")
