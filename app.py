@@ -79,7 +79,7 @@ def get_ws_cached(name):
     return get_book().worksheet(name)
 
 
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def read_all_cached(name):
     ws = get_ws_cached(name)
     return ws.get_all_records()
@@ -99,9 +99,7 @@ def invalidate_cache(name=None):
 
 
 def ensure_sheets_once():
-    """Без @st.cache_resource — запускается каждый раз при старте.
-    Создаёт отсутствующие листы и дописывает недостающие заголовки,
-    расширяет листы при необходимости."""
+    """Создаёт листы и дописывает заголовки. Вызывается 1 раз за сессию."""
     book = get_book()
     existing = {ws.title for ws in book.worksheets()}
     for name, headers in SHEET_SCHEMAS.items():
@@ -110,13 +108,11 @@ def ensure_sheets_once():
             ws.append_row(headers)
         else:
             ws = book.worksheet(name)
-            # Расширяем лист, если колонок меньше, чем нужно
             try:
                 if ws.col_count < len(headers):
                     ws.add_cols(len(headers) - ws.col_count)
             except Exception:
                 pass
-            # Дописываем отсутствующие заголовки
             try:
                 current = ws.row_values(1)
             except Exception:
@@ -133,12 +129,20 @@ def ensure_sheets_once():
 
 
 def _ensure_cols(ws, needed):
-    """Гарантирует, что на листе не меньше `needed` колонок."""
     try:
         if ws.col_count < needed:
             ws.add_cols(needed - ws.col_count)
     except Exception:
         pass
+
+
+def _find_row_index_by_id(name, row_id):
+    """Возвращает номер строки в листе (1-based) или None. Из кэша, без API."""
+    rows = read_all_cached(name)
+    for idx, r in enumerate(rows):
+        if s(r.get("id")) == s(row_id):
+            return idx + 2
+    return None
 
 
 def append_row(name, row_dict):
@@ -444,143 +448,101 @@ def create_trip(tractor, driver, route, dep, ret, created_by):
 
 def update_trip(trip_id, tractor, driver, route, dep, ret):
     ws = get_ws_cached("trips")
-    _ensure_cols(ws, len(SHEET_SCHEMAS["trips"]))
-    all_rows = ws.get_all_values()
-    headers = SHEET_SCHEMAS["trips"]
-    last_col = chr(64 + len(headers))
-    for i, row in enumerate(all_rows[1:], start=2):
-        if s(row[0]) == s(trip_id):
-            cb = row[6] if len(row) > 6 else ""
-            ca = row[7] if len(row) > 7 else ""
-            arch = row[8] if len(row) > 8 else "0"
-            comp = row[9] if len(row) > 9 else "0"
-            comp_at = row[10] if len(row) > 10 else ""
-            inv_num = row[11] if len(row) > 11 else ""
-            inv_date = row[12] if len(row) > 12 else ""
-            new_row = [trip_id, s(tractor), s(driver), s(route), s(dep), s(ret),
-                       cb, ca, arch, comp, comp_at, inv_num, inv_date]
-            ws.update("A" + str(i) + ":" + last_col + str(i), [new_row])
-            invalidate_cache("trips")
-            return True
-    return False
+    row_idx = _find_row_index_by_id("trips", trip_id)
+    if row_idx is None:
+        return False
+    payload = [
+        {"range": "B" + str(row_idx), "values": [[s(tractor)]]},
+        {"range": "C" + str(row_idx), "values": [[s(driver)]]},
+        {"range": "D" + str(row_idx), "values": [[s(route)]]},
+        {"range": "E" + str(row_idx), "values": [[s(dep)]]},
+        {"range": "F" + str(row_idx), "values": [[s(ret)]]},
+    ]
+    ws.batch_update(payload, value_input_option="USER_ENTERED")
+    invalidate_cache("trips")
+    return True
 
 
 def update_trip_invoice(trip_id, invoice_number, invoice_date):
     ws = get_ws_cached("trips")
-    _ensure_cols(ws, len(SHEET_SCHEMAS["trips"]))
-    all_rows = ws.get_all_values()
-    headers = SHEET_SCHEMAS["trips"]
-    last_col = chr(64 + len(headers))
-    for i, row in enumerate(all_rows[1:], start=2):
-        if s(row[0]) == s(trip_id):
-            fields = list(row) + [""] * (len(headers) - len(row))
-            fields = fields[:len(headers)]
-            fields[11] = s(invoice_number)
-            fields[12] = s(invoice_date)
-            ws.update("A" + str(i) + ":" + last_col + str(i), [fields])
-            invalidate_cache("trips")
-            return True
-    return False
+    row_idx = _find_row_index_by_id("trips", trip_id)
+    if row_idx is None:
+        return False
+    payload = [
+        {"range": "L" + str(row_idx), "values": [[s(invoice_number)]]},
+        {"range": "M" + str(row_idx), "values": [[s(invoice_date)]]},
+    ]
+    ws.batch_update(payload, value_input_option="USER_ENTERED")
+    invalidate_cache("trips")
+    return True
 
 
 def archive_trip(trip_id):
     ws = get_ws_cached("trips")
-    _ensure_cols(ws, len(SHEET_SCHEMAS["trips"]))
-    all_rows = ws.get_all_values()
-    headers = SHEET_SCHEMAS["trips"]
-    last_col = chr(64 + len(headers))
-    for i, row in enumerate(all_rows[1:], start=2):
-        if s(row[0]) == s(trip_id):
-            cb = row[6] if len(row) > 6 else ""
-            ca = row[7] if len(row) > 7 else ""
-            comp = row[9] if len(row) > 9 else "0"
-            comp_at = row[10] if len(row) > 10 else ""
-            inv_num = row[11] if len(row) > 11 else ""
-            inv_date = row[12] if len(row) > 12 else ""
-            new_row = [trip_id, row[1], row[2], row[3], row[4], row[5], cb, ca, "1",
-                       comp, comp_at, inv_num, inv_date]
-            ws.update("A" + str(i) + ":" + last_col + str(i), [new_row])
-            invalidate_cache("trips")
-            return True
-    return False
+    row_idx = _find_row_index_by_id("trips", trip_id)
+    if row_idx is None:
+        return False
+    ws.update_cell(row_idx, 9, "1")
+    invalidate_cache("trips")
+    return True
 
 
 def unarchive_trip(trip_id):
     ws = get_ws_cached("trips")
-    _ensure_cols(ws, len(SHEET_SCHEMAS["trips"]))
-    all_rows = ws.get_all_values()
-    headers = SHEET_SCHEMAS["trips"]
-    last_col = chr(64 + len(headers))
-    for i, row in enumerate(all_rows[1:], start=2):
-        if s(row[0]) == s(trip_id):
-            cb = row[6] if len(row) > 6 else ""
-            ca = row[7] if len(row) > 7 else ""
-            comp = row[9] if len(row) > 9 else "0"
-            comp_at = row[10] if len(row) > 10 else ""
-            inv_num = row[11] if len(row) > 11 else ""
-            inv_date = row[12] if len(row) > 12 else ""
-            new_row = [trip_id, row[1], row[2], row[3], row[4], row[5], cb, ca, "0",
-                       comp, comp_at, inv_num, inv_date]
-            ws.update("A" + str(i) + ":" + last_col + str(i), [new_row])
-            invalidate_cache("trips")
-            return True
-    return False
+    row_idx = _find_row_index_by_id("trips", trip_id)
+    if row_idx is None:
+        return False
+    ws.update_cell(row_idx, 9, "0")
+    invalidate_cache("trips")
+    return True
 
 
 def complete_trip(trip_id, completed_at):
     ws = get_ws_cached("trips")
-    _ensure_cols(ws, len(SHEET_SCHEMAS["trips"]))
-    all_rows = ws.get_all_values()
-    headers = SHEET_SCHEMAS["trips"]
-    last_col = chr(64 + len(headers))
-    for i, row in enumerate(all_rows[1:], start=2):
-        if s(row[0]) == s(trip_id):
-            inv_num = row[11] if len(row) > 11 else ""
-            inv_date = row[12] if len(row) > 12 else ""
-            new_row = [trip_id, row[1], row[2], row[3], row[4], row[5],
-                       row[6] if len(row) > 6 else "",
-                       row[7] if len(row) > 7 else "",
-                       row[8] if len(row) > 8 else "0",
-                       "1", s(completed_at), inv_num, inv_date]
-            ws.update("A" + str(i) + ":" + last_col + str(i), [new_row])
-            invalidate_cache("trips")
-            return True
-    return False
+    row_idx = _find_row_index_by_id("trips", trip_id)
+    if row_idx is None:
+        return False
+    payload = [
+        {"range": "J" + str(row_idx), "values": [["1"]]},
+        {"range": "K" + str(row_idx), "values": [[s(completed_at)]]},
+    ]
+    ws.batch_update(payload, value_input_option="USER_ENTERED")
+    invalidate_cache("trips")
+    return True
 
 
 def uncomplete_trip(trip_id):
     ws = get_ws_cached("trips")
-    _ensure_cols(ws, len(SHEET_SCHEMAS["trips"]))
-    all_rows = ws.get_all_values()
-    headers = SHEET_SCHEMAS["trips"]
-    last_col = chr(64 + len(headers))
-    for i, row in enumerate(all_rows[1:], start=2):
-        if s(row[0]) == s(trip_id):
-            inv_num = row[11] if len(row) > 11 else ""
-            inv_date = row[12] if len(row) > 12 else ""
-            new_row = [trip_id, row[1], row[2], row[3], row[4], row[5],
-                       row[6] if len(row) > 6 else "",
-                       row[7] if len(row) > 7 else "",
-                       row[8] if len(row) > 8 else "0",
-                       "0", "", inv_num, inv_date]
-            ws.update("A" + str(i) + ":" + last_col + str(i), [new_row])
-            invalidate_cache("trips")
-            return True
-    return False
+    row_idx = _find_row_index_by_id("trips", trip_id)
+    if row_idx is None:
+        return False
+    payload = [
+        {"range": "J" + str(row_idx), "values": [["0"]]},
+        {"range": "K" + str(row_idx), "values": [[""]]},
+    ]
+    ws.batch_update(payload, value_input_option="USER_ENTERED")
+    invalidate_cache("trips")
+    return True
 
 
 def delete_trip(trip_id):
     ws = get_ws_cached("trips")
-    for i, row in enumerate(ws.get_all_values()[1:], start=2):
-        if s(row[0]) == s(trip_id):
-            ws.delete_rows(i)
-            invalidate_cache("trips")
-            break
+    row_idx = _find_row_index_by_id("trips", trip_id)
+    if row_idx is not None:
+        ws.delete_rows(row_idx)
+        invalidate_cache("trips")
+    # Удаляем авто этого рейса
+    rows = read_all_cached("shipments")
+    to_del = []
+    for idx, r in enumerate(rows):
+        if s(r.get("trip_id")) == s(trip_id):
+            to_del.append(idx + 2)
     ws2 = get_ws_cached("shipments")
-    to_del = [i for i, row in enumerate(ws2.get_all_values()[1:], start=2)
-              if s(row[1]) == s(trip_id)]
     for i in reversed(to_del):
-        ws2.delete_rows(i)
+        try:
+            ws2.delete_rows(i)
+        except Exception:
+            pass
     invalidate_cache("shipments")
 
 
@@ -627,84 +589,70 @@ def update_shipment(shipment_id, position, car_model, client, amount,
                     payer_type, customer, contract_number,
                     nds_amount, amount_no_nds):
     ws = get_ws_cached("shipments")
-    _ensure_cols(ws, len(SHEET_SCHEMAS["shipments"]))
-    all_rows = ws.get_all_values()
-    headers = SHEET_SCHEMAS["shipments"]
-    last_col = chr(64 + len(headers))
-    for i, row in enumerate(all_rows[1:], start=2):
-        if s(row[0]) == s(shipment_id):
-            trip_id = row[1] if len(row) > 1 else ""
-            created_by = row[17] if len(row) > 17 else ""
-            created_at = row[18] if len(row) > 18 else ""
-            issued_val = row[19] if len(row) > 19 else "0"
-            issued_ever_val = row[20] if len(row) > 20 else "0"
-            paid_val = row[21] if len(row) > 21 else "0"
-            archived_val = row[22] if len(row) > 22 else "0"
-            adv_before_paid_val = row[23] if len(row) > 23 else ""
-            inv_num = row[24] if len(row) > 24 else ""
-            inv_date = row[25] if len(row) > 25 else ""
-            tr_to = row[26] if len(row) > 26 else ""
-            tr_at = row[27] if len(row) > 27 else ""
-            tr_from = row[28] if len(row) > 28 else ""
-            new_row = [
-                shipment_id, trip_id, position, s(car_model), s(client),
-                money_value(amount), s(date_pay), s(paid_to),
-                s(delivery_city), s(vin),
-                money_value(advance), s(advance_date),
-                s(payer_type), s(customer), s(contract_number),
-                money_value(nds_amount), money_value(amount_no_nds),
-                created_by, created_at, issued_val, issued_ever_val,
-                paid_val, archived_val, adv_before_paid_val,
-                inv_num, inv_date,
-                tr_to, tr_at, tr_from,
-            ]
-            ws.update("A" + str(i) + ":" + last_col + str(i), [new_row])
-            invalidate_cache("shipments")
-            return True
-    return False
+    row_idx = _find_row_index_by_id("shipments", shipment_id)
+    if row_idx is None:
+        return False
+    payload = [
+        {"range": "C" + str(row_idx), "values": [[position]]},
+        {"range": "D" + str(row_idx), "values": [[s(car_model)]]},
+        {"range": "E" + str(row_idx), "values": [[s(client)]]},
+        {"range": "F" + str(row_idx), "values": [[money_value(amount)]]},
+        {"range": "G" + str(row_idx), "values": [[s(date_pay)]]},
+        {"range": "H" + str(row_idx), "values": [[s(paid_to)]]},
+        {"range": "I" + str(row_idx), "values": [[s(delivery_city)]]},
+        {"range": "J" + str(row_idx), "values": [[s(vin)]]},
+        {"range": "K" + str(row_idx), "values": [[money_value(advance)]]},
+        {"range": "L" + str(row_idx), "values": [[s(advance_date)]]},
+        {"range": "M" + str(row_idx), "values": [[s(payer_type)]]},
+        {"range": "N" + str(row_idx), "values": [[s(customer)]]},
+        {"range": "O" + str(row_idx), "values": [[s(contract_number)]]},
+        {"range": "P" + str(row_idx), "values": [[money_value(nds_amount)]]},
+        {"range": "Q" + str(row_idx), "values": [[money_value(amount_no_nds)]]},
+    ]
+    ws.batch_update(payload, value_input_option="USER_ENTERED")
+    invalidate_cache("shipments")
+    return True
 
 
 def transfer_shipment_to_trip(shipment_id, target_trip_id, new_position,
                               user_login):
     ws = get_ws_cached("shipments")
-    _ensure_cols(ws, len(SHEET_SCHEMAS["shipments"]))
-    all_rows = ws.get_all_values()
-    headers = SHEET_SCHEMAS["shipments"]
-    last_col = chr(64 + len(headers))
-
-    src_row = None
-    src_idx = None
-    for i, row in enumerate(all_rows[1:], start=2):
-        if s(row[0]) == s(shipment_id):
-            src_row = row
-            src_idx = i
-            break
-    if src_row is None:
+    row_idx = _find_row_index_by_id("shipments", shipment_id)
+    if row_idx is None:
         return False
 
-    source_trip_id = src_row[1] if len(src_row) > 1 else ""
-    car_model = src_row[3] if len(src_row) > 3 else ""
+    rows = read_all_cached("shipments")
+    src = None
+    for r in rows:
+        if s(r.get("id")) == s(shipment_id):
+            src = r
+            break
+    if src is None:
+        return False
 
-    fields = list(src_row) + [""] * (len(headers) - len(src_row))
-    fields = fields[:len(headers)]
-    fields[1] = target_trip_id
-    fields[2] = new_position
-    fields[26] = ""
-    fields[27] = datetime.now().strftime("%d.%m.%Y")
-    fields[28] = source_trip_id
-    ws.update("A" + str(src_idx) + ":" + last_col + str(src_idx), [fields])
+    source_trip_id = s(src.get("trip_id", ""))
+    car_model = s(src.get("car_model", ""))
+
+    payload = [
+        {"range": "B" + str(row_idx), "values": [[target_trip_id]]},
+        {"range": "C" + str(row_idx), "values": [[new_position]]},
+        {"range": "AA" + str(row_idx), "values": [[""]]},
+        {"range": "AB" + str(row_idx), "values": [[datetime.now().strftime("%d.%m.%Y")]]},
+        {"range": "AC" + str(row_idx), "values": [[source_trip_id]]},
+    ]
+    ws.batch_update(payload, value_input_option="USER_ENTERED")
 
     trace = {
         "id": next_id("shipments"),
         "trip_id": source_trip_id,
-        "position": src_row[2] if len(src_row) > 2 else "",
-        "car_model": "Перенесён: " + s(car_model),
+        "position": s(src.get("position", "")),
+        "car_model": "Перенесён: " + car_model,
         "client": "",
         "amount": 0,
         "date_pay": "",
         "paid_to": "",
-        "delivery_city": src_row[8] if len(src_row) > 8 else "",
-        "vin": src_row[9] if len(src_row) > 9 else "",
+        "delivery_city": s(src.get("delivery_city", "")),
+        "vin": s(src.get("vin", "")),
         "advance": 0,
         "advance_date": "",
         "payer_type": "",
@@ -726,65 +674,67 @@ def transfer_shipment_to_trip(shipment_id, target_trip_id, new_position,
         "transferred_from_trip": "",
     }
     append_row("shipments", trace)
-
     invalidate_cache("shipments")
     return True
 
 
 def toggle_issued(shipment_id, current_value, current_ever):
     ws = get_ws_cached("shipments")
-    _ensure_cols(ws, len(SHEET_SCHEMAS["shipments"]))
-    for i, row in enumerate(ws.get_all_values()[1:], start=2):
-        if s(row[0]) == s(shipment_id):
-            was_issued = s(current_value) == "1"
-            if not was_issued:
-                ws.update_cell(i, 20, "1")
-                ws.update_cell(i, 21, "1")
-            else:
-                ws.update_cell(i, 20, "0")
-                ws.update_cell(i, 22, "0")
-            invalidate_cache("shipments")
-            return "0" if was_issued else "1"
-    return current_value
+    row_idx = _find_row_index_by_id("shipments", shipment_id)
+    if row_idx is None:
+        return current_value
+    was_issued = s(current_value) == "1"
+    if not was_issued:
+        ws.update_cell(row_idx, 20, "1")
+        ws.update_cell(row_idx, 21, "1")
+    else:
+        ws.update_cell(row_idx, 20, "0")
+        ws.update_cell(row_idx, 22, "0")
+    invalidate_cache("shipments")
+    return "0" if was_issued else "1"
 
 
 def toggle_paid(shipment_id, current_paid, current_amount, current_advance):
     ws = get_ws_cached("shipments")
-    _ensure_cols(ws, 24)
-    for i, row in enumerate(ws.get_all_values()[1:], start=2):
-        if s(row[0]) == s(shipment_id):
-            was_paid = s(current_paid) == "1"
-            amount_val = money_value(current_amount)
-            advance_val = money_value(current_advance)
-            prev_adv = row[23] if len(row) > 23 else ""
+    row_idx = _find_row_index_by_id("shipments", shipment_id)
+    if row_idx is None:
+        return current_paid
+    was_paid = s(current_paid) == "1"
+    amount_val = money_value(current_amount)
+    advance_val = money_value(current_advance)
 
-            if not was_paid:
-                try:
-                    ws.update_cell(i, 24, money_value(advance_val))
-                except Exception:
-                    pass
-                ws.update_cell(i, 11, amount_val)
-                ws.update_cell(i, 22, "1")
-            else:
-                restore = money_value(prev_adv) if s(prev_adv).strip() != "" else 0.0
-                ws.update_cell(i, 11, restore)
-                ws.update_cell(i, 22, "0")
-                try:
-                    ws.update_cell(i, 24, "")
-                except Exception:
-                    pass
-            invalidate_cache("shipments")
-            return "1" if not was_paid else "0"
-    return current_paid
+    if not was_paid:
+        payload = [
+            {"range": "X" + str(row_idx), "values": [[advance_val]]},
+            {"range": "K" + str(row_idx), "values": [[amount_val]]},
+            {"range": "V" + str(row_idx), "values": [["1"]]},
+        ]
+        ws.batch_update(payload, value_input_option="USER_ENTERED")
+    else:
+        rows = read_all_cached("shipments")
+        prev_adv = ""
+        for r in rows:
+            if s(r.get("id")) == s(shipment_id):
+                prev_adv = s(r.get("advance_before_paid", ""))
+                break
+        restore = money_value(prev_adv) if prev_adv.strip() != "" else 0.0
+        payload = [
+            {"range": "K" + str(row_idx), "values": [[restore]]},
+            {"range": "V" + str(row_idx), "values": [["0"]]},
+            {"range": "X" + str(row_idx), "values": [[""]]},
+        ]
+        ws.batch_update(payload, value_input_option="USER_ENTERED")
+    invalidate_cache("shipments")
+    return "1" if not was_paid else "0"
 
 
 def delete_shipment(shipment_id):
     ws = get_ws_cached("shipments")
-    for i, row in enumerate(ws.get_all_values()[1:], start=2):
-        if s(row[0]) == s(shipment_id):
-            ws.delete_rows(i)
-            invalidate_cache("shipments")
-            return
+    row_idx = _find_row_index_by_id("shipments", shipment_id)
+    if row_idx is None:
+        return
+    ws.delete_rows(row_idx)
+    invalidate_cache("shipments")
 
 
 def log_act_print(login, trip_id, shipment_id, client):
@@ -1114,8 +1064,9 @@ def main_page():
                 return
         st.session_state.pop("show_act_for", None)
 
-    trips = get_trips(fresh=True)
-    shipments = get_shipments(fresh=True)
+    # Без fresh=True — читаем из кэша, обновляется через invalidate_cache после записи
+    trips = get_trips()
+    shipments = get_shipments()
 
     if view_mode == "archive":
         filtered = [t for t in trips if is_archived(t.get("archived", "0"))]
@@ -1709,11 +1660,17 @@ def main_page():
 
 def main():
     st.set_page_config(page_title="Учёт рейсов", page_icon="🚛", layout="wide")
-    try:
-        ensure_sheets_once()
-    except Exception as e:
-        st.error("Ошибка подключения к Google Sheets: " + type(e).__name__ + ": " + s(e))
-        st.stop()
+
+    # ensure_sheets_once — 1 раз за сессию
+    if not st.session_state.get("sheets_ready"):
+        try:
+            ensure_sheets_once()
+            st.session_state["sheets_ready"] = True
+        except Exception as e:
+            st.error("Ошибка подключения к Google Sheets: "
+                     + type(e).__name__ + ": " + s(e))
+            st.stop()
+
     ensure_first_admin()
     if "user" not in st.session_state:
         login_page()
