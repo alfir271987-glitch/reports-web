@@ -391,14 +391,13 @@ def next_shipment_id():
 # ============================================================
 
 def calculate_financials(row):
-    """Единый расчёт. Долг = Сумма − Аванс.
-    paid_amount используется только как «память» для отката оплаты
-    и в расчёте долга не участвует."""
     amount = to_float(row.get("amount"))
     advance = to_float(row.get("advance"))
+    paid_amount = to_float(row.get("paid_amount"))
     payer_type = s(row.get("payer_type"))
 
-    debt = amount - advance
+    total_paid = advance + paid_amount
+    debt = amount - total_paid
     if debt < 0.01:
         debt = 0.0
 
@@ -417,8 +416,8 @@ def calculate_financials(row):
     return {
         "amount": amount,
         "advance": advance,
-        "paid_amount": to_float(row.get("paid_amount")),
-        "total_paid": advance,
+        "paid_amount": paid_amount,
+        "total_paid": total_paid,
         "debt": debt,
         "nds": nds,
         "amount_no_nds": amount_no_nds,
@@ -659,19 +658,10 @@ def toggle_issued(shipment_id, current_value, current_ever):
     return "0" if was_issued else "1"
 
 
-def toggle_paid(shipment_id, current_paid, current_amount, current_advance):
-    """Оплачен / снять оплату.
-
-    При нажатии «Оплачен»:
-      paid_amount := amount − advance  (запоминаем, сколько нужно вернуть)
-      advance     := amount            (аванс = сумме → долг = 0)
-      paid        := 1
-
-    При снятии:
-      advance     := advance − paid_amount  (возвращаем прежний аванс)
-      paid_amount := 0
-      paid        := 0
-    """
+def toggle_paid(shipment_id, current_paid, current_amount, current_advance,
+                pay_date=None):
+    """Оплачен/снять. Оплата = amount - advance зачисляется в paid_amount.
+    Дополнительно записывается дата оплаты (date_pay)."""
     ws = get_ws_cached("shipments")
     row_idx = _find_row_index_by_id("shipments", shipment_id)
     if row_idx is None:
@@ -681,56 +671,25 @@ def toggle_paid(shipment_id, current_paid, current_amount, current_advance):
     advance_val = money_value(current_advance)
 
     if not was_paid:
-        # Сколько прибавляем к авансу, чтобы долг стал 0
-        add_to_advance = amount_val - advance_val
-        if add_to_advance < 0:
-            add_to_advance = 0.0
+        rest = amount_val - advance_val
+        if rest < 0:
+            rest = 0.0
+        if not pay_date:
+            pay_date = datetime.now().strftime("%d.%m.%Y")
         payload = [
-            {"range": "X" + str(row_idx), "values": [[add_to_advance]]},
-            {"range": "K" + str(row_idx), "values": [[amount_val]]},
+            {"range": "X" + str(row_idx), "values": [[rest]]},
             {"range": "V" + str(row_idx), "values": [["1"]]},
+            {"range": "G" + str(row_idx), "values": [[s(pay_date)]]},
         ]
         ws.batch_update(payload, value_input_option="USER_ENTERED")
     else:
-        # Снимаем оплату: возвращаем прежний аванс
-        rows = read_all_cached("shipments")
-        prev_paid_amount = 0.0
-        for r in rows:
-            if s(r.get("id")) == s(shipment_id):
-                prev_paid_amount = to_float(r.get("paid_amount"))
-                break
-        restored_advance = advance_val - prev_paid_amount
-        if restored_advance < 0:
-            restored_advance = 0.0
         payload = [
-            {"range": "K" + str(row_idx), "values": [[restored_advance]]},
             {"range": "X" + str(row_idx), "values": [[0]]},
             {"range": "V" + str(row_idx), "values": [["0"]]},
         ]
         ws.batch_update(payload, value_input_option="USER_ENTERED")
     invalidate_cache("shipments")
     return "1" if not was_paid else "0"
-
-
-def close_debt(shipment_id, current_amount, current_advance):
-    """Принудительно закрывает долг: аванс := сумма, paid := 1."""
-    ws = get_ws_cached("shipments")
-    row_idx = _find_row_index_by_id("shipments", shipment_id)
-    if row_idx is None:
-        return False
-    amount_val = money_value(current_amount)
-    advance_val = money_value(current_advance)
-    add_to_advance = amount_val - advance_val
-    if add_to_advance < 0:
-        add_to_advance = 0.0
-    payload = [
-        {"range": "X" + str(row_idx), "values": [[add_to_advance]]},
-        {"range": "K" + str(row_idx), "values": [[amount_val]]},
-        {"range": "V" + str(row_idx), "values": [["1"]]},
-    ]
-    ws.batch_update(payload, value_input_option="USER_ENTERED")
-    invalidate_cache("shipments")
-    return True
 
 
 def delete_shipment(shipment_id):
@@ -1467,7 +1426,6 @@ def main_page():
 
     st.title("Учёт рейсов и перевозок")
 
-    # ПЕЧАТЬ: ОБЩИЙ СПИСОК
     if st.session_state.get("show_print_all"):
         if st.button("Назад к списку", key="btn_back_from_print"):
             st.session_state.pop("show_print_all", None)
@@ -1509,7 +1467,6 @@ def main_page():
             show_print_list(print_rows)
         return
 
-    # АКТ
     if st.session_state.get("show_act_for"):
         sid = st.session_state["show_act_for"]
         shipments = get_shipments(fresh=True)
@@ -1526,7 +1483,6 @@ def main_page():
                 return
         st.session_state.pop("show_act_for", None)
 
-    # ИСТОРИЯ
     if st.session_state.get("show_history_for"):
         sid = st.session_state["show_history_for"]
         shipments = get_shipments(fresh=True)
@@ -1553,7 +1509,6 @@ def main_page():
                 )
         return
 
-    # ПЕЧАТЬ: ОДИН РЕЙС
     if st.session_state.get("show_print_trip"):
         rows = st.session_state["show_print_trip"]
         if st.button("Назад к списку", key="btn_back_from_print_trip"):
@@ -1990,6 +1945,8 @@ def main_page():
                             details.append("Город: " + s(x.get("delivery_city", "")))
                         if s(x.get("advance_date", "")):
                             details.append("Дата аванса: " + date_to_display_safe(x.get("advance_date", "")))
+                        if s(x.get("date_pay", "")):
+                            details.append("Дата оплаты: " + date_to_display_safe(x.get("date_pay", "")))
                         if s(x.get("payer_type", "")):
                             details.append("Оплата: " + s(x.get("payer_type", "")))
                         if s(x.get("paid_to", "")):
@@ -2005,40 +1962,92 @@ def main_page():
                                 unsafe_allow_html=True,
                             )
 
-                        if view_mode == "active" and not is_trace:
-                            bc1, bc2, bc3, bc4 = st.columns(4)
-                            paid_label = "❌ Снять" if is_paid_flag else "✅ Оплачен"
-                            if bc1.button(paid_label, key="btn_paid_" + s(x["id"]),
-                                          use_container_width=True):
-                                toggle_paid(x["id"], paid_val, amount_val, advance_val)
-                                log_action(u["login"], role, "toggle_paid",
-                                           "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
-                                st.rerun()
+                        # === Кнопки «Оплачен» — активные И завершённые ===
+                        if not is_trace and view_mode in ("active", "completed"):
+                            pay_key = "open_pay_" + s(x["id"])
 
-                            if is_issued_flag:
-                                if bc2.button("↩ Снять выдан", key="btn_issued_" + s(x["id"]),
+                            if not is_paid_flag:
+                                bc1, bc2, bc3, bc4 = st.columns(4)
+                                if bc1.button("✅ Оплачен",
+                                              key="btn_paid_open_" + s(x["id"]),
                                               use_container_width=True):
-                                    toggle_issued(x["id"], issued_val, "0")
-                                    log_action(u["login"], role, "toggle_issued",
-                                               "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
+                                    st.session_state[pay_key] = True
                                     st.rerun()
                             else:
-                                if bc2.button("✅ Выдан", key="btn_issued_" + s(x["id"]),
+                                bc1, bc2, bc3, bc4 = st.columns(4)
+                                if bc1.button("❌ Снять",
+                                              key="btn_paid_" + s(x["id"]),
                                               use_container_width=True):
-                                    toggle_issued(x["id"], issued_val, "0")
-                                    log_action(u["login"], role, "toggle_issued",
+                                    toggle_paid(x["id"], paid_val, amount_val, advance_val)
+                                    log_action(u["login"], role, "toggle_paid",
                                                "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
                                     st.rerun()
 
-                            if bc3.button("📄 Акт", key="btn_act_inline_" + s(x["id"]),
-                                          use_container_width=True):
-                                st.session_state["show_act_for"] = x["id"]
-                                st.rerun()
+                            if view_mode == "active":
+                                if is_issued_flag:
+                                    if bc2.button("↩ Снять выдан", key="btn_issued_" + s(x["id"]),
+                                                  use_container_width=True):
+                                        toggle_issued(x["id"], issued_val, "0")
+                                        log_action(u["login"], role, "toggle_issued",
+                                                   "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
+                                        st.rerun()
+                                else:
+                                    if bc2.button("✅ Выдан", key="btn_issued_" + s(x["id"]),
+                                                  use_container_width=True):
+                                        toggle_issued(x["id"], issued_val, "0")
+                                        log_action(u["login"], role, "toggle_issued",
+                                                   "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
+                                        st.rerun()
 
-                            if bc4.button("✏ Изменить", key="btn_edit_" + s(x["id"]),
-                                          use_container_width=True):
-                                st.session_state["edit_ship_" + s(x["id"])] = True
+                                if bc3.button("📄 Акт", key="btn_act_inline_" + s(x["id"]),
+                                              use_container_width=True):
+                                    st.session_state["show_act_for"] = x["id"]
+                                    st.rerun()
 
+                                if bc4.button("✏ Изменить", key="btn_edit_" + s(x["id"]),
+                                              use_container_width=True):
+                                    st.session_state["edit_ship_" + s(x["id"])] = True
+                            else:
+                                if bc2.button("📄 Акт", key="btn_act_inline_" + s(x["id"]),
+                                              use_container_width=True):
+                                    st.session_state["show_act_for"] = x["id"]
+                                    st.rerun()
+
+                            # Форма даты оплаты
+                            if not is_paid_flag and st.session_state.get(pay_key):
+                                with st.form("pay_form_" + s(x["id"])):
+                                    st.markdown("**Отметить оплату**")
+                                    pay_date = st.text_input(
+                                        "Дата оплаты (ДД.ММ.ГГГГ)",
+                                        value=datetime.now().strftime("%d.%m.%Y"),
+                                        key="pay_date_" + s(x["id"]))
+                                    c_ok = st.form_submit_button("💾 Сохранить оплату")
+                                    c_no = st.form_submit_button("Отмена")
+                                if c_no:
+                                    st.session_state.pop(pay_key, None)
+                                    st.rerun()
+                                if c_ok:
+                                    try:
+                                        pay_fmt = parse_date_ui(pay_date)
+                                    except ValueError as ex:
+                                        st.error(str(ex))
+                                    else:
+                                        toggle_paid(x["id"], paid_val, amount_val,
+                                                    advance_val, pay_date=pay_fmt)
+                                        log_action(u["login"], role, "toggle_paid",
+                                                   "рейс " + s(trip_id)
+                                                   + ", поз " + s(x.get("position"))
+                                                   + ", дата " + pay_fmt)
+                                        st.session_state.pop(pay_key, None)
+                                        st.success("Оплата сохранена")
+                                        st.rerun()
+
+                        elif view_mode == "active" and not is_trace:
+                            # Fallback (не должно срабатывать, но на всякий случай)
+                            pass
+
+                        # Кнопки переноса и удаления — только в активных
+                        if view_mode == "active" and not is_trace:
                             tc1, tc2, tc3 = st.columns(3)
                             if can("transfer_ship", role):
                                 if tc1.button("📦 Перенести",
@@ -2057,6 +2066,13 @@ def main_page():
                                     log_action(u["login"], role, "delete_ship",
                                                "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
                                     st.rerun()
+                        elif view_mode == "completed" and not is_trace:
+                            tc1, tc2 = st.columns(2)
+                            if tc1.button("📜 История",
+                                          key="btn_hist_" + s(x["id"]),
+                                          use_container_width=True):
+                                st.session_state["show_history_for"] = x["id"]
+                                st.rerun()
 
                         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -2162,7 +2178,6 @@ def main_page():
                 else:
                     st.info("В этом рейсе ещё нет авто.")
 
-    # ИТОГО
     st.markdown("---")
 
     active_trip_ids = {s(t.get("id")) for t in trips
@@ -2213,10 +2228,6 @@ def main_page():
             unsafe_allow_html=True,
         )
 
-
-# ============================================================
-# ТОЧКА ВХОДА
-# ============================================================
 
 def main():
     st.set_page_config(page_title="Учёт рейсов", page_icon="🚛", layout="wide")
