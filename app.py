@@ -180,7 +180,7 @@ def safe_df(rows):
 
 
 # ============================================================
-# БЕЗОПАСНОСТЬ: bcrypt
+# БЕЗОПАСНОСТЬ
 # ============================================================
 
 try:
@@ -354,7 +354,7 @@ def _log_system_error(where, name, exc):
 
 
 # ============================================================
-# ГЕТТЕРЫ ДАННЫХ
+# ГЕТТЕРЫ
 # ============================================================
 
 def get_trips(fresh=False):
@@ -387,7 +387,7 @@ def next_shipment_id():
 
 
 # ============================================================
-# ФИНАНСОВЫЙ РАСЧЁТ
+# ФИНАНСЫ
 # ============================================================
 
 def calculate_financials(row):
@@ -409,13 +409,8 @@ def calculate_financials(row):
         amount_no_nds = amount
 
     if debt <= 0.01:
-        status = "paid"
         status_text = "🟡 Оплачен"
-    elif total_paid > 0:
-        status = "partial"
-        status_text = "🔴 Долг"
     else:
-        status = "unpaid"
         status_text = "🔴 Долг"
 
     return {
@@ -426,13 +421,12 @@ def calculate_financials(row):
         "debt": debt,
         "nds": nds,
         "amount_no_nds": amount_no_nds,
-        "status": status,
         "status_text": status_text,
     }
 
 
 # ============================================================
-# ХЕЛПЕРЫ АКТИВНЫХ АВТО
+# АКТИВНЫЕ АВТО
 # ============================================================
 
 def is_car_active_on_avtovoz(x):
@@ -467,7 +461,7 @@ def next_free_position(cars):
 
 
 # ============================================================
-# CRUD: ТРИПЫ
+# CRUD: TRIPS
 # ============================================================
 
 def create_trip(tractor, driver, route, dep, ret, created_by):
@@ -577,7 +571,7 @@ def soft_delete_trip(trip_id):
 
 
 # ============================================================
-# CRUD: SHIPMENTS (АВТО)
+# CRUD: SHIPMENTS
 # ============================================================
 
 def create_shipment(trip_id, position, car_model, client, amount,
@@ -702,7 +696,7 @@ def delete_shipment(shipment_id):
 
 
 # ============================================================
-# ИСТОРИЯ ПЕРЕМЕЩЕНИЙ + ПЕРЕНОС
+# ПЕРЕНОС
 # ============================================================
 
 def log_transfer(shipment_id, from_trip, to_trip,
@@ -875,6 +869,128 @@ def show_act(trip, shipment):
             file_name=base_name + ".txt", mime="text/plain",
             key="dl_txt_" + s(shipment.get("id")))
     st.components.v1.html(render_act_html(trip, shipment), height=850, scrolling=True)
+
+
+# ============================================================
+# СПИСОК ДЛЯ ВОДИТЕЛЯ (.doc)
+# ============================================================
+
+def render_print_list_doc(rows, title="Список перевозимых автомобилей"):
+    """Печатная форма .doc: шапка рейса сверху, таблица авто снизу."""
+    # Группируем по рейсам
+    groups = []
+    cur_key = None
+    cur_group = None
+    for r in rows:
+        key = (s(r.get("tractor")), s(r.get("driver")),
+               s(r.get("route")), s(r.get("dep")))
+        if key != cur_key:
+            if cur_group:
+                groups.append(cur_group)
+            cur_key = key
+            cur_group = {
+                "tractor": s(r.get("tractor")),
+                "driver": s(r.get("driver")),
+                "route": s(r.get("route")),
+                "dep": s(r.get("dep")),
+                "cars": [],
+            }
+        cur_group["cars"].append(r)
+    if cur_group:
+        groups.append(cur_group)
+
+    p = []
+    p.append("<!DOCTYPE html>")
+    p.append('<html xmlns:o="urn:schemas-microsoft-com:office:office" '
+             'xmlns:w="urn:schemas-microsoft-com:office:word" '
+             'xmlns="http://www.w3.org/TR/REC-html40">')
+    p.append("<head>")
+    p.append('<meta charset="utf-8">')
+    p.append("<title>" + title + "</title>")
+    p.append("<style>")
+    p.append("@page { size: A4; margin: 1.5cm; }")
+    p.append('body { font-family: "Times New Roman", Times, serif; '
+             'font-size: 12pt; line-height: 1.4; }')
+    p.append("h1 { text-align: center; font-size: 16pt; "
+             "text-transform: uppercase; margin-bottom: 18px; }")
+    p.append("table { width: 100%; border-collapse: collapse; "
+             "margin-bottom: 14px; }")
+    p.append("th, td { border: 1px solid #333; padding: 4px 6px; "
+             "vertical-align: top; font-size: 11pt; }")
+    p.append("th { background: #e8e8e8; font-weight: bold; text-align: left; }")
+    p.append(".num { width: 30px; text-align: center; }")
+    p.append(".pos { width: 40px; text-align: center; }")
+    p.append(".debt { width: 100px; text-align: right; font-weight: bold; }")
+    p.append(".city { width: 130px; }")
+    p.append(".fio { width: 160px; }")
+    p.append(".header-trip { background: #f0f0f0; padding: 6px 8px; "
+             "border: 1px solid #333; margin-bottom: 6px; }")
+    p.append("</style></head><body>")
+    p.append("<h1>" + title + "</h1>")
+
+    for g in groups:
+        p.append('<div class="header-trip">')
+        p.append('<p style="margin: 2px 0;"><b>Дата выезда:</b> '
+                 + s(g["dep"]) + "</p>")
+        p.append('<p style="margin: 2px 0;"><b>Тягач:</b> '
+                 + s(g["tractor"]) + " &nbsp;&nbsp; "
+                 '<b>Водитель:</b> ' + s(g["driver"]) + "</p>")
+        p.append('<p style="margin: 2px 0;"><b>Маршрут:</b> '
+                 + s(g["route"]) + "</p>")
+        p.append("</div>")
+
+        p.append("<table>")
+        p.append("<thead><tr>")
+        p.append('<th class="num">№</th>')
+        p.append('<th class="pos">Поз.</th>')
+        p.append("<th>Марка / модель</th>")
+        p.append('<th class="fio">ФИО</th>')
+        p.append('<th class="city">Город доставки</th>')
+        p.append('<th class="debt">Задолж., ₽</th>')
+        p.append("</tr></thead><tbody>")
+
+        total_debt = 0.0
+        for i, r in enumerate(g["cars"], start=1):
+            fio = s(r.get("client", "")) or s(r.get("customer", ""))
+            debt = to_float(r.get("debt"))
+            total_debt += debt
+            p.append("<tr>")
+            p.append('<td class="num">' + s(i) + "</td>")
+            p.append('<td class="pos">' + s(r.get("position", "")) + "</td>")
+            p.append("<td>" + s(r.get("car_model", "")) + "</td>")
+            p.append('<td class="fio">' + fio + "</td>")
+            p.append('<td class="city">' + s(r.get("delivery_city", "")) + "</td>")
+            p.append('<td class="debt">' + fmt_money(debt) + "</td>")
+            p.append("</tr>")
+
+        p.append("<tr>")
+        p.append('<td colspan="5" style="text-align: right; font-weight: bold;">'
+                 "Итого по рейсу:</td>")
+        p.append('<td class="debt">' + fmt_money(total_debt) + "</td>")
+        p.append("</tr>")
+        p.append("</tbody></table>")
+
+    grand_total = sum(to_float(r.get("debt")) for r in rows)
+    p.append('<p style="text-align: right; font-size: 13pt; '
+             'font-weight: bold; margin-top: 16px;">'
+             "Общая задолженность: " + fmt_money(grand_total) + " ₽</p>")
+
+    p.append("</body></html>")
+    return "".join(p)
+
+
+def show_print_list(rows):
+    st.info("Скачайте файл — он откроется в Word или LibreOffice. "
+            "Для PDF: откройте файл и выберите «Сохранить как PDF».")
+    doc_html = render_print_list_doc(rows)
+    st.download_button(
+        "📥 Скачать список (.doc)",
+        data=doc_html.encode("utf-8"),
+        file_name="Список_авто.doc",
+        mime="application/msword",
+        key="dl_print_doc_" + str(len(rows)),
+    )
+    st.components.v1.html(doc_html, height=900, scrolling=True)
 
 
 # ============================================================
@@ -1306,6 +1422,49 @@ def main_page():
 
     st.title("Учёт рейсов и перевозок")
 
+    # ========== ПЕЧАТЬ: ОБЩИЙ СПИСОК ==========
+    if st.session_state.get("show_print_all"):
+        if st.button("Назад к списку", key="btn_back_from_print"):
+            st.session_state.pop("show_print_all", None)
+            st.rerun()
+        st.subheader("🖨 Печать списка автомобилей")
+        print_rows = []
+        active_trips = [t for t in get_trips()
+                        if not is_archived(t.get("archived", "0"))
+                        and not is_deleted(t.get("deleted_at", ""))
+                        and not check_completed(t.get("completed", "0"))]
+        active_trips = sorted(
+            active_trips,
+            key=lambda t: date_sort_key(t.get("date_departure", "")),
+            reverse=True,
+        )
+        all_ships = get_shipments()
+        for t in active_trips:
+            tid = s(t.get("id"))
+            cars = [x for x in all_ships if s(x.get("trip_id")) == tid]
+            for x in sorted(cars, key=lambda z: int(to_float(z.get("position")))):
+                if not is_car_active_on_avtovoz(x):
+                    continue
+                fin = calculate_financials(x)
+                print_rows.append({
+                    "tractor": s(t.get("tractor_number", "")),
+                    "driver": s(t.get("driver", "")),
+                    "route": s(t.get("route", "")),
+                    "dep": date_to_display_safe(t.get("date_departure", "")),
+                    "position": s(x.get("position", "")),
+                    "car_model": s(x.get("car_model", "")),
+                    "client": s(x.get("client", "")),
+                    "customer": s(x.get("customer", "")),
+                    "delivery_city": s(x.get("delivery_city", "")),
+                    "debt": fin["debt"],
+                })
+        if not print_rows:
+            st.info("Нет активных авто для печати.")
+        else:
+            show_print_list(print_rows)
+        return
+
+    # ========== АКТ ==========
     if st.session_state.get("show_act_for"):
         sid = st.session_state["show_act_for"]
         shipments = get_shipments(fresh=True)
@@ -1322,6 +1481,7 @@ def main_page():
                 return
         st.session_state.pop("show_act_for", None)
 
+    # ========== ИСТОРИЯ ==========
     if st.session_state.get("show_history_for"):
         sid = st.session_state["show_history_for"]
         shipments = get_shipments(fresh=True)
@@ -1348,8 +1508,25 @@ def main_page():
                 )
         return
 
+    # ========== ПЕЧАТЬ: ОДИН РЕЙС ==========
+    if st.session_state.get("show_print_trip"):
+        rows = st.session_state["show_print_trip"]
+        if st.button("Назад к списку", key="btn_back_from_print_trip"):
+            st.session_state.pop("show_print_trip", None)
+            st.rerun()
+        st.subheader("🖨 Печать списка по рейсу")
+        show_print_list(rows)
+        return
+
     trips = get_trips()
     shipments = get_shipments()
+
+    col_p1, col_p2, col_p3 = st.columns([1, 1, 4])
+    with col_p1:
+        if st.button("🖨 Печать списка авто", key="btn_print_all",
+                     use_container_width=True):
+            st.session_state["show_print_all"] = True
+            st.rerun()
 
     if view_mode == "archive":
         filtered = [t for t in trips
@@ -1476,7 +1653,6 @@ def main_page():
                                trip_invoice_number=trip_inv_num,
                                trip_invoice_date=trip_inv_date)
 
-            # === Счёт доступен и в активных, и в завершённых ===
             if has_nds and can("edit_invoice", role) and view_mode in ("active", "completed"):
                 inv_key = "show_inv_form_" + s(trip_id)
                 label = ("✏ Изменить счёт" if (trip_inv_num or trip_inv_date)
@@ -1576,6 +1752,31 @@ def main_page():
                             log_action(u["login"], role, "uncomplete_trip",
                                        s(tractor) + " " + s(driver))
                             st.rerun()
+
+                if cars:
+                    if st.button("🖨 Печать списка по рейсу",
+                                 key="btn_print_trip_" + s(trip_id),
+                                 use_container_width=True):
+                        rows = []
+                        for x in sorted(cars,
+                                        key=lambda z: int(to_float(z.get("position")))):
+                            if not is_car_active_on_avtovoz(x):
+                                continue
+                            fin = calculate_financials(x)
+                            rows.append({
+                                "tractor": tractor,
+                                "driver": driver,
+                                "route": route,
+                                "dep": dep,
+                                "position": s(x.get("position", "")),
+                                "car_model": s(x.get("car_model", "")),
+                                "client": s(x.get("client", "")),
+                                "customer": s(x.get("customer", "")),
+                                "delivery_city": s(x.get("delivery_city", "")),
+                                "debt": fin["debt"],
+                            })
+                        st.session_state["show_print_trip"] = rows
+                        st.rerun()
 
                 if st.session_state.get("open_complete_" + s(trip_id)):
                     with st.form("complete_" + s(trip_id)):
