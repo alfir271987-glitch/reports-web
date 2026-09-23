@@ -1,5 +1,5 @@
 # ============================================================
-# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.1
+# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.3
 # Streamlit + Google Sheets
 # ============================================================
 
@@ -394,11 +394,12 @@ def calculate_financials(row):
     amount = to_float(row.get("amount"))
     advance = to_float(row.get("advance"))
     paid_amount = to_float(row.get("paid_amount"))
+    paid_flag = check_paid(row.get("paid", "0"))
     payer_type = s(row.get("payer_type"))
 
-    total_paid = advance + paid_amount
-    debt = amount - total_paid
-    if debt < 0.01:
+    # Долг = amount - advance. Флаг paid дополнительно обнуляет долг.
+    debt = amount - advance
+    if debt < 0.01 or paid_flag:
         debt = 0.0
 
     if payer_type == NDS_PAYER:
@@ -417,7 +418,6 @@ def calculate_financials(row):
         "amount": amount,
         "advance": advance,
         "paid_amount": paid_amount,
-        "total_paid": total_paid,
         "debt": debt,
         "nds": nds,
         "amount_no_nds": amount_no_nds,
@@ -660,9 +660,9 @@ def toggle_issued(shipment_id, current_value, current_ever):
 
 def toggle_paid(shipment_id, current_paid, current_amount, current_advance):
     """Оплачен / снять оплату.
-
-    При нажатии «Оплачен»: paid_amount := amount - advance (долг обнуляется),
-    paid := 1. При снятии: paid_amount := 0, paid := 0 (долг возвращается)."""
+    При оплате: paid_amount := advance (запоминаем старый аванс),
+                advance := amount (долг = 0), paid := 1.
+    При снятии: advance := paid_amount (возвращаем), paid_amount := 0, paid := 0."""
     ws = get_ws_cached("shipments")
     row_idx = _find_row_index_by_id("shipments", shipment_id)
     if row_idx is None:
@@ -672,45 +672,21 @@ def toggle_paid(shipment_id, current_paid, current_amount, current_advance):
     advance_val = money_value(current_advance)
 
     if not was_paid:
-        # Оплачено: долг обнуляется → paid_amount = amount - advance
-        rest = amount_val - advance_val
-        if rest < 0:
-            rest = 0.0
         payload = [
-            {"range": "X" + str(row_idx), "values": [[rest]]},   # paid_amount
-            {"range": "V" + str(row_idx), "values": [["1"]]},    # paid
+            {"range": "X" + str(row_idx), "values": [[advance_val]]},
+            {"range": "K" + str(row_idx), "values": [[amount_val]]},
+            {"range": "V" + str(row_idx), "values": [["1"]]},
         ]
         ws.batch_update(payload, value_input_option="USER_ENTERED")
     else:
-        # Снять оплату: возвращаем долг
         payload = [
+            {"range": "K" + str(row_idx), "values": [[advance_val]]},
             {"range": "X" + str(row_idx), "values": [[0]]},
             {"range": "V" + str(row_idx), "values": [["0"]]},
         ]
         ws.batch_update(payload, value_input_option="USER_ENTERED")
     invalidate_cache("shipments")
     return "1" if not was_paid else "0"
-
-
-def close_debt(shipment_id, current_amount, current_advance):
-    """Принудительно закрывает долг.
-    paid_amount := amount - advance, paid := 1. Одностороннее действие."""
-    ws = get_ws_cached("shipments")
-    row_idx = _find_row_index_by_id("shipments", shipment_id)
-    if row_idx is None:
-        return False
-    amount_val = money_value(current_amount)
-    advance_val = money_value(current_advance)
-    rest = amount_val - advance_val
-    if rest < 0:
-        rest = 0.0
-    payload = [
-        {"range": "X" + str(row_idx), "values": [[rest]]},
-        {"range": "V" + str(row_idx), "values": [["1"]]},
-    ]
-    ws.batch_update(payload, value_input_option="USER_ENTERED")
-    invalidate_cache("shipments")
-    return True
 
 
 def delete_shipment(shipment_id):
@@ -727,13 +703,8 @@ def delete_shipment(shipment_id):
 # ============================================================
 
 def pay_entire_trip_nds(trip_id, user_login, role):
-    """Оплачивает все авто в рейсе, у которых payer_type == NDS_PAYER.
-
-    Для каждого авто выставляет:
-      paid_amount = amount - advance
-      paid = 1
-    Возвращает (оплачено, пропущено, сумма_закрытая).
-    """
+    """Оплата всех авто с безналом НДС в рейсе.
+    advance := amount (долг = 0), старый аванс сохраняется в paid_amount."""
     shipments = read_all("shipments", fresh=True)
     cars = [x for x in shipments
             if s(x.get("trip_id")) == s(trip_id)
@@ -763,8 +734,9 @@ def pay_entire_trip_nds(trip_id, user_login, role):
             continue
 
         payload = [
-            {"range": "X" + str(row_idx), "values": [[debt_val]]},  # paid_amount
-            {"range": "V" + str(row_idx), "values": [["1"]]},       # paid
+            {"range": "X" + str(row_idx), "values": [[advance_val]]},
+            {"range": "K" + str(row_idx), "values": [[amount_val]]},
+            {"range": "V" + str(row_idx), "values": [["1"]]},
         ]
         ws.batch_update(payload, value_input_option="USER_ENTERED")
         paid_count += 1
@@ -779,9 +751,46 @@ def pay_entire_trip_nds(trip_id, user_login, role):
     return paid_count, skipped_count, closed_sum
 
 
-def render_trip_payment_button(trip_id, cars, role, user_login,
-                                trip_label=""):
-    """Кнопка 'Оплатить весь рейс (безнал с НДС)' + подтверждение."""
+def unpay_entire_trip_nds(trip_id, user_login, role):
+    """Снятие оплаты со всех авто с безналом НДС в рейсе.
+    advance := paid_amount (возвращаем прежний), paid_amount := 0, paid := 0."""
+    shipments = read_all("shipments", fresh=True)
+    cars = [x for x in shipments
+            if s(x.get("trip_id")) == s(trip_id)
+            and s(x.get("payer_type", "")).strip() == NDS_PAYER]
+
+    unpay_count = 0
+    ws = get_ws_cached("shipments")
+
+    for x in cars:
+        sid = s(x.get("id"))
+        row_idx = _find_row_index_by_id("shipments", sid)
+        if row_idx is None:
+            continue
+
+        was_paid = check_paid(x.get("paid", "0"))
+        if not was_paid:
+            continue
+
+        old_adv = money_value(x.get("paid_amount"))
+        payload = [
+            {"range": "K" + str(row_idx), "values": [[old_adv]]},
+            {"range": "X" + str(row_idx), "values": [[0]]},
+            {"range": "V" + str(row_idx), "values": [["0"]]},
+        ]
+        ws.batch_update(payload, value_input_option="USER_ENTERED")
+        unpay_count += 1
+
+    if unpay_count > 0:
+        invalidate_cache("shipments")
+        log_action(user_login, role, "unpay_entire_trip_nds",
+                   "trip " + s(trip_id) + " | снято с " + s(unpay_count) + " авто")
+
+    return unpay_count
+
+
+def render_trip_payment_button(trip_id, cars, role, user_login, trip_label=""):
+    """Кнопки 'Оплатить весь рейс' и 'Снять оплату с рейса'."""
     nds_cars = [x for x in cars
                 if s(x.get("payer_type", "")).strip() == NDS_PAYER]
     if not nds_cars:
@@ -789,58 +798,87 @@ def render_trip_payment_button(trip_id, cars, role, user_login,
 
     unpaid_debt = 0.0
     unpaid_count = 0
+    paid_count = 0
     for x in nds_cars:
         f = calculate_financials(x)
-        if f["debt"] > 0.01:
+        if check_paid(x.get("paid", "0")):
+            paid_count += 1
+        elif f["debt"] > 0.01:
             unpaid_debt += f["debt"]
             unpaid_count += 1
 
-    if unpaid_count == 0:
-        st.caption("💵 Все авто с безналом (НДС) уже оплачены.")
-        return
+    key_confirm_pay = "confirm_pay_trip_nds_" + s(trip_id)
+    key_confirm_unpay = "confirm_unpay_trip_nds_" + s(trip_id)
 
-    key_btn = "btn_pay_trip_nds_" + s(trip_id)
-    key_confirm = "confirm_pay_trip_nds_" + s(trip_id)
-
-    if not st.session_state.get(key_confirm):
-        if st.button(
-            "💵 Оплатить весь рейс (безнал с НДС) — "
-            + fmt_money(unpaid_debt) + " ₽ / " + s(unpaid_count) + " авто",
-            key=key_btn,
-            use_container_width=True,
-        ):
-            st.session_state[key_confirm] = True
-            st.rerun()
-    else:
-        st.warning(
-            "Закрыть долг по **" + s(unpaid_count) + "** авто на сумму **"
-            + fmt_money(unpaid_debt) + " ₽**? Действие одностороннее."
-        )
-        c1, c2 = st.columns(2)
-        if c1.button("✅ Подтвердить оплату",
-                     key="ok_" + key_confirm,
-                     use_container_width=True):
-            paid, skipped, closed = pay_entire_trip_nds(
-                trip_id, user_login, role
+    if unpaid_count > 0:
+        if not st.session_state.get(key_confirm_pay):
+            if st.button(
+                "💵 Оплатить весь рейс (безнал с НДС) — "
+                + fmt_money(unpaid_debt) + " ₽ / " + s(unpaid_count) + " авто",
+                key="btn_pay_trip_nds_" + s(trip_id),
+                use_container_width=True,
+            ):
+                st.session_state[key_confirm_pay] = True
+                st.rerun()
+        else:
+            st.warning(
+                "Оплатить **" + s(unpaid_count) + "** авто на сумму **"
+                + fmt_money(unpaid_debt) + " ₽**? Долг будет обнулён — "
+                "аванс поднимется до полной суммы."
             )
-            st.session_state.pop(key_confirm, None)
-            if paid > 0:
-                st.success(
-                    "Оплачено авто: " + s(paid)
-                    + " · закрыто: " + fmt_money(closed) + " ₽"
-                    + (" · пропущено: " + s(skipped) if skipped else "")
+            c1, c2 = st.columns(2)
+            if c1.button("✅ Подтвердить оплату",
+                         key="ok_" + key_confirm_pay,
+                         use_container_width=True):
+                paid, skipped, closed = pay_entire_trip_nds(
+                    trip_id, user_login, role
                 )
-            else:
-                st.info("Нечего оплачивать.")
-            st.rerun()
-        if c2.button("Отмена",
-                     key="cancel_" + key_confirm,
-                     use_container_width=True):
-            st.session_state.pop(key_confirm, None)
-            st.rerun()
+                st.session_state.pop(key_confirm_pay, None)
+                if paid > 0:
+                    st.success(
+                        "Оплачено авто: " + s(paid)
+                        + " · долг закрыт на " + fmt_money(closed) + " ₽"
+                    )
+                else:
+                    st.info("Нечего оплачивать.")
+                st.rerun()
+            if c2.button("Отмена",
+                         key="cancel_" + key_confirm_pay,
+                         use_container_width=True):
+                st.session_state.pop(key_confirm_pay, None)
+                st.rerun()
 
-
-# ============================================================
+    if paid_count > 0 and unpaid_count == 0:
+        if not st.session_state.get(key_confirm_unpay):
+            if st.button(
+                "↩ Снять оплату с рейса (безнал с НДС)",
+                key="btn_unpay_trip_nds_" + s(trip_id),
+                use_container_width=True,
+            ):
+                st.session_state[key_confirm_unpay] = True
+                st.rerun()
+        else:
+            st.warning(
+                "Снять оплату с **" + s(paid_count) + "** авто? "
+                "Аванс вернётся к исходному значению, долг появится снова."
+            )
+            c1, c2 = st.columns(2)
+            if c1.button("✅ Подтвердить снятие",
+                         key="ok_" + key_confirm_unpay,
+                         use_container_width=True):
+                cnt = unpay_entire_trip_nds(trip_id, user_login, role)
+                st.session_state.pop(key_confirm_unpay, None)
+                if cnt > 0:
+                    st.success("Оплата снята с " + s(cnt) + " авто, долг возвращён.")
+                else:
+                    st.info("Нечего снимать.")
+                st.rerun()
+            if c2.button("Отмена",
+                         key="cancel_" + key_confirm_unpay,
+                         use_container_width=True):
+                st.session_state.pop(key_confirm_unpay, None)
+                st.rerun()
+                # ============================================================
 # ПЕРЕНОС
 # ============================================================
 
@@ -1796,8 +1834,8 @@ def main_page():
                                trip_invoice_number=trip_inv_num,
                                trip_invoice_date=trip_inv_date)
 
-            # ----- КНОПКА «ОПЛАТИТЬ ВЕСЬ РЕЙС (БЕЗНАЛ С НДС)» -----
-            if has_nds and can("edit_ship", role) and view_mode in ("active",):
+            # Кнопка «Оплатить весь рейс» — в активных и завершённых
+            if has_nds and can("edit_ship", role) and view_mode in ("active", "completed"):
                 render_trip_payment_button(trip_id, cars, role, u["login"],
                                            trip_label=tractor + " " + driver)
 
@@ -2160,6 +2198,17 @@ def main_page():
                                     log_action(u["login"], role, "delete_ship",
                                                "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
                                     st.rerun()
+                        elif view_mode == "completed" and not is_trace:
+                            bc1, bc2, bc3, bc4 = st.columns(4)
+                            if bc1.button("📄 Акт", key="btn_act_inline_" + s(x["id"]),
+                                          use_container_width=True):
+                                st.session_state["show_act_for"] = x["id"]
+                                st.rerun()
+                            if bc2.button("📜 История",
+                                          key="btn_hist_" + s(x["id"]),
+                                          use_container_width=True):
+                                st.session_state["show_history_for"] = x["id"]
+                                st.rerun()
 
                         st.markdown("</div>", unsafe_allow_html=True)
 
