@@ -1,5 +1,5 @@
 # ============================================================
-# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.1
+# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.0
 # Streamlit + Google Sheets
 # ============================================================
 
@@ -271,10 +271,6 @@ def invalidate_cache(name=None):
         _id_to_row_index.clear()
     except Exception:
         pass
-    try:
-        _header_index_map.clear()
-    except Exception:
-        pass
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -290,46 +286,6 @@ def _id_to_row_index(name):
 
 def _find_row_index_by_id(name, row_id):
     return _id_to_row_index(name).get(s(row_id))
-
-
-def _col_num_to_letter(n):
-    """1 → A, 27 → AA."""
-    result = ""
-    while n > 0:
-        n, rem = divmod(n - 1, 26)
-        result = chr(65 + rem) + result
-    return result
-
-
-def _get_ws_headers(ws):
-    """Возвращает список заголовков первой строки (без пустых в конце)."""
-    try:
-        raw = ws.row_values(1)
-    except Exception:
-        return []
-    while raw and raw[-1] == "":
-        raw.pop()
-    return raw
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def _header_index_map(name):
-    """Имя поля → номер колонки (1-based)."""
-    ws = get_ws_cached(name)
-    headers = _get_ws_headers(ws)
-    result = {}
-    for i, h in enumerate(headers, start=1):
-        if h:
-            result[h] = i
-    return result
-
-
-def _col_letter(name, field):
-    """Буква колонки по имени поля на листе name. None, если поля нет."""
-    idx = _header_index_map(name).get(field)
-    if idx is None:
-        return None
-    return _col_num_to_letter(idx)
 
 
 def ensure_sheets_once():
@@ -435,13 +391,14 @@ def next_shipment_id():
 # ============================================================
 
 def calculate_financials(row):
+    """Единый расчёт. Долг = Сумма − Аванс.
+    paid_amount используется только как «память» для отката оплаты
+    и в расчёте долга не участвует."""
     amount = to_float(row.get("amount"))
     advance = to_float(row.get("advance"))
-    paid_amount = to_float(row.get("paid_amount"))
     payer_type = s(row.get("payer_type"))
 
-    total_paid = advance + paid_amount
-    debt = amount - total_paid
+    debt = amount - advance
     if debt < 0.01:
         debt = 0.0
 
@@ -460,8 +417,8 @@ def calculate_financials(row):
     return {
         "amount": amount,
         "advance": advance,
-        "paid_amount": paid_amount,
-        "total_paid": total_paid,
+        "paid_amount": to_float(row.get("paid_amount")),
+        "total_paid": advance,
         "debt": debt,
         "nds": nds,
         "amount_no_nds": amount_no_nds,
@@ -529,17 +486,14 @@ def update_trip(trip_id, tractor, driver, route, dep, ret):
     row_idx = _find_row_index_by_id("trips", trip_id)
     if row_idx is None:
         return False
-    payload = []
-    for fname, fval in [("tractor_number", s(tractor)),
-                        ("driver", s(driver)),
-                        ("route", s(route)),
-                        ("date_departure", s(dep)),
-                        ("date_return", s(ret))]:
-        letter = _col_letter("trips", fname)
-        if letter:
-            payload.append({"range": letter + str(row_idx), "values": [[fval]]})
-    if payload:
-        ws.batch_update(payload, value_input_option="USER_ENTERED")
+    payload = [
+        {"range": "B" + str(row_idx), "values": [[s(tractor)]]},
+        {"range": "C" + str(row_idx), "values": [[s(driver)]]},
+        {"range": "D" + str(row_idx), "values": [[s(route)]]},
+        {"range": "E" + str(row_idx), "values": [[s(dep)]]},
+        {"range": "F" + str(row_idx), "values": [[s(ret)]]},
+    ]
+    ws.batch_update(payload, value_input_option="USER_ENTERED")
     invalidate_cache("trips")
     return True
 
@@ -549,15 +503,11 @@ def update_trip_invoice(trip_id, invoice_number, invoice_date):
     row_idx = _find_row_index_by_id("trips", trip_id)
     if row_idx is None:
         return False
-    payload = []
-    letter_num = _col_letter("trips", "invoice_number")
-    letter_date = _col_letter("trips", "invoice_date")
-    if letter_num:
-        payload.append({"range": letter_num + str(row_idx), "values": [[s(invoice_number)]]})
-    if letter_date:
-        payload.append({"range": letter_date + str(row_idx), "values": [[s(invoice_date)]]})
-    if payload:
-        ws.batch_update(payload, value_input_option="USER_ENTERED")
+    payload = [
+        {"range": "L" + str(row_idx), "values": [[s(invoice_number)]]},
+        {"range": "M" + str(row_idx), "values": [[s(invoice_date)]]},
+    ]
+    ws.batch_update(payload, value_input_option="USER_ENTERED")
     invalidate_cache("trips")
     return True
 
@@ -567,10 +517,7 @@ def archive_trip(trip_id):
     row_idx = _find_row_index_by_id("trips", trip_id)
     if row_idx is None:
         return False
-    letter = _col_letter("trips", "archived")
-    if not letter:
-        return False
-    ws.update_cell(row_idx, _header_index_map("trips").get("archived"), "1")
+    ws.update_cell(row_idx, 9, "1")
     invalidate_cache("trips")
     return True
 
@@ -580,10 +527,7 @@ def unarchive_trip(trip_id):
     row_idx = _find_row_index_by_id("trips", trip_id)
     if row_idx is None:
         return False
-    col = _header_index_map("trips").get("archived")
-    if not col:
-        return False
-    ws.update_cell(row_idx, col, "0")
+    ws.update_cell(row_idx, 9, "0")
     invalidate_cache("trips")
     return True
 
@@ -593,15 +537,11 @@ def complete_trip(trip_id, completed_at):
     row_idx = _find_row_index_by_id("trips", trip_id)
     if row_idx is None:
         return False
-    payload = []
-    letter_comp = _col_letter("trips", "completed")
-    letter_at = _col_letter("trips", "completed_at")
-    if letter_comp:
-        payload.append({"range": letter_comp + str(row_idx), "values": [["1"]]})
-    if letter_at:
-        payload.append({"range": letter_at + str(row_idx), "values": [[s(completed_at)]]})
-    if payload:
-        ws.batch_update(payload, value_input_option="USER_ENTERED")
+    payload = [
+        {"range": "J" + str(row_idx), "values": [["1"]]},
+        {"range": "K" + str(row_idx), "values": [[s(completed_at)]]},
+    ]
+    ws.batch_update(payload, value_input_option="USER_ENTERED")
     invalidate_cache("trips")
     return True
 
@@ -611,15 +551,11 @@ def uncomplete_trip(trip_id):
     row_idx = _find_row_index_by_id("trips", trip_id)
     if row_idx is None:
         return False
-    payload = []
-    letter_comp = _col_letter("trips", "completed")
-    letter_at = _col_letter("trips", "completed_at")
-    if letter_comp:
-        payload.append({"range": letter_comp + str(row_idx), "values": [["0"]]})
-    if letter_at:
-        payload.append({"range": letter_at + str(row_idx), "values": [[""]]})
-    if payload:
-        ws.batch_update(payload, value_input_option="USER_ENTERED")
+    payload = [
+        {"range": "J" + str(row_idx), "values": [["0"]]},
+        {"range": "K" + str(row_idx), "values": [[""]]},
+    ]
+    ws.batch_update(payload, value_input_option="USER_ENTERED")
     invalidate_cache("trips")
     return True
 
@@ -629,10 +565,8 @@ def soft_delete_trip(trip_id):
     row_idx = _find_row_index_by_id("trips", trip_id)
     if row_idx is None:
         return False
-    col = _header_index_map("trips").get("deleted_at")
-    if not col:
-        return False
-    ws.update_cell(row_idx, col, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    ws.update_cell(row_idx, 14,
+                   datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     invalidate_cache("trips")
     return True
 
@@ -687,148 +621,112 @@ def update_shipment(shipment_id, position, car_model, client, amount,
     row_idx = _find_row_index_by_id("shipments", shipment_id)
     if row_idx is None:
         return False
-    fields = [
-        ("position", position),
-        ("car_model", s(car_model)),
-        ("client", s(client)),
-        ("amount", money_value(amount)),
-        ("date_pay", s(date_pay)),
-        ("paid_to", s(paid_to)),
-        ("delivery_city", s(delivery_city)),
-        ("vin", s(vin)),
-        ("advance", money_value(advance)),
-        ("advance_date", s(advance_date)),
-        ("payer_type", s(payer_type)),
-        ("customer", s(customer)),
-        ("contract_number", s(contract_number)),
-        ("nds_amount", money_value(nds_amount)),
-        ("amount_no_nds", money_value(amount_no_nds)),
+    payload = [
+        {"range": "C" + str(row_idx), "values": [[position]]},
+        {"range": "D" + str(row_idx), "values": [[s(car_model)]]},
+        {"range": "E" + str(row_idx), "values": [[s(client)]]},
+        {"range": "F" + str(row_idx), "values": [[money_value(amount)]]},
+        {"range": "G" + str(row_idx), "values": [[s(date_pay)]]},
+        {"range": "H" + str(row_idx), "values": [[s(paid_to)]]},
+        {"range": "I" + str(row_idx), "values": [[s(delivery_city)]]},
+        {"range": "J" + str(row_idx), "values": [[s(vin)]]},
+        {"range": "K" + str(row_idx), "values": [[money_value(advance)]]},
+        {"range": "L" + str(row_idx), "values": [[s(advance_date)]]},
+        {"range": "M" + str(row_idx), "values": [[s(payer_type)]]},
+        {"range": "N" + str(row_idx), "values": [[s(customer)]]},
+        {"range": "O" + str(row_idx), "values": [[s(contract_number)]]},
+        {"range": "P" + str(row_idx), "values": [[money_value(nds_amount)]]},
+        {"range": "Q" + str(row_idx), "values": [[money_value(amount_no_nds)]]},
     ]
-    payload = []
-    for fname, fval in fields:
-        letter = _col_letter("shipments", fname)
-        if letter:
-            payload.append({"range": letter + str(row_idx), "values": [[fval]]})
-    if payload:
-        ws.batch_update(payload, value_input_option="USER_ENTERED")
+    ws.batch_update(payload, value_input_option="USER_ENTERED")
     invalidate_cache("shipments")
     return True
 
 
 def toggle_issued(shipment_id, current_value, current_ever):
-    """Переключает статус «Выдан».
-    Работает независимо от порядка колонок."""
     ws = get_ws_cached("shipments")
     row_idx = _find_row_index_by_id("shipments", shipment_id)
     if row_idx is None:
         return current_value
-
-    col_issued = _col_letter("shipments", "issued")
-    col_issued_ever = _col_letter("shipments", "issued_ever")
-    col_paid = _col_letter("shipments", "paid")
-
-    if not col_issued:
-        _log_system_error("toggle_issued", "shipments",
-                          Exception("Колонка issued не найдена"))
-        return current_value
-
     was_issued = s(current_value) == "1"
-    payload = []
     if not was_issued:
-        payload.append({"range": col_issued + str(row_idx), "values": [["1"]]})
-        if col_issued_ever:
-            payload.append({"range": col_issued_ever + str(row_idx), "values": [["1"]]})
+        ws.update_cell(row_idx, 20, "1")
+        ws.update_cell(row_idx, 21, "1")
     else:
-        payload.append({"range": col_issued + str(row_idx), "values": [["0"]]})
-        if col_paid:
-            payload.append({"range": col_paid + str(row_idx), "values": [["0"]]})
-
-    if payload:
-        ws.batch_update(payload, value_input_option="USER_ENTERED")
+        ws.update_cell(row_idx, 20, "0")
+        ws.update_cell(row_idx, 22, "0")
     invalidate_cache("shipments")
     return "0" if was_issued else "1"
 
 
 def toggle_paid(shipment_id, current_paid, current_amount, current_advance):
     """Оплачен / снять оплату.
-    Работает независимо от порядка колонок — находит их по имени.
 
-    При нажатии «Оплачен»: paid_amount := amount − advance, paid := 1 → долг = 0.
-    При снятии: paid_amount := 0, paid := 0 → долг возвращается."""
+    При нажатии «Оплачен»:
+      paid_amount := amount − advance  (запоминаем, сколько нужно вернуть)
+      advance     := amount            (аванс = сумме → долг = 0)
+      paid        := 1
+
+    При снятии:
+      advance     := advance − paid_amount  (возвращаем прежний аванс)
+      paid_amount := 0
+      paid        := 0
+    """
     ws = get_ws_cached("shipments")
     row_idx = _find_row_index_by_id("shipments", shipment_id)
     if row_idx is None:
         return current_paid
-
-    col_paid = _col_letter("shipments", "paid")
-    col_paid_amount = _col_letter("shipments", "paid_amount")
-
-    # Если колонок нет — создаём их справа
-    if not col_paid or not col_paid_amount:
-        try:
-            headers = _get_ws_headers(ws)
-            if "paid" not in headers:
-                new_col = len(headers) + 1
-                ws.update_cell(1, new_col, "paid")
-                headers.append("paid")
-            if "paid_amount" not in headers:
-                new_col = len(headers) + 1
-                ws.update_cell(1, new_col, "paid_amount")
-                headers.append("paid_amount")
-            _header_index_map.clear()
-            col_paid = _col_letter("shipments", "paid")
-            col_paid_amount = _col_letter("shipments", "paid_amount")
-        except Exception as e:
-            _log_system_error("toggle_paid_create_cols", "shipments", e)
-            return current_paid
-
-    if not col_paid or not col_paid_amount:
-        _log_system_error("toggle_paid", "shipments",
-                          Exception("Не удалось найти/создать paid/paid_amount"))
-        return current_paid
-
     was_paid = s(current_paid) == "1"
     amount_val = money_value(current_amount)
     advance_val = money_value(current_advance)
 
     if not was_paid:
-        rest = amount_val - advance_val
-        if rest < 0:
-            rest = 0.0
+        # Сколько прибавляем к авансу, чтобы долг стал 0
+        add_to_advance = amount_val - advance_val
+        if add_to_advance < 0:
+            add_to_advance = 0.0
         payload = [
-            {"range": col_paid_amount + str(row_idx), "values": [[rest]]},
-            {"range": col_paid + str(row_idx), "values": [["1"]]},
+            {"range": "X" + str(row_idx), "values": [[add_to_advance]]},
+            {"range": "K" + str(row_idx), "values": [[amount_val]]},
+            {"range": "V" + str(row_idx), "values": [["1"]]},
         ]
+        ws.batch_update(payload, value_input_option="USER_ENTERED")
     else:
+        # Снимаем оплату: возвращаем прежний аванс
+        rows = read_all_cached("shipments")
+        prev_paid_amount = 0.0
+        for r in rows:
+            if s(r.get("id")) == s(shipment_id):
+                prev_paid_amount = to_float(r.get("paid_amount"))
+                break
+        restored_advance = advance_val - prev_paid_amount
+        if restored_advance < 0:
+            restored_advance = 0.0
         payload = [
-            {"range": col_paid_amount + str(row_idx), "values": [[0]]},
-            {"range": col_paid + str(row_idx), "values": [["0"]]},
+            {"range": "K" + str(row_idx), "values": [[restored_advance]]},
+            {"range": "X" + str(row_idx), "values": [[0]]},
+            {"range": "V" + str(row_idx), "values": [["0"]]},
         ]
-
-    ws.batch_update(payload, value_input_option="USER_ENTERED")
+        ws.batch_update(payload, value_input_option="USER_ENTERED")
     invalidate_cache("shipments")
     return "1" if not was_paid else "0"
 
 
 def close_debt(shipment_id, current_amount, current_advance):
-    """Принудительно обнуляет долг.
-    paid_amount := amount − advance, paid := 1. Одностороннее действие."""
+    """Принудительно закрывает долг: аванс := сумма, paid := 1."""
     ws = get_ws_cached("shipments")
     row_idx = _find_row_index_by_id("shipments", shipment_id)
     if row_idx is None:
         return False
-    col_paid = _col_letter("shipments", "paid")
-    col_paid_amount = _col_letter("shipments", "paid_amount")
-    if not col_paid or not col_paid_amount:
-        return False
     amount_val = money_value(current_amount)
     advance_val = money_value(current_advance)
-    rest = amount_val - advance_val
-    if rest < 0:
-        rest = 0.0
+    add_to_advance = amount_val - advance_val
+    if add_to_advance < 0:
+        add_to_advance = 0.0
     payload = [
-        {"range": col_paid_amount + str(row_idx), "values": [[rest]]},
-        {"range": col_paid + str(row_idx), "values": [["1"]]},
+        {"range": "X" + str(row_idx), "values": [[add_to_advance]]},
+        {"range": "K" + str(row_idx), "values": [[amount_val]]},
+        {"range": "V" + str(row_idx), "values": [["1"]]},
     ]
     ws.batch_update(payload, value_input_option="USER_ENTERED")
     invalidate_cache("shipments")
@@ -882,25 +780,14 @@ def transfer_shipment_to_trip(shipment_id, target_trip_id, new_position,
     source_trip_id = s(src.get("trip_id", ""))
     source_position = s(src.get("position", ""))
 
-    payload = []
-    l_trip = _col_letter("shipments", "trip_id")
-    l_pos = _col_letter("shipments", "position")
-    l_to = _col_letter("shipments", "transferred_to_trip")
-    l_at = _col_letter("shipments", "transferred_at")
-    l_from = _col_letter("shipments", "transferred_from_trip")
-    if l_trip:
-        payload.append({"range": l_trip + str(row_idx), "values": [[s(target_trip_id)]]})
-    if l_pos:
-        payload.append({"range": l_pos + str(row_idx), "values": [[new_position]]})
-    if l_to:
-        payload.append({"range": l_to + str(row_idx), "values": [[""]]})
-    if l_at:
-        payload.append({"range": l_at + str(row_idx), "values": [[datetime.now().strftime("%d.%m.%Y")]]})
-    if l_from:
-        payload.append({"range": l_from + str(row_idx), "values": [[source_trip_id]]})
-
-    if payload:
-        ws.batch_update(payload, value_input_option="USER_ENTERED")
+    payload = [
+        {"range": "B" + str(row_idx), "values": [[s(target_trip_id)]]},
+        {"range": "C" + str(row_idx), "values": [[new_position]]},
+        {"range": "AA" + str(row_idx), "values": [[""]]},
+        {"range": "AB" + str(row_idx), "values": [[datetime.now().strftime("%d.%m.%Y")]]},
+        {"range": "AC" + str(row_idx), "values": [[source_trip_id]]},
+    ]
+    ws.batch_update(payload, value_input_option="USER_ENTERED")
 
     log_transfer(shipment_id, source_trip_id, target_trip_id,
                  source_position, new_position, user_login,
@@ -1334,26 +1221,22 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
 
 def _update_user_lockout(login, attempts, locked_until):
     ws = get_ws_cached("users")
-    col_att = _header_index_map("users").get("failed_attempts")
-    col_lock = _header_index_map("users").get("locked_until")
-    if not col_att or not col_lock:
-        return
     for i, row in enumerate(ws.get_all_values()[1:], start=2):
         if row[0] == login:
-            ws.update_cell(i, col_att, str(attempts))
-            ws.update_cell(i, col_lock, locked_until)
+            payload = [
+                {"range": "F" + str(i), "values": [[str(attempts)]]},
+                {"range": "G" + str(i), "values": [[locked_until]]},
+            ]
+            ws.batch_update(payload, value_input_option="USER_ENTERED")
             break
     invalidate_cache("users")
 
 
 def _upgrade_password_hash(login, new_hash):
     ws = get_ws_cached("users")
-    col_pwd = _header_index_map("users").get("password_hash")
-    if not col_pwd:
-        return
     for i, row in enumerate(ws.get_all_values()[1:], start=2):
         if row[0] == login:
-            ws.update_cell(i, col_pwd, new_hash)
+            ws.update_cell(i, 2, new_hash)
             break
     invalidate_cache("users")
 
@@ -1436,7 +1319,6 @@ def admin_panel():
     with tab1:
         st.subheader("Пользователи")
         users = read_all("users", fresh=True)
-        col_active_idx = _header_index_map("users").get("active")
         for u in users:
             c1, c2, c3, c4, c5 = st.columns([2, 2, 2, 2, 2])
             c1.write(s(u.get("login")))
@@ -1446,18 +1328,17 @@ def admin_panel():
             c4.write("активен" if active else "отключён")
             if c5.button("Отключить" if active else "Включить",
                          key="toggle_user_" + s(u.get('login'))):
-                if col_active_idx:
-                    ws = get_ws_cached("users")
-                    all_rows = ws.get_all_values()
-                    for i, row in enumerate(all_rows[1:], start=2):
-                        if row[0] == u["login"]:
-                            new_val = "0" if active else "1"
-                            ws.update_cell(i, col_active_idx, new_val)
-                            invalidate_cache("users")
-                            log_action(st.session_state["user"]["login"],
-                                       st.session_state["user"]["role"],
-                                       "toggle_user", s(u['login']) + " -> " + new_val)
-                            st.rerun()
+                ws = get_ws_cached("users")
+                all_rows = ws.get_all_values()
+                for i, row in enumerate(all_rows[1:], start=2):
+                    if row[0] == u["login"]:
+                        new_val = "0" if active else "1"
+                        ws.update_cell(i, 5, new_val)
+                        invalidate_cache("users")
+                        log_action(st.session_state["user"]["login"],
+                                   st.session_state["user"]["role"],
+                                   "toggle_user", s(u['login']) + " -> " + new_val)
+                        st.rerun()
         st.markdown("---")
         st.subheader("Добавить пользователя")
         with st.form("add_user"):
