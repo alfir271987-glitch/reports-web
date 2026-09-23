@@ -659,6 +659,10 @@ def toggle_issued(shipment_id, current_value, current_ever):
 
 
 def toggle_paid(shipment_id, current_paid, current_amount, current_advance):
+    """Оплачен / снять оплату.
+
+    При нажатии «Оплачен»: paid_amount := amount - advance (долг обнуляется),
+    paid := 1. При снятии: paid_amount := 0, paid := 0 (долг возвращается)."""
     ws = get_ws_cached("shipments")
     row_idx = _find_row_index_by_id("shipments", shipment_id)
     if row_idx is None:
@@ -668,15 +672,17 @@ def toggle_paid(shipment_id, current_paid, current_amount, current_advance):
     advance_val = money_value(current_advance)
 
     if not was_paid:
+        # Оплачено: долг обнуляется → paid_amount = amount - advance
         rest = amount_val - advance_val
         if rest < 0:
             rest = 0.0
         payload = [
-            {"range": "X" + str(row_idx), "values": [[rest]]},
-            {"range": "V" + str(row_idx), "values": [["1"]]},
+            {"range": "X" + str(row_idx), "values": [[rest]]},   # paid_amount
+            {"range": "V" + str(row_idx), "values": [["1"]]},    # paid
         ]
         ws.batch_update(payload, value_input_option="USER_ENTERED")
     else:
+        # Снять оплату: возвращаем долг
         payload = [
             {"range": "X" + str(row_idx), "values": [[0]]},
             {"range": "V" + str(row_idx), "values": [["0"]]},
@@ -684,6 +690,27 @@ def toggle_paid(shipment_id, current_paid, current_amount, current_advance):
         ws.batch_update(payload, value_input_option="USER_ENTERED")
     invalidate_cache("shipments")
     return "1" if not was_paid else "0"
+
+
+def close_debt(shipment_id, current_amount, current_advance):
+    """Принудительно закрывает долг.
+    paid_amount := amount - advance, paid := 1. Одностороннее действие."""
+    ws = get_ws_cached("shipments")
+    row_idx = _find_row_index_by_id("shipments", shipment_id)
+    if row_idx is None:
+        return False
+    amount_val = money_value(current_amount)
+    advance_val = money_value(current_advance)
+    rest = amount_val - advance_val
+    if rest < 0:
+        rest = 0.0
+    payload = [
+        {"range": "X" + str(row_idx), "values": [[rest]]},
+        {"range": "V" + str(row_idx), "values": [["1"]]},
+    ]
+    ws.batch_update(payload, value_input_option="USER_ENTERED")
+    invalidate_cache("shipments")
+    return True
 
 
 def delete_shipment(shipment_id):
@@ -876,8 +903,6 @@ def show_act(trip, shipment):
 # ============================================================
 
 def render_print_list_doc(rows, title="Список перевозимых автомобилей"):
-    """Печатная форма .doc: шапка рейса сверху, таблица авто снизу."""
-    # Группируем по рейсам
     groups = []
     cur_key = None
     cur_group = None
