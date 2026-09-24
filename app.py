@@ -1,5 +1,5 @@
 # ============================================================
-# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.3
+# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.4
 # Streamlit + Google Sheets
 # ============================================================
 
@@ -54,7 +54,7 @@ PAYER_TYPES = ["нал", "эквайринг", "безнал с НДС 22%"]
 NDS_RATE = 0.22
 NDS_PAYER = "безнал с НДС 22%"
 MAX_CARS = 8
-CACHE_TTL = 60
+CACHE_TTL = 90
 LOGIN_MAX_ATTEMPTS = 5
 LOGIN_LOCK_MINUTES = 15
 
@@ -1055,7 +1055,7 @@ def show_act(trip, shipment):
 
 
 # ============================================================
-# СПИСОК ДЛЯ ВОДИТЕЛЯ (.doc)
+# СПИСОК ДЛЯ ВОДИТЕЛЯ (.doc) — с VIN
 # ============================================================
 
 def render_print_list_doc(rows, title="Список перевозимых автомобилей"):
@@ -1089,7 +1089,7 @@ def render_print_list_doc(rows, title="Список перевозимых ав�
     p.append('<meta charset="utf-8">')
     p.append("<title>" + title + "</title>")
     p.append("<style>")
-    p.append("@page { size: A4; margin: 1.5cm; }")
+    p.append("@page { size: A4 landscape; margin: 1cm; }")
     p.append('body { font-family: "Times New Roman", Times, serif; '
              'font-size: 12pt; line-height: 1.4; }')
     p.append("h1 { text-align: center; font-size: 16pt; "
@@ -1101,7 +1101,9 @@ def render_print_list_doc(rows, title="Список перевозимых ав�
     p.append("th { background: #e8e8e8; font-weight: bold; text-align: left; }")
     p.append(".num { width: 30px; text-align: center; }")
     p.append(".pos { width: 40px; text-align: center; }")
-    p.append(".debt { width: 100px; text-align: right; font-weight: bold; }")
+    p.append(".vin { width: 170px; font-family: 'Courier New', monospace; "
+             "font-size: 10pt; }")
+    p.append(".debt { width: 110px; text-align: right; font-weight: bold; }")
     p.append(".city { width: 130px; }")
     p.append(".fio { width: 160px; }")
     p.append(".header-trip { background: #f0f0f0; padding: 6px 8px; "
@@ -1125,6 +1127,7 @@ def render_print_list_doc(rows, title="Список перевозимых ав�
         p.append('<th class="num">№</th>')
         p.append('<th class="pos">Поз.</th>')
         p.append("<th>Марка / модель</th>")
+        p.append('<th class="vin">VIN</th>')
         p.append('<th class="fio">ФИО</th>')
         p.append('<th class="city">Город доставки</th>')
         p.append('<th class="debt">Задолж., ₽</th>')
@@ -1139,13 +1142,15 @@ def render_print_list_doc(rows, title="Список перевозимых ав�
             p.append('<td class="num">' + s(i) + "</td>")
             p.append('<td class="pos">' + s(r.get("position", "")) + "</td>")
             p.append("<td>" + s(r.get("car_model", "")) + "</td>")
+            p.append('<td class="vin">' + (s(r.get("vin", ""))[:17] or "—")
+                     + "</td>")
             p.append('<td class="fio">' + fio + "</td>")
             p.append('<td class="city">' + s(r.get("delivery_city", "")) + "</td>")
             p.append('<td class="debt">' + fmt_money(debt) + "</td>")
             p.append("</tr>")
 
         p.append("<tr>")
-        p.append('<td colspan="5" style="text-align: right; font-weight: bold;">'
+        p.append('<td colspan="6" style="text-align: right; font-weight: bold;">'
                  "Итого по рейсу:</td>")
         p.append('<td class="debt">' + fmt_money(total_debt) + "</td>")
         p.append("</tr>")
@@ -1603,7 +1608,6 @@ def main_page():
 
     st.title("Учёт рейсов и перевозок")
 
-    # ========== ПЕЧАТЬ: ОБЩИЙ СПИСОК ==========
     if st.session_state.get("show_print_all"):
         if st.button("Назад к списку", key="btn_back_from_print"):
             st.session_state.pop("show_print_all", None)
@@ -1634,6 +1638,7 @@ def main_page():
                     "dep": date_to_display_safe(t.get("date_departure", "")),
                     "position": s(x.get("position", "")),
                     "car_model": s(x.get("car_model", "")),
+                    "vin": s(x.get("vin", "")),
                     "client": s(x.get("client", "")),
                     "customer": s(x.get("customer", "")),
                     "delivery_city": s(x.get("delivery_city", "")),
@@ -1645,7 +1650,6 @@ def main_page():
             show_print_list(print_rows)
         return
 
-    # ========== АКТ ==========
     if st.session_state.get("show_act_for"):
         sid = st.session_state["show_act_for"]
         shipments = get_shipments(fresh=True)
@@ -1662,7 +1666,6 @@ def main_page():
                 return
         st.session_state.pop("show_act_for", None)
 
-    # ========== ИСТОРИЯ ==========
     if st.session_state.get("show_history_for"):
         sid = st.session_state["show_history_for"]
         shipments = get_shipments(fresh=True)
@@ -1689,7 +1692,6 @@ def main_page():
                 )
         return
 
-    # ========== ПЕЧАТЬ: ОДИН РЕЙС ==========
     if st.session_state.get("show_print_trip"):
         rows = st.session_state["show_print_trip"]
         if st.button("Назад к списку", key="btn_back_from_print_trip"):
@@ -1956,6 +1958,7 @@ def main_page():
                                 "dep": dep,
                                 "position": s(x.get("position", "")),
                                 "car_model": s(x.get("car_model", "")),
+                                "vin": s(x.get("vin", "")),
                                 "client": s(x.get("client", "")),
                                 "customer": s(x.get("customer", "")),
                                 "delivery_city": s(x.get("delivery_city", "")),
