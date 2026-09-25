@@ -1,5 +1,5 @@
 # ============================================================
-# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.9.5
+# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.9.7
 # Streamlit + Google Sheets
 # ЧАСТЬ 1/2
 # ============================================================
@@ -419,6 +419,7 @@ def calculate_financials(row):
 
 
 def is_car_active_on_avtovoz(x):
+    """Авто «в пути»: не выдано и не помечено как перенесённое."""
     if check_issued(s(x.get("issued", "0"))):
         return False
     if s(x.get("transferred_to_trip", "")):
@@ -444,8 +445,7 @@ def is_transferred_car(x):
     Авто считается перенесённым в текущий рейс, если:
     - это не trace-строка, И
     - у него заполнено либо AC (transferred_from_trip = id исходного рейса),
-      либо AA (transferred_to_trip = id текущего рейса) — fallback для записей,
-      сделанных старой версией кода.
+      либо AA (transferred_to_trip = id текущего рейса) — fallback.
     """
     if is_trace_row(x):
         return False
@@ -462,6 +462,18 @@ def count_outgoing_transfers(cars):
 def count_incoming_transfers(cars):
     """Сколько авто ПРИНЯТО в этот рейс (по AC, fallback по AA)."""
     return sum(1 for x in cars if is_transferred_car(x))
+
+
+def count_incoming_on_route(cars):
+    """
+    Сколько перенесённых авто РЕАЛЬНО ЕЩЁ В ПУТИ (не выданы).
+    Используется для подсчёта общего числа авто в рейсе.
+    """
+    return sum(
+        1 for x in cars
+        if is_transferred_car(x)
+        and not check_issued(s(x.get("issued", "0")))
+    )
 
 
 def sum_incoming_transfers(cars):
@@ -567,7 +579,6 @@ def resolve_source_trip_label_for_car(x, all_trips, transfer_history):
     ac = s(x.get("transferred_from_trip", "")).strip()
     if ac:
         return resolve_target_trip_label(ac, all_trips, transfer_history)
-    # Fallback: ищем в истории переносов этого авто
     sid = s(x.get("id"))
     for h in transfer_history:
         if s(h.get("shipment_id")) == sid and s(h.get("cancelled", "")) != "1":
@@ -1314,10 +1325,15 @@ def show_act(trip, shipment):
 
 
 # ============================================================
-# ПЕЧАТЬ СПИСКА
+# ПЕЧАТЬ СПИСКА — v2.9.7 (один рейс = один альбомный лист)
 # ============================================================
 
 def render_print_list_doc(rows, title="Список перевозимых автомобилей"):
+    """
+    Формирует HTML для печати. Каждый рейс — на отдельном
+    альбомном листе A4. Всё сжато так, чтобы 8 машин + итог
+    гарантированно помещались на один лист.
+    """
     groups = []
     cur_key = None
     cur_group = None
@@ -1348,51 +1364,92 @@ def render_print_list_doc(rows, title="Список перевозимых ав�
     p.append('<meta charset="utf-8">')
     p.append("<title>" + title + "</title>")
     p.append("<style>")
-    p.append("@page { size: A4 landscape; margin: 1cm; }")
+    # --- Параметры листа: A4 Landscape, узкие поля ---
+    p.append("@page { size: A4 landscape; margin: 0.7cm 0.8cm 0.7cm 0.8cm; }")
+    p.append("html, body { margin: 0; padding: 0; }")
     p.append('body { font-family: "Times New Roman", Times, serif; '
-             'font-size: 12pt; line-height: 1.4; }')
-    p.append("h1 { text-align: center; font-size: 16pt; "
-             "text-transform: uppercase; margin-bottom: 18px; }")
+             'font-size: 9pt; line-height: 1.15; color: #000; }')
+    p.append("h1 { text-align: center; font-size: 12pt; "
+             "text-transform: uppercase; margin: 0 0 6px 0; "
+             "font-weight: bold; }")
+
+    # --- Один рейс = один лист ---
+    p.append(".trip-block { page-break-after: always; }")
+    p.append(".trip-block:last-child { page-break-after: auto; }")
+
+    # --- Компактная шапка рейса ---
+    p.append(".header-trip { "
+             "background: #f0f0f0; border: 1px solid #333; "
+             "padding: 3px 6px; margin-bottom: 3px; "
+             "font-size: 9.5pt; line-height: 1.2; }")
+    p.append(".header-trip b { font-weight: bold; }")
+
+    # --- Таблица ---
     p.append("table { width: 100%; border-collapse: collapse; "
-             "margin-bottom: 14px; }")
-    p.append("th, td { border: 1px solid #333; padding: 4px 6px; "
-             "vertical-align: top; font-size: 11pt; }")
-    p.append("th { background: #e8e8e8; font-weight: bold; text-align: left; }")
-    p.append(".num { width: 30px; text-align: center; }")
-    p.append(".pos { width: 40px; text-align: center; }")
-    p.append(".vin { width: 170px; font-family: 'Courier New', monospace; "
-             "font-size: 10pt; }")
-    p.append(".debt { width: 110px; text-align: right; font-weight: bold; }")
-    p.append(".city { width: 130px; }")
-    p.append(".fio { width: 150px; }")
-    p.append(".note { width: 170px; font-size: 10pt; color: #444; }")
-    p.append("tr.trace td { background: #f0f0f0; font-style: italic; }")
-    p.append(".header-trip { background: #f0f0f0; padding: 6px 8px; "
-             "border: 1px solid #333; margin-bottom: 6px; }")
+             "table-layout: fixed; }")
+    p.append("th, td { border: 1px solid #333; "
+             "padding: 2px 4px; vertical-align: top; "
+             "font-size: 9pt; line-height: 1.15; "
+             "overflow: hidden; }")
+    p.append("th { background: #e0e0e0; font-weight: bold; "
+             "text-align: left; padding: 2px 4px; }")
+
+    # --- Ширины колонок ---
+    p.append("col.c-num    { width: 3%; }")
+    p.append("col.c-pos    { width: 4%; }")
+    p.append("col.c-model  { width: 18%; }")
+    p.append("col.c-vin    { width: 15%; }")
+    p.append("col.c-fio    { width: 14%; }")
+    p.append("col.c-city   { width: 12%; }")
+    p.append("col.c-debt   { width: 11%; }")
+    p.append("col.c-note   { width: 23%; }")
+
+    p.append(".num, .pos { text-align: center; }")
+    p.append(".debt { text-align: right; font-weight: bold; "
+             "white-space: nowrap; }")
+    p.append(".vin { font-family: 'Courier New', monospace; "
+             "font-size: 8pt; word-break: break-all; }")
+    p.append(".note { font-size: 8pt; color: #222; }")
+    p.append("tr.trace td { background: #f5f5f5; font-style: italic; }")
+    p.append("tr.total td { background: #f0f0f0; font-weight: bold; "
+             "border-top: 1.5px solid #333; }")
     p.append("</style></head><body>")
     p.append("<h1>" + title + "</h1>")
 
     for g in groups:
+        p.append('<div class="trip-block">')
+
+        # ---- Шапка рейса (одна строка) ----
         p.append('<div class="header-trip">')
-        p.append('<p style="margin: 2px 0;"><b>Дата выезда:</b> '
-                 + s(g["dep"]) + "</p>")
-        p.append('<p style="margin: 2px 0;"><b>Тягач:</b> '
-                 + s(g["tractor"]) + " &nbsp;&nbsp; "
-                 '<b>Водитель:</b> ' + s(g["driver"]) + "</p>")
-        p.append('<p style="margin: 2px 0;"><b>Маршрут:</b> '
-                 + s(g["route"]) + "</p>")
+        p.append('<b>Дата выезда:</b> ' + s(g["dep"]))
+        p.append(' &nbsp;·&nbsp; <b>Тягач:</b> ' + s(g["tractor"]))
+        p.append(' &nbsp;·&nbsp; <b>Водитель:</b> ' + s(g["driver"]))
+        if s(g["route"]):
+            p.append(' &nbsp;·&nbsp; <b>Маршрут:</b> ' + s(g["route"]))
         p.append("</div>")
 
+        # ---- Таблица ----
         p.append("<table>")
+        p.append("<colgroup>")
+        p.append('<col class="c-num">')
+        p.append('<col class="c-pos">')
+        p.append('<col class="c-model">')
+        p.append('<col class="c-vin">')
+        p.append('<col class="c-fio">')
+        p.append('<col class="c-city">')
+        p.append('<col class="c-debt">')
+        p.append('<col class="c-note">')
+        p.append("</colgroup>")
+
         p.append("<thead><tr>")
         p.append('<th class="num">№</th>')
-        p.append('<th class="pos">Поз.</th>')
+        p.append('<th class="pos">Поз</th>')
         p.append("<th>Марка / модель</th>")
         p.append('<th class="vin">VIN</th>')
-        p.append('<th class="fio">ФИО</th>')
-        p.append('<th class="city">Город доставки</th>')
+        p.append("<th>ФИО</th>")
+        p.append("<th>Город доставки</th>")
         p.append('<th class="debt">Задолж., ₽</th>')
-        p.append('<th class="note">Примечание</th>')
+        p.append("<th>Примечание</th>")
         p.append("</tr></thead><tbody>")
 
         total_debt = 0.0
@@ -1408,24 +1465,21 @@ def render_print_list_doc(rows, title="Список перевозимых ав�
             p.append("<td>" + s(r.get("car_model", "")) + "</td>")
             p.append('<td class="vin">' + (s(r.get("vin", ""))[:17] or "—")
                      + "</td>")
-            p.append('<td class="fio">' + fio + "</td>")
-            p.append('<td class="city">' + s(r.get("delivery_city", "")) + "</td>")
+            p.append("<td>" + fio + "</td>")
+            p.append("<td>" + s(r.get("delivery_city", "")) + "</td>")
             p.append('<td class="debt">' + fmt_money(debt) + "</td>")
             p.append('<td class="note">' + note + "</td>")
             p.append("</tr>")
 
-        p.append("<tr>")
-        p.append('<td colspan="6" style="text-align: right; font-weight: bold;">'
-                 "Итого по рейсу:</td>")
+        # Итог по рейсу
+        p.append('<tr class="total">')
+        p.append('<td colspan="6" style="text-align:right;">Итого по рейсу:</td>')
         p.append('<td class="debt">' + fmt_money(total_debt) + "</td>")
         p.append("<td></td>")
         p.append("</tr>")
-        p.append("</tbody></table>")
 
-    grand_total = sum(to_float(r.get("debt")) for r in rows)
-    p.append('<p style="text-align: right; font-size: 13pt; '
-             'font-weight: bold; margin-top: 16px;">'
-             "Общая задолженность: " + fmt_money(grand_total) + " ₽</p>")
+        p.append("</tbody></table>")
+        p.append("</div>")  # /trip-block
 
     p.append("</body></html>")
     return "".join(p)
@@ -1433,7 +1487,8 @@ def render_print_list_doc(rows, title="Список перевозимых ав�
 
 def show_print_list(rows):
     st.info("Скачайте файл — он откроется в Word или LibreOffice. "
-            "Для PDF: откройте файл и выберите «Сохранить как PDF».")
+            "Для PDF: откройте файл и выберите «Сохранить как PDF». "
+            "Каждый рейс печатается на отдельном альбомном листе A4.")
     doc_html = render_print_list_doc(rows)
     st.download_button(
         "📥 Скачать список (.doc)",
@@ -1442,7 +1497,7 @@ def show_print_list(rows):
         mime="application/msword",
         key="dl_print_doc_" + str(len(rows)),
     )
-    st.components.v1.html(doc_html, height=900, scrolling=True)
+    st.components.v1.html(doc_html, height=1000, scrolling=True)
 
 
 # ============================================================
@@ -1544,7 +1599,7 @@ def render_shipment_form(form_key, c=None, submit_label="Сохранить ав
 
 
 # ============================================================
-# ШАПКА РЕЙСА
+# ШАПКА РЕЙСА (v2.9.7)
 # ============================================================
 
 def render_trip_header(trip_id, tractor, driver, route, dep, ret,
@@ -1557,11 +1612,9 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
                        incoming_count=0, incoming_from_labels=None,
                        incoming_total_amount=0.0,
                        incoming_total_advance=0.0,
-                       incoming_total_debt=0.0):
-    # Цвет шапки:
-    #   красный — ТОЛЬКО если есть задолженность;
-    #   зелёный — если задолженности нет;
-    #   серый — если рейс полностью пустой.
+                       incoming_total_debt=0.0,
+                       total_in_route=None):
+    # Цвет шапки: красный — только при задолженности.
     if active_count == 0 and issued_count == 0 and not has_transfers and incoming_count == 0:
         bg, bd = "#fafafa", "#dddddd"
     elif total_debt > 0.01:
@@ -1573,7 +1626,10 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
     if ret:
         title += " — возврат " + s(ret)
 
-    stats = "авто: " + s(active_count) + "/" + s(MAX_CARS)
+    if total_in_route is None:
+        total_in_route = active_count + incoming_count
+
+    stats = "авто: " + s(total_in_route) + "/" + s(MAX_CARS)
     if issued_count > 0:
         stats += "  |  выдано: " + s(issued_count)
     if transfers_count > 0:
@@ -2273,8 +2329,12 @@ def main_page():
             issued_count = count_issued_cars(cars)
             outgoing_count = count_outgoing_transfers(cars)
             incoming_count = count_incoming_transfers(cars)
+            incoming_on_route = count_incoming_on_route(cars)
             incoming_amount, incoming_advance, incoming_debt = sum_incoming_transfers(cars)
             free_pos = next_free_position(cars)
+
+            # Общее число авто «в пути» = обычные активные + перенесённые невыданные
+            total_in_route = active_count + incoming_on_route
 
             has_transfers = outgoing_count > 0
 
@@ -2305,7 +2365,8 @@ def main_page():
                                incoming_from_labels=incoming_from_labels,
                                incoming_total_amount=incoming_amount,
                                incoming_total_advance=incoming_advance,
-                               incoming_total_debt=incoming_debt)
+                               incoming_total_debt=incoming_debt,
+                               total_in_route=total_in_route)
 
             if has_nds and can("edit_ship", role) and view_mode in ("active", "completed"):
                 render_trip_payment_button(trip_id, cars, role, u["login"],
@@ -2553,7 +2614,7 @@ def main_page():
                         st.session_state.pop("open_addcar_" + s(trip_id), None)
                         st.rerun()
                     if f["save"]:
-                        if active_count >= MAX_CARS:
+                        if total_in_route >= MAX_CARS:
                             st.error("На автовозе " + s(MAX_CARS)
                                      + " активных авто. Освободите место, сняв статус «Выдан».")
                         elif not f["client"] and not f["customer"]:
@@ -2619,8 +2680,6 @@ def main_page():
                                 tr_to, trips, transfer_history)
 
                         # ---------- Логика цвета и статуса ----------
-                        # 🟢 зелёный, если долга нет (независимо от paid/issued)
-                        # 🔴 красный, если долг > 0
                         advance_covers = (amount_val > 0.01
                                           and advance_val >= amount_val - 0.01)
 
@@ -3100,7 +3159,7 @@ def main_page():
                     sum_cols[0].markdown("**Сумма:** " + fmt_money(total))
                     sum_cols[1].markdown("**Аванс:** " + fmt_money(total_advance))
                     sum_cols[2].markdown("**Задолженность:** " + fmt_money(total_debt))
-                    sum_cols[3].markdown("**Авто:** " + s(active_count) + "/" + s(MAX_CARS))
+                    sum_cols[3].markdown("**Авто:** " + s(total_in_route) + "/" + s(MAX_CARS))
                     if total_nds > 0:
                         st.markdown("**НДС 22%:** " + fmt_money(total_nds))
 
@@ -3164,7 +3223,7 @@ def main_page():
                                         st.success("Изменения сохранены")
                                         st.rerun()
 
-                    if view_mode == "active" and can("create_ship", role) and active_count < MAX_CARS:
+                    if view_mode == "active" and can("create_ship", role) and total_in_route < MAX_CARS:
                         free_pos_btn = next_free_position(cars) or 1
                         if st.button("Добавить еще авто (позиция " + s(free_pos_btn) + ")",
                                      key="btn_more_addcar_" + s(trip_id),
@@ -3192,7 +3251,7 @@ def main_page():
     grand_debt = 0.0
     grand_nds = 0.0
     for x in all_active_cars:
-        if not is_car_active_on_avtovoz(x):
+        if check_issued(s(x.get("issued", "0"))):
             continue
         f = calculate_financials(x)
         grand_total += f["amount"]
