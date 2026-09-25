@@ -1,5 +1,5 @@
 # ============================================================
-# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.9.7
+# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.9.8
 # Streamlit + Google Sheets
 # ЧАСТЬ 1/2
 # ============================================================
@@ -1325,15 +1325,10 @@ def show_act(trip, shipment):
 
 
 # ============================================================
-# ПЕЧАТЬ СПИСКА — v2.9.7 (один рейс = один альбомный лист)
+# ПЕЧАТЬ СПИСКА — один рейс = один альбомный лист A4
 # ============================================================
 
 def render_print_list_doc(rows, title="Список перевозимых автомобилей"):
-    """
-    Формирует HTML для печати. Каждый рейс — на отдельном
-    альбомном листе A4. Всё сжато так, чтобы 8 машин + итог
-    гарантированно помещались на один лист.
-    """
     groups = []
     cur_key = None
     cur_group = None
@@ -1364,7 +1359,6 @@ def render_print_list_doc(rows, title="Список перевозимых ав�
     p.append('<meta charset="utf-8">')
     p.append("<title>" + title + "</title>")
     p.append("<style>")
-    # --- Параметры листа: A4 Landscape, узкие поля ---
     p.append("@page { size: A4 landscape; margin: 0.7cm 0.8cm 0.7cm 0.8cm; }")
     p.append("html, body { margin: 0; padding: 0; }")
     p.append('body { font-family: "Times New Roman", Times, serif; '
@@ -1373,18 +1367,15 @@ def render_print_list_doc(rows, title="Список перевозимых ав�
              "text-transform: uppercase; margin: 0 0 6px 0; "
              "font-weight: bold; }")
 
-    # --- Один рейс = один лист ---
     p.append(".trip-block { page-break-after: always; }")
     p.append(".trip-block:last-child { page-break-after: auto; }")
 
-    # --- Компактная шапка рейса ---
     p.append(".header-trip { "
              "background: #f0f0f0; border: 1px solid #333; "
              "padding: 3px 6px; margin-bottom: 3px; "
              "font-size: 9.5pt; line-height: 1.2; }")
     p.append(".header-trip b { font-weight: bold; }")
 
-    # --- Таблица ---
     p.append("table { width: 100%; border-collapse: collapse; "
              "table-layout: fixed; }")
     p.append("th, td { border: 1px solid #333; "
@@ -1394,7 +1385,6 @@ def render_print_list_doc(rows, title="Список перевозимых ав�
     p.append("th { background: #e0e0e0; font-weight: bold; "
              "text-align: left; padding: 2px 4px; }")
 
-    # --- Ширины колонок ---
     p.append("col.c-num    { width: 3%; }")
     p.append("col.c-pos    { width: 4%; }")
     p.append("col.c-model  { width: 18%; }")
@@ -1419,7 +1409,6 @@ def render_print_list_doc(rows, title="Список перевозимых ав�
     for g in groups:
         p.append('<div class="trip-block">')
 
-        # ---- Шапка рейса (одна строка) ----
         p.append('<div class="header-trip">')
         p.append('<b>Дата выезда:</b> ' + s(g["dep"]))
         p.append(' &nbsp;·&nbsp; <b>Тягач:</b> ' + s(g["tractor"]))
@@ -1428,7 +1417,6 @@ def render_print_list_doc(rows, title="Список перевозимых ав�
             p.append(' &nbsp;·&nbsp; <b>Маршрут:</b> ' + s(g["route"]))
         p.append("</div>")
 
-        # ---- Таблица ----
         p.append("<table>")
         p.append("<colgroup>")
         p.append('<col class="c-num">')
@@ -1471,7 +1459,6 @@ def render_print_list_doc(rows, title="Список перевозимых ав�
             p.append('<td class="note">' + note + "</td>")
             p.append("</tr>")
 
-        # Итог по рейсу
         p.append('<tr class="total">')
         p.append('<td colspan="6" style="text-align:right;">Итого по рейсу:</td>')
         p.append('<td class="debt">' + fmt_money(total_debt) + "</td>")
@@ -1479,7 +1466,7 @@ def render_print_list_doc(rows, title="Список перевозимых ав�
         p.append("</tr>")
 
         p.append("</tbody></table>")
-        p.append("</div>")  # /trip-block
+        p.append("</div>")
 
     p.append("</body></html>")
     return "".join(p)
@@ -1599,7 +1586,7 @@ def render_shipment_form(form_key, c=None, submit_label="Сохранить ав
 
 
 # ============================================================
-# ШАПКА РЕЙСА (v2.9.7)
+# ШАПКА РЕЙСА
 # ============================================================
 
 def render_trip_header(trip_id, tractor, driver, route, dep, ret,
@@ -1614,7 +1601,6 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
                        incoming_total_advance=0.0,
                        incoming_total_debt=0.0,
                        total_in_route=None):
-    # Цвет шапки: красный — только при задолженности.
     if active_count == 0 and issued_count == 0 and not has_transfers and incoming_count == 0:
         bg, bd = "#fafafa", "#dddddd"
     elif total_debt > 0.01:
@@ -1829,7 +1815,7 @@ def render_trip_payment_button(trip_id, cars, role, user_login, trip_label=""):
 
 
 # ============================================================
-# АВТОРИЗАЦИЯ
+# УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ (админ)
 # ============================================================
 
 def _update_user_lockout(login, attempts, locked_until):
@@ -1853,6 +1839,46 @@ def _upgrade_password_hash(login, new_hash):
             break
     invalidate_cache("users")
 
+
+def admin_set_password(login, new_password):
+    """Устанавливает новый пароль пользователю (bcrypt) и снимает блокировку."""
+    if not login or not new_password:
+        return False, "Логин и пароль обязательны"
+    if len(new_password) < 8:
+        return False, "Пароль минимум 8 символов"
+    ws = get_ws_cached("users")
+    all_rows = ws.get_all_values()
+    row_idx = None
+    for i, row in enumerate(all_rows[1:], start=2):
+        if s(row[0]).strip() == s(login).strip():
+            row_idx = i
+            break
+    if row_idx is None:
+        return False, "Пользователь не найден"
+    new_hash = hash_password(new_password)
+    ws.update_cell(row_idx, 2, new_hash)   # password_hash
+    ws.update_cell(row_idx, 6, "0")        # failed_attempts
+    ws.update_cell(row_idx, 7, "")         # locked_until
+    invalidate_cache("users")
+    return True, ""
+
+
+def admin_unlock_user(login):
+    """Сбрасывает блокировку и счётчик неудачных попыток."""
+    ws = get_ws_cached("users")
+    all_rows = ws.get_all_values()
+    for i, row in enumerate(all_rows[1:], start=2):
+        if s(row[0]).strip() == s(login).strip():
+            ws.update_cell(i, 6, "0")
+            ws.update_cell(i, 7, "")
+            invalidate_cache("users")
+            return True
+    return False
+
+
+# ============================================================
+# АВТОРИЗАЦИЯ
+# ============================================================
 
 def login_page():
     st.title("Учёт рейсов — вход")
@@ -1976,35 +2002,101 @@ def can(action, role):
 
 
 # ============================================================
-# АДМИН-ПАНЕЛЬ
+# АДМИН-ПАНЕЛЬ (v2.9.8 — со сменой пароля)
 # ============================================================
 
 def admin_panel():
     st.header("Админ-панель")
     tab1, tab2, tab3 = st.tabs(["Пользователи", "Журнал действий", "Журнал печати актов"])
+
     with tab1:
         st.subheader("Пользователи")
         users = read_all("users", fresh=True)
+        admin_login = st.session_state["user"]["login"]
+        admin_role = st.session_state["user"]["role"]
+
         for u in users:
-            c1, c2, c3, c4, c5 = st.columns([2, 2, 2, 2, 2])
-            c1.write(s(u.get("login")))
-            c2.write(s(u.get("role")))
-            c3.write(s(u.get("full_name")))
-            active = is_active(u)
-            c4.write("активен" if active else "отключён")
-            if c5.button("Отключить" if active else "Включить",
-                         key="toggle_user_" + s(u.get('login'))):
+            login_u = s(u.get("login"))
+            role_u = s(u.get("role"))
+            name_u = s(u.get("full_name"))
+            active_u = is_active(u)
+            attempts = int(to_float(u.get("failed_attempts")) or 0)
+            locked_until = s(u.get("locked_until", "")).strip()
+            is_locked = bool(locked_until)
+
+            st.markdown(
+                "---\n"
+                "**" + login_u + "** · роль: `" + role_u + "` · " + name_u
+                + ("  \n🟢 активен" if active_u else "  \n🔴 отключён")
+                + ("  \n🔒 **заблокирован** до " + locked_until if is_locked else "")
+                + ("  \n⚠️ неудачных попыток: " + s(attempts) if attempts > 0 else "")
+            )
+
+            c1, c2, c3, c4 = st.columns(4)
+
+            if c1.button("🔑 Сменить пароль",
+                         key="btn_pwd_" + login_u,
+                         use_container_width=True):
+                st.session_state["show_pwd_form_" + login_u] = True
+                st.rerun()
+
+            if is_locked or attempts > 0:
+                if c2.button("🔓 Разблокировать",
+                             key="btn_unlock_" + login_u,
+                             use_container_width=True):
+                    if admin_unlock_user(login_u):
+                        log_action(admin_login, admin_role, "unlock_user", login_u)
+                        st.success("Блокировка снята: " + login_u)
+                        st.rerun()
+
+            if c3.button("Отключить" if active_u else "Включить",
+                         key="toggle_user_" + login_u,
+                         use_container_width=True):
                 ws = get_ws_cached("users")
                 all_rows = ws.get_all_values()
                 for i, row in enumerate(all_rows[1:], start=2):
-                    if row[0] == u["login"]:
-                        new_val = "0" if active else "1"
+                    if s(row[0]).strip() == login_u:
+                        new_val = "0" if active_u else "1"
                         ws.update_cell(i, 5, new_val)
                         invalidate_cache("users")
-                        log_action(st.session_state["user"]["login"],
-                                   st.session_state["user"]["role"],
-                                   "toggle_user", s(u['login']) + " -> " + new_val)
+                        log_action(admin_login, admin_role, "toggle_user",
+                                   login_u + " -> " + new_val)
                         st.rerun()
+
+            if st.session_state.get("show_pwd_form_" + login_u):
+                with st.form("pwd_form_" + login_u):
+                    st.markdown("**Смена пароля для `" + login_u + "`**")
+                    new_pwd = st.text_input("Новый пароль (минимум 8 символов)",
+                                            type="password",
+                                            key="new_pwd_" + login_u)
+                    new_pwd2 = st.text_input("Повторите пароль",
+                                             type="password",
+                                             key="new_pwd2_" + login_u)
+                    col_a, col_b = st.columns(2)
+                    ok = col_a.form_submit_button("💾 Сохранить пароль")
+                    cancel = col_b.form_submit_button("Отмена")
+                if cancel:
+                    st.session_state.pop("show_pwd_form_" + login_u, None)
+                    st.rerun()
+                if ok:
+                    if not new_pwd or not new_pwd2:
+                        st.error("Заполните оба поля")
+                    elif new_pwd != new_pwd2:
+                        st.error("Пароли не совпадают")
+                    elif len(new_pwd) < 8:
+                        st.error("Пароль минимум 8 символов")
+                    else:
+                        success, err = admin_set_password(login_u, new_pwd)
+                        if success:
+                            log_action(admin_login, admin_role, "admin_set_password",
+                                       "пользователь: " + login_u)
+                            st.session_state.pop("show_pwd_form_" + login_u, None)
+                            st.success("Пароль для " + login_u + " обновлён. "
+                                       "Блокировка снята, счётчик попыток сброшен.")
+                            st.rerun()
+                        else:
+                            st.error("Не удалось: " + s(err))
+
         st.markdown("---")
         st.subheader("Добавить пользователя")
         with st.form("add_user"):
@@ -2026,11 +2118,11 @@ def admin_panel():
                     "role": new_role, "full_name": new_name, "active": "1",
                     "failed_attempts": "0", "locked_until": "",
                 })
-                log_action(st.session_state["user"]["login"],
-                           st.session_state["user"]["role"],
+                log_action(admin_login, admin_role,
                            "create_user", new_login + " / " + new_role)
                 st.success("Пользователь " + new_login + " создан")
                 st.rerun()
+
     with tab2:
         st.subheader("Журнал действий")
         rows = list(reversed(read_all("audit_log")))[:200]
@@ -2038,6 +2130,7 @@ def admin_panel():
             st.dataframe(safe_df(rows), use_container_width=True)
         else:
             st.info("Пока пусто")
+
     with tab3:
         st.subheader("Журнал печати актов")
         rows = list(reversed(read_all("act_log")))[:200]
