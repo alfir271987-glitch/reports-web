@@ -13,10 +13,6 @@ import uuid
 import os
 import re
 
-# ============================================================
-# КОНФИГ
-# ============================================================
-
 SHEET_ID = "1MHslz3VRowoOLtS_AAQ5h-tFm-fIXBN8noqtyQpmKLw"
 CRED_FILE = "gifted-mountain-508410-s3-96f38b5a0f63.json"
 
@@ -59,10 +55,6 @@ CACHE_TTL = 90
 LOGIN_MAX_ATTEMPTS = 5
 LOGIN_LOCK_MINUTES = 15
 
-
-# ============================================================
-# УТИЛИТЫ
-# ============================================================
 
 def s(x):
     if x is None:
@@ -180,10 +172,6 @@ def safe_df(rows):
     return [{k: ("" if v is None else str(v)) for k, v in r.items()} for r in rows]
 
 
-# ============================================================
-# БЕЗОПАСНОСТЬ
-# ============================================================
-
 try:
     import bcrypt
     HAS_BCRYPT = True
@@ -230,10 +218,6 @@ def check_lockout(u):
         pass
     return None
 
-
-# ============================================================
-# GOOGLE SHEETS
-# ============================================================
 
 @st.cache_resource
 def get_book():
@@ -354,10 +338,6 @@ def _log_system_error(where, name, exc):
         print("SHEETS ERROR:", where, name, exc)
 
 
-# ============================================================
-# ГЕТТЕРЫ
-# ============================================================
-
 def get_trips(fresh=False):
     return read_all("trips", fresh=fresh)
 
@@ -366,9 +346,9 @@ def get_shipments(fresh=False):
     return read_all("shipments", fresh=fresh)
 
 
-# ============================================================
-# ГЕНЕРАЦИЯ ID
-# ============================================================
+def get_transfer_history(fresh=False):
+    return read_all("transfer_history", fresh=fresh)
+
 
 def next_trip_id():
     rows = read_all_cached("trips")
@@ -386,10 +366,6 @@ def next_trip_id():
 def next_shipment_id():
     return new_uuid()
 
-
-# ============================================================
-# ФИНАНСЫ
-# ============================================================
 
 def calculate_financials(row):
     amount = to_float(row.get("amount"))
@@ -425,10 +401,6 @@ def calculate_financials(row):
     }
 
 
-# ============================================================
-# АКТИВНЫЕ АВТО
-# ============================================================
-
 def is_car_active_on_avtovoz(x):
     if check_issued(s(x.get("issued", "0"))):
         return False
@@ -443,6 +415,27 @@ def count_active_cars(cars):
 
 def count_issued_cars(cars):
     return sum(1 for x in cars if check_issued(s(x.get("issued", "0"))))
+
+
+def is_trace_row(x):
+    return (bool(s(x.get("transferred_to_trip", "")))
+            and s(x.get("car_model", "")).startswith("Перенесён:"))
+
+
+def count_outgoing_transfers(cars):
+    cnt = 0
+    for x in cars:
+        if is_trace_row(x):
+            continue
+        if s(x.get("transferred_to_trip", "")).strip():
+            cnt += 1
+    return cnt
+
+
+def count_incoming_transfers(cars):
+    return sum(1 for x in cars
+               if not is_trace_row(x)
+               and s(x.get("transferred_from_trip", "")).strip() != "")
 
 
 def next_free_position(cars):
@@ -460,9 +453,55 @@ def next_free_position(cars):
     return None
 
 
-# ============================================================
-# CRUD: TRIPS
-# ============================================================
+def describe_trip(trip):
+    if not trip:
+        return ""
+    parts = []
+    if s(trip.get("tractor_number", "")):
+        parts.append(s(trip.get("tractor_number", "")))
+    if s(trip.get("driver", "")):
+        parts.append(s(trip.get("driver", "")))
+    if s(trip.get("route", "")):
+        parts.append(s(trip.get("route", "")))
+    dep = date_to_display_safe(trip.get("date_departure", ""))
+    if dep:
+        parts.append("выезд " + dep)
+    return " — ".join(parts)
+
+
+def find_trip_by_id(all_trips, trip_id):
+    tid = s(trip_id).strip()
+    if not tid:
+        return None
+    for t in all_trips:
+        if s(t.get("id")) == tid:
+            return t
+    return None
+
+
+def resolve_target_trip_label(target_id, all_trips, transfer_history=None):
+    tid = s(target_id).strip()
+    if not tid:
+        return "—"
+    trip = find_trip_by_id(all_trips, tid)
+    if trip:
+        label = describe_trip(trip)
+        if check_completed(trip.get("completed", "0")):
+            label += " ✅"
+        if is_archived(trip.get("archived", "0")):
+            label += " 📦"
+        if is_deleted(trip.get("deleted_at", "")):
+            label += " 🗑"
+        return label
+    if transfer_history:
+        for h in transfer_history:
+            if s(h.get("to_trip")) == tid:
+                ts = s(h.get("ts", ""))
+                if ts:
+                    return "рейс #" + tid + " (перенос " + ts[:10] + ")"
+                break
+    return "рейс #" + tid
+
 
 def create_trip(tractor, driver, route, dep, ret, created_by):
     append_row("trips", {
@@ -587,10 +626,6 @@ def delete_trip(trip_id):
     invalidate_cache("shipments")
 
 
-# ============================================================
-# CRUD: SHIPMENTS
-# ============================================================
-
 def create_shipment(trip_id, position, car_model, client, amount,
                     date_pay, paid_to, delivery_city, vin,
                     advance, advance_date,
@@ -710,10 +745,6 @@ def delete_shipment(shipment_id):
     ws.delete_rows(row_idx)
     invalidate_cache("shipments")
 
-
-# ============================================================
-# МАССОВАЯ ОПЛАТА РЕЙСА (безнал с НДС)
-# ============================================================
 
 def pay_entire_trip_nds(trip_id, user_login, role):
     shipments = read_all("shipments", fresh=True)
@@ -886,9 +917,7 @@ def render_trip_payment_button(trip_id, cars, role, user_login, trip_label=""):
                          use_container_width=True):
                 st.session_state.pop(key_confirm_unpay, None)
                 st.rerun()
-                # ============================================================
-# ПЕРЕНОС
-# ============================================================
+
 
 def log_transfer(shipment_id, from_trip, to_trip,
                  from_position, to_position, user_login, note="",
@@ -929,7 +958,7 @@ def transfer_shipment_to_trip(shipment_id, target_trip_id, new_position,
     payload = [
         {"range": "B" + str(row_idx), "values": [[s(target_trip_id)]]},
         {"range": "C" + str(row_idx), "values": [[new_position]]},
-        {"range": "AA" + str(row_idx), "values": [[""]]},
+        {"range": "AA" + str(row_idx), "values": [[s(target_trip_id)]]},
         {"range": "AB" + str(row_idx), "values": [[datetime.now().strftime("%d.%m.%Y")]]},
         {"range": "AC" + str(row_idx), "values": [[source_trip_id]]},
     ]
@@ -962,9 +991,9 @@ def transfer_shipment_to_trip(shipment_id, target_trip_id, new_position,
         "paid_amount": 0,
         "invoice_number": "",
         "invoice_date": "",
-        "transferred_to_trip": s(target_trip_id),
+        "transferred_to_trip": s(shipment_id),
         "transferred_at": datetime.now().strftime("%d.%m.%Y"),
-        "transferred_from_trip": s(shipment_id),   # ← ID самого авто
+        "transferred_from_trip": s(shipment_id),
     }
     append_row("shipments", trace)
 
@@ -976,10 +1005,66 @@ def transfer_shipment_to_trip(shipment_id, target_trip_id, new_position,
     return True
 
 
+def reassign_transfer_for_car(car_id, new_target_trip_id, new_position,
+                              user_login, role):
+    ws = get_ws_cached("shipments")
+    car_row = _find_row_index_by_id("shipments", car_id)
+    if car_row is None:
+        return False, "Авто не найдено"
+
+    rows = read_all_cached("shipments")
+    src = None
+    for r in rows:
+        if s(r.get("id")) == s(car_id):
+            src = r
+            break
+    if src is None:
+        return False, "Авто не найдено"
+
+    old_target = s(src.get("transferred_to_trip", "")).strip()
+    if not old_target:
+        return False, "У этого авто нет переноса — нечего переназначать"
+
+    old_position = s(src.get("position", ""))
+    old_trip_id = s(src.get("trip_id", ""))
+
+    payload = [
+        {"range": "B" + str(car_row), "values": [[s(new_target_trip_id)]]},
+        {"range": "C" + str(car_row), "values": [[new_position]]},
+        {"range": "AA" + str(car_row), "values": [[s(new_target_trip_id)]]},
+        {"range": "AB" + str(car_row), "values": [[datetime.now().strftime("%d.%m.%Y")]]},
+    ]
+    ws.batch_update(payload, value_input_option="USER_ENTERED")
+
+    try:
+        all_vals = ws.get_all_values()
+        for i, row in enumerate(all_vals[1:], start=2):
+            if len(row) < 29:
+                row = row + [""] * (29 - len(row))
+            car_model = s(row[3])
+            aa_val = s(row[26]) if len(row) > 26 else ""
+            ac_val = s(row[28]) if len(row) > 28 else ""
+            if car_model.startswith("Перенесён:") and (
+                    ac_val == s(car_id) or aa_val == s(car_id)):
+                ws.batch_update([
+                    {"range": "B" + str(i), "values": [[old_trip_id]]},
+                    {"range": "AA" + str(i), "values": [[s(car_id)]]},
+                    {"range": "AB" + str(i), "values": [[datetime.now().strftime("%d.%m.%Y")]]},
+                    {"range": "AC" + str(i), "values": [[s(car_id)]]},
+                ], value_input_option="USER_ENTERED")
+    except Exception as e:
+        _log_system_error("reassign_update_trace", car_id, e)
+
+    log_transfer(car_id, old_target, new_target_trip_id,
+                 old_position, new_position, user_login,
+                 note="Переназначение переноса вручную")
+
+    invalidate_cache("shipments")
+    return True, ""
+
+
 def update_trace_shipment(trace_id, new_car_model, new_vin, new_delivery_city,
                           new_position=None):
-    """Редактирует запись-след «Перенесён: …».
-    Позволяет изменить марку, VIN, город доставки, позицию следа."""
     ws = get_ws_cached("shipments")
     row_idx = _find_row_index_by_id("shipments", trace_id)
     if row_idx is None:
@@ -998,7 +1083,6 @@ def update_trace_shipment(trace_id, new_car_model, new_vin, new_delivery_city,
 
 
 def delete_trace_shipment(trace_id):
-    """Удаляет запись-след. Само авто не трогает."""
     ws = get_ws_cached("shipments")
     row_idx = _find_row_index_by_id("shipments", trace_id)
     if row_idx is None:
@@ -1008,12 +1092,34 @@ def delete_trace_shipment(trace_id):
     return True
 
 
+def find_parent_for_trace(trace_row, all_shipments):
+    parent_id = s(trace_row.get("transferred_from_trip", "")).strip()
+    if parent_id:
+        for c in all_shipments:
+            if s(c.get("id")) == parent_id:
+                return parent_id
+    trace_vin = s(trace_row.get("vin", "")).strip()
+    trace_car = s(trace_row.get("car_model", "")).replace(
+        "Перенесён: ", "").strip()
+    tr_from = s(trace_row.get("trip_id", "")).strip()
+    for c in all_shipments:
+        if s(c.get("id")) == s(trace_row.get("id")):
+            continue
+        if s(c.get("car_model", "")).startswith("Перенесён:"):
+            continue
+        if s(c.get("transferred_to_trip", "")):
+            continue
+        c_vin = s(c.get("vin", "")).strip()
+        c_car = s(c.get("car_model", "")).strip()
+        if trace_vin and c_vin and trace_vin == c_vin:
+            return s(c.get("id"))
+        if trace_car and c_car and trace_car == c_car \
+                and s(c.get("trip_id")) == tr_from:
+            return s(c.get("id"))
+    return ""
+
+
 def cancel_transfer(shipment_id, user_login, role, new_position=None):
-    """Отменяет перенос авто.
-    shipment_id — ID самого авто (не следа).
-    Возвращает авто на рейс из transferred_from_trip,
-    удаляет запись-след в исходном рейсе,
-    пишет запись в transfer_history с cancelled=1."""
     ws = get_ws_cached("shipments")
     row_idx = _find_row_index_by_id("shipments", shipment_id)
     if row_idx is None:
@@ -1045,6 +1151,7 @@ def cancel_transfer(shipment_id, user_login, role, new_position=None):
     payload = [
         {"range": "B" + str(row_idx), "values": [[source_trip_id]]},
         {"range": "C" + str(row_idx), "values": [[new_position]]},
+        {"range": "AA" + str(row_idx), "values": [[""]]},
         {"range": "AB" + str(row_idx), "values": [[datetime.now().strftime("%d.%m.%Y")]]},
         {"range": "AC" + str(row_idx), "values": [[""]]},
     ]
@@ -1055,11 +1162,14 @@ def cancel_transfer(shipment_id, user_login, role, new_position=None):
         all_vals = ws2.get_all_values()
         to_del = []
         for i, row in enumerate(all_vals[1:], start=2):
-            if len(row) > 28:
-                car_model = s(row[3]) if len(row) > 3 else ""
-                tr_from = s(row[28]) if len(row) > 28 else ""
-                if car_model.startswith("Перенесён:") and tr_from == s(shipment_id):
-                    to_del.append(i)
+            if len(row) < 29:
+                row = row + [""] * (29 - len(row))
+            car_model = s(row[3]) if len(row) > 3 else ""
+            ac_val = s(row[28]) if len(row) > 28 else ""
+            aa_val = s(row[26]) if len(row) > 26 else ""
+            if car_model.startswith("Перенесён:") and (
+                    ac_val == s(shipment_id) or aa_val == s(shipment_id)):
+                to_del.append(i)
         for i in reversed(to_del):
             try:
                 ws2.delete_rows(i)
@@ -1086,12 +1196,8 @@ def get_shipment_history(shipment_id):
     return result
 
 
-# ============================================================
-# АКТ
-# ============================================================
-
 def render_act_html(trip, shipment):
-    route = s(trip.get("route", ""))
+    route = s(trip.get("route", "")) if trip else ""
     car_model = s(shipment.get("car_model", ""))
     client = s(shipment.get("client", ""))
     customer = s(shipment.get("customer", ""))
@@ -1142,7 +1248,7 @@ def render_act_html(trip, shipment):
 
 
 def render_act_text(trip, shipment):
-    route = s(trip.get("route", ""))
+    route = s(trip.get("route", "")) if trip else ""
     car_model = s(shipment.get("car_model", ""))
     client = s(shipment.get("client", ""))
     customer = s(shipment.get("customer", ""))
@@ -1181,7 +1287,8 @@ def log_act_print(login, trip_id, shipment_id, client):
 
 def show_act(trip, shipment):
     u = st.session_state["user"]
-    log_act_print(u["login"], trip.get("id"), shipment.get("id"), shipment.get("client"))
+    log_act_print(u["login"], trip.get("id") if trip else "",
+                  shipment.get("id"), shipment.get("client"))
     st.info("Нажмите **Ctrl+P** для печати или скачайте акт кнопкой ниже.")
     safe_car = s(shipment.get("car_model", "")).replace("/", "-").replace("\\", "-")
     safe_client = s(shipment.get("client", "")).replace("/", "-").replace("\\", "-")
@@ -1199,10 +1306,6 @@ def show_act(trip, shipment):
             key="dl_txt_" + s(shipment.get("id")))
     st.components.v1.html(render_act_html(trip, shipment), height=850, scrolling=True)
 
-
-# ============================================================
-# СПИСОК ДЛЯ ВОДИТЕЛЯ (.doc) — VIN + Примечание
-# ============================================================
 
 def render_print_list_doc(rows, title="Список перевозимых автомобилей"):
     groups = []
@@ -1332,10 +1435,6 @@ def show_print_list(rows):
     st.components.v1.html(doc_html, height=900, scrolling=True)
 
 
-# ============================================================
-# ФОРМЫ
-# ============================================================
-
 def render_shipment_form(form_key, c=None, submit_label="Сохранить авто",
                          default_position=None):
     defaults = {
@@ -1430,20 +1529,17 @@ def render_shipment_form(form_key, c=None, submit_label="Сохранить ав
     }
 
 
-# ============================================================
-# ШАПКА РЕЙСА — с подсветкой переносов
-# ============================================================
-
 def render_trip_header(trip_id, tractor, driver, route, dep, ret,
                        trip_completed, trip_completed_at,
                        active_count, issued_count,
                        total, total_advance, total_debt, total_nds,
                        has_nds=False,
                        trip_invoice_number="", trip_invoice_date="",
-                       has_transfers=False):
-    if active_count == 0 and issued_count == 0 and not has_transfers:
+                       has_transfers=False, transfers_count=0,
+                       incoming_count=0):
+    if active_count == 0 and issued_count == 0 and not has_transfers and incoming_count == 0:
         bg, bd = "#fafafa", "#dddddd"
-    elif has_transfers:
+    elif has_transfers or incoming_count > 0:
         bg, bd = "#ffcdd2", "#e53935"
     elif total_debt > 0.01:
         bg, bd = "#ffcdd2", "#e53935"
@@ -1457,6 +1553,10 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
     stats = "авто: " + s(active_count) + "/" + s(MAX_CARS)
     if issued_count > 0:
         stats += "  |  выдано: " + s(issued_count)
+    if transfers_count > 0:
+        stats += "  |  перенесено: " + s(transfers_count)
+    if incoming_count > 0:
+        stats += "  |  принято: " + s(incoming_count)
     stats += ("  |  сумма: " + fmt_money(total)
               + "  |  аванс: " + fmt_money(total_advance)
               + "  |  задолженность: " + fmt_money(total_debt))
@@ -1480,12 +1580,17 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
                         'font-weight:bold; white-space:nowrap; margin-left:6px;">'
                         '📄 Счёт: не выставлен</span>')
 
-    transfers_html = ""
-    if has_transfers:
-        transfers_html = ('<span style="background:#b71c1c; color:#fff; '
-                          'padding:2px 10px; border-radius:12px; font-size:12px; '
-                          'font-weight:bold; white-space:nowrap; margin-left:6px;">'
-                          '↔ есть переносы</span>')
+    badges = ""
+    if transfers_count > 0:
+        badges += ('<span style="background:#b71c1c; color:#fff; '
+                   'padding:2px 10px; border-radius:12px; font-size:12px; '
+                   'font-weight:bold; white-space:nowrap; margin-left:6px;">'
+                   '↗ ушло: ' + s(transfers_count) + '</span>')
+    if incoming_count > 0:
+        badges += ('<span style="background:#4a148c; color:#fff; '
+                   'padding:2px 10px; border-radius:12px; font-size:12px; '
+                   'font-weight:bold; white-space:nowrap; margin-left:6px;">'
+                   '↘ принято: ' + s(incoming_count) + '</span>')
 
     completed_html = ""
     if trip_completed:
@@ -1507,7 +1612,7 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
         '<div style="font-weight:bold; flex:1; min-width:200px;">'
         + title +
         '</div>'
-        '<div>' + transfers_html + completed_html + '</div>'
+        '<div>' + badges + completed_html + '</div>'
         '</div>'
         '<div style="color:#333; margin-top:4px; display:flex; '
         'align-items:center; flex-wrap:wrap;">'
@@ -1518,10 +1623,6 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
         unsafe_allow_html=True,
     )
 
-
-# ============================================================
-# ЛОГИН
-# ============================================================
 
 def _update_user_lockout(login, attempts, locked_until):
     ws = get_ws_cached("users")
@@ -1613,10 +1714,6 @@ def logout():
     st.rerun()
 
 
-# ============================================================
-# АДМИНКА
-# ============================================================
-
 def admin_panel():
     st.header("Админ-панель")
     tab1, tab2, tab3 = st.tabs(["Пользователи", "Журнал действий", "Журнал печати актов"])
@@ -1685,10 +1782,6 @@ def admin_panel():
             st.info("Пока пусто")
 
 
-# ============================================================
-# ПЕРВЫЙ АДМИН
-# ============================================================
-
 def ensure_first_admin():
     users = read_all("users", fresh=True)
     if not users:
@@ -1742,10 +1835,6 @@ def can(action, role):
     return action in rights.get(role, set())
 
 
-# ============================================================
-# ГЛАВНАЯ
-# ============================================================
-
 def main_page():
     u = st.session_state["user"]
     role = u["role"]
@@ -1775,14 +1864,15 @@ def main_page():
 
     st.title("Учёт рейсов и перевозок")
 
-    # ============ ПЕЧАТЬ ОБЩЕГО СПИСКА ============
     if st.session_state.get("show_print_all"):
         if st.button("Назад к списку", key="btn_back_from_print"):
             st.session_state.pop("show_print_all", None)
             st.rerun()
         st.subheader("🖨 Печать списка автомобилей")
         print_rows = []
-        active_trips = [t for t in get_trips()
+        all_trips_list = get_trips()
+        all_hist_list = get_transfer_history()
+        active_trips = [t for t in all_trips_list
                         if not is_archived(t.get("archived", "0"))
                         and not is_deleted(t.get("deleted_at", ""))
                         and not check_completed(t.get("completed", "0"))]
@@ -1792,7 +1882,6 @@ def main_page():
             reverse=True,
         )
         all_ships = get_shipments()
-        trip_by_id = {s(t.get("id")): t for t in get_trips()}
         for t in active_trips:
             tid = s(t.get("id"))
             cars = [x for x in all_ships if s(x.get("trip_id")) == tid]
@@ -1801,15 +1890,16 @@ def main_page():
                     continue
                 fin = calculate_financials(x)
                 tr_to = s(x.get("transferred_to_trip", ""))
+                tr_from = s(x.get("transferred_from_trip", ""))
                 note = ""
                 if tr_to:
-                    target_trip = trip_by_id.get(tr_to)
-                    if target_trip:
-                        note = ("Перенесён на: "
-                                + s(target_trip.get("tractor_number", ""))
-                                + " " + s(target_trip.get("route", "")))
+                    if is_trace_row(x):
+                        origin_id = s(x.get("trip_id", ""))
+                        note = "Перенесён из: " + resolve_target_trip_label(
+                            origin_id, all_trips_list, all_hist_list)
                     else:
-                        note = "Перенесён на рейс #" + tr_to
+                        note = "Перенесён из: " + resolve_target_trip_label(
+                            tr_from, all_trips_list, all_hist_list)
                 print_rows.append({
                     "tractor": s(t.get("tractor_number", "")),
                     "driver": s(t.get("driver", "")),
@@ -1830,14 +1920,13 @@ def main_page():
             show_print_list(print_rows)
         return
 
-    # ============ АКТ ============
     if st.session_state.get("show_act_for"):
         sid = st.session_state["show_act_for"]
         shipments = get_shipments(fresh=True)
-        trips = get_trips(fresh=True)
+        all_trips_now = get_trips(fresh=True)
         ship = next((x for x in shipments if s(x.get("id")) == s(sid)), None)
         if ship:
-            trip = next((x for x in trips if s(x.get("id")) == s(ship.get("trip_id"))), None)
+            trip = find_trip_by_id(all_trips_now, ship.get("trip_id"))
             if trip:
                 if st.button("Назад к списку", key="btn_back_from_act"):
                     st.session_state.pop("show_act_for", None)
@@ -1847,7 +1936,6 @@ def main_page():
                 return
         st.session_state.pop("show_act_for", None)
 
-    # ============ ИСТОРИЯ ============
     if st.session_state.get("show_history_for"):
         sid = st.session_state["show_history_for"]
         shipments = get_shipments(fresh=True)
@@ -1879,7 +1967,6 @@ def main_page():
                 )
         return
 
-    # ============ ПЕЧАТЬ ОДНОГО РЕЙСА ============
     if st.session_state.get("show_print_trip"):
         rows = st.session_state["show_print_trip"]
         if st.button("Назад к списку", key="btn_back_from_print_trip"):
@@ -1891,6 +1978,7 @@ def main_page():
 
     trips = get_trips()
     shipments = get_shipments()
+    transfer_history = get_transfer_history()
 
     col_p1, col_p2, col_p3 = st.columns([1, 1, 4])
     with col_p1:
@@ -2011,9 +2099,11 @@ def main_page():
 
             active_count = count_active_cars(cars)
             issued_count = count_issued_cars(cars)
+            outgoing_count = count_outgoing_transfers(cars)
+            incoming_count = count_incoming_transfers(cars)
             free_pos = next_free_position(cars)
 
-            has_transfers = any(s(x.get("transferred_to_trip", "")) for x in cars)
+            has_transfers = outgoing_count > 0
 
             has_nds = any(s(x.get("payer_type", "")).strip() == NDS_PAYER
                           for x in cars)
@@ -2025,7 +2115,9 @@ def main_page():
                                has_nds=has_nds,
                                trip_invoice_number=trip_inv_num,
                                trip_invoice_date=trip_inv_date,
-                               has_transfers=has_transfers)
+                               has_transfers=has_transfers,
+                               transfers_count=outgoing_count,
+                               incoming_count=incoming_count)
 
             if has_nds and can("edit_ship", role) and view_mode in ("active", "completed"):
                 render_trip_payment_button(trip_id, cars, role, u["login"],
@@ -2163,22 +2255,22 @@ def main_page():
                                  key="btn_print_trip_" + s(trip_id),
                                  use_container_width=True):
                         rows = []
-                        trip_by_id_local = {s(tt.get("id")): tt for tt in trips}
                         for x in sorted(cars,
                                         key=lambda z: int(to_float(z.get("position")))):
                             if check_issued(s(x.get("issued", "0"))):
                                 continue
                             fin = calculate_financials(x)
                             tr_to_x = s(x.get("transferred_to_trip", ""))
+                            tr_from_x = s(x.get("transferred_from_trip", ""))
                             note_x = ""
                             if tr_to_x:
-                                tgt = trip_by_id_local.get(tr_to_x)
-                                if tgt:
-                                    note_x = ("Перенесён на: "
-                                              + s(tgt.get("tractor_number", ""))
-                                              + " " + s(tgt.get("route", "")))
+                                if is_trace_row(x):
+                                    origin_id = s(x.get("trip_id", ""))
+                                    note_x = "Перенесён из: " + resolve_target_trip_label(
+                                        origin_id, trips, transfer_history)
                                 else:
-                                    note_x = "Перенесён на рейс #" + tr_to_x
+                                    note_x = "Перенесён из: " + resolve_target_trip_label(
+                                        tr_from_x, trips, transfer_history)
                             rows.append({
                                 "tractor": tractor,
                                 "driver": driver,
@@ -2323,9 +2415,19 @@ def main_page():
                         tr_to = s(x.get("transferred_to_trip", ""))
                         tr_at = s(x.get("transferred_at", ""))
                         tr_from = s(x.get("transferred_from_trip", ""))
-                        is_trace = bool(tr_to)
+                        is_trace = is_trace_row(x)
                         parent_id = tr_from if is_trace else ""
                         can_cancel_parent = bool(tr_from) and not is_trace
+
+                        src_trip_label = ""
+                        if tr_from:
+                            src_trip_label = resolve_target_trip_label(
+                                tr_from, trips, transfer_history)
+
+                        target_trip_label = ""
+                        if tr_to:
+                            target_trip_label = resolve_target_trip_label(
+                                tr_to, trips, transfer_history)
 
                         if is_trace:
                             bg = "#eeeeee"; bd = "#bdbdbd"
@@ -2349,53 +2451,155 @@ def main_page():
                             unsafe_allow_html=True)
 
                         if is_trace:
-                            # ==== КАРТОЧКА СЛЕДА «ПЕРЕНЕСЁН» ====
-                            target_trip = next((tt for tt in trips
-                                                if s(tt.get("id")) == s(tr_to)), None)
-                            target_label = ""
-                            if target_trip:
-                                target_label = (s(target_trip.get("tractor_number", ""))
-                                                + " " + s(target_trip.get("route", "")))
+                            origin_trip = find_trip_by_id(get_trips(), s(x.get("trip_id", "")))
+                            if origin_trip:
+                                origin_label = describe_trip(origin_trip)
+                            else:
+                                origin_label = "рейс #" + s(x.get("trip_id", ""))
+
                             st.markdown(
                                 "**" + s(x.get("car_model", "")) + "**  \n"
-                                "Перенесён на рейс: **" + (target_label or ("#" + tr_to)) + "**"
+                                "↩ **Перенесён из рейса:** " + origin_label
                                 + ("  \nДата переноса: **" + s(tr_at) + "**" if tr_at else "")
                             )
 
-                            # Кнопки для следа: вернуть, изменить, удалить
+                            actual_parent_id = parent_id
+                            if not actual_parent_id:
+                                actual_parent_id = find_parent_for_trace(x, shipments)
+                                if actual_parent_id:
+                                    try:
+                                        ws_fix = get_ws_cached("shipments")
+                                        fix_row = _find_row_index_by_id(
+                                            "shipments", s(x["id"]))
+                                        if fix_row:
+                                            ws_fix.batch_update(
+                                                [{"range": "AC" + str(fix_row),
+                                                  "values": [[actual_parent_id]]}],
+                                                value_input_option="USER_ENTERED")
+                                            invalidate_cache("shipments")
+                                    except Exception as e_fix:
+                                        _log_system_error(
+                                            "fix_parent_on_trace", s(x["id"]), e_fix)
+
                             if view_mode == "active":
-                                tc1, tc2, tc3 = st.columns(3)
-                                if can("cancel_transfer", role) and parent_id:
-                                    if tc1.button("↩ Вернуть авто в рейс",
-                                                  key="btn_cancel_trace_" + s(x["id"]),
-                                                  use_container_width=True):
-                                        ok_flag, err = cancel_transfer(
-                                            parent_id, u["login"], role
-                                        )
-                                        if ok_flag:
-                                            log_action(u["login"], role, "cancel_transfer",
-                                                       "trace " + s(x["id"])
-                                                       + " → parent " + parent_id)
-                                            st.success("Перенос отменён, авто вернулось")
-                                        else:
-                                            st.error("Не удалось: " + s(err))
-                                        st.rerun()
+                                tc1, tc2 = st.columns(2)
+
+                                if can("cancel_transfer", role):
+                                    if actual_parent_id:
+                                        if tc1.button("↩ Вернуть авто в рейс",
+                                                      key="btn_cancel_trace_" + s(x["id"]),
+                                                      use_container_width=True):
+                                            ok_flag, err = cancel_transfer(
+                                                actual_parent_id, u["login"], role
+                                            )
+                                            if ok_flag:
+                                                log_action(u["login"], role,
+                                                           "cancel_transfer",
+                                                           "trace " + s(x["id"])
+                                                           + " → parent "
+                                                           + actual_parent_id)
+                                                st.success(
+                                                    "Перенос отменён, авто вернулось")
+                                            else:
+                                                st.error("Не удалось: " + s(err))
+                                            st.rerun()
+                                    else:
+                                        tc1.button("↩ Вернуть авто в рейс",
+                                                   key="btn_cancel_trace_na_"
+                                                   + s(x["id"]),
+                                                   disabled=True,
+                                                   use_container_width=True,
+                                                   help="Не найден исходный автомобиль.")
+
                                 if can("edit_trace", role):
-                                    if tc2.button("✏ Изменить след",
-                                                  key="btn_edit_trace_" + s(x["id"]),
-                                                  use_container_width=True):
-                                        st.session_state["edit_trace_" + s(x["id"])] = True
-                                if can("delete_ship", role):
-                                    if tc3.button("🗑 Удалить след",
-                                                  key="btn_del_trace_" + s(x["id"]),
-                                                  use_container_width=True):
-                                        delete_trace_shipment(x["id"])
-                                        log_action(u["login"], role, "delete_trace",
-                                                   "trace " + s(x["id"]))
-                                        st.success("След удалён")
-                                        st.rerun()
+                                    if actual_parent_id:
+                                        if tc2.button("✏ Редактировать перенос",
+                                                      key="btn_edit_transfer_"
+                                                      + s(x["id"]),
+                                                      use_container_width=True):
+                                            st.session_state[
+                                                "open_edit_transfer_" + s(x["id"])
+                                            ] = True
+                                    else:
+                                        tc2.button("✏ Редактировать перенос",
+                                                   key="btn_edit_transfer_na_"
+                                                   + s(x["id"]),
+                                                   disabled=True,
+                                                   use_container_width=True,
+                                                   help="Не найден исходный автомобиль.")
+
+                                if actual_parent_id and st.session_state.get(
+                                        "open_edit_transfer_" + s(x["id"])):
+                                    other_trips = [tt for tt in get_trips()
+                                                   if not is_archived(tt.get("archived", "0"))
+                                                   and not is_deleted(tt.get("deleted_at", ""))
+                                                   and not check_completed(tt.get("completed", "0"))]
+                                    if not other_trips:
+                                        st.warning("Нет активных рейсов для выбора.")
+                                    else:
+                                        options = []
+                                        for tt in other_trips:
+                                            options.append((describe_trip(tt),
+                                                            tt.get("id")))
+                                        current_target_label = resolve_target_trip_label(
+                                            tr_to, trips, transfer_history)
+                                        with st.form("edit_transfer_form_"
+                                                     + s(x["id"])):
+                                            st.markdown(
+                                                "**Редактировать перенос вручную**  \n"
+                                                "Сейчас авто в рейсе: **"
+                                                + current_target_label + "**"
+                                            )
+                                            labels = [o[0] for o in options]
+                                            chosen_label = st.selectbox(
+                                                "Новый рейс для авто",
+                                                labels,
+                                                key="edt_sel_" + s(x["id"]))
+                                            chosen_id = next(
+                                                o[1] for o in options
+                                                if o[0] == chosen_label)
+                                            target_cars = [c for c in shipments
+                                                           if s(c.get("trip_id"))
+                                                           == s(chosen_id)]
+                                            suggested_pos = (
+                                                next_free_position(target_cars)
+                                                or 1)
+                                            new_pos = st.number_input(
+                                                "Позиция на новом рейсе",
+                                                min_value=1,
+                                                max_value=MAX_CARS,
+                                                value=suggested_pos,
+                                                step=1,
+                                                key="edt_pos_" + s(x["id"]))
+                                            e_ok = st.form_submit_button(
+                                                "💾 Сохранить перенос")
+                                            e_no = st.form_submit_button("Отмена")
+                                        if e_no:
+                                            st.session_state.pop(
+                                                "open_edit_transfer_"
+                                                + s(x["id"]), None)
+                                            st.rerun()
+                                        if e_ok:
+                                            ok_flag, err = reassign_transfer_for_car(
+                                                actual_parent_id, chosen_id,
+                                                new_pos, u["login"], role)
+                                            st.session_state.pop(
+                                                "open_edit_transfer_"
+                                                + s(x["id"]), None)
+                                            if ok_flag:
+                                                log_action(
+                                                    u["login"], role,
+                                                    "edit_transfer_manual",
+                                                    "shipment "
+                                                    + actual_parent_id
+                                                    + " → trip " + s(chosen_id))
+                                                st.success(
+                                                    "Перенос обновлён: авто "
+                                                    "теперь в выбранном рейсе.")
+                                            else:
+                                                st.error("Не удалось: " + s(err))
+                                            st.rerun()
                         else:
-                            # ==== ОБЫЧНАЯ КАРТОЧКА АВТО ====
                             client_display = s(x.get("client", "")) or s(x.get("customer", ""))
                             st.markdown(
                                 "**Поз. " + s(x.get("position", "")) + "** · "
@@ -2408,15 +2612,18 @@ def main_page():
                                 (" | НДС: " + fmt_money(nds_val) if nds_val > 0 else "") +
                                 "  \nСтатус: **" + status_text + "**"
                             )
-                            if can_cancel_parent:
-                                src_trip = next((tt for tt in trips
-                                                 if s(tt.get("id")) == s(tr_from)), None)
-                                src_label = ""
-                                if src_trip:
-                                    src_label = (s(src_trip.get("tractor_number", ""))
-                                                 + " " + s(src_trip.get("route", "")))
-                                st.info("↩ Авто перенесено с рейса: **"
-                                        + (src_label or ("#" + tr_from)) + "**")
+                            if tr_from:
+                                st.markdown(
+                                    '<div style="background:#ede7f6; '
+                                    'border-left:4px solid #5e35b1; '
+                                    'padding:6px 10px; margin-top:6px; '
+                                    'border-radius:4px; font-size:13px; '
+                                    'word-wrap:break-word;">'
+                                    '↩ <b>Перенесён из рейса:</b> '
+                                    + src_trip_label +
+                                    '</div>',
+                                    unsafe_allow_html=True,
+                                )
                             details = []
                             if s(x.get("delivery_city", "")):
                                 details.append("Город: " + s(x.get("delivery_city", "")))
@@ -2437,7 +2644,6 @@ def main_page():
                                     unsafe_allow_html=True,
                                 )
 
-                        # Кнопки управления обычной карточкой
                         if view_mode == "active" and not is_trace:
                             bc1, bc2, bc3, bc4 = st.columns(4)
                             paid_label = "❌ Снять" if is_paid_flag else "✅ Оплачен"
@@ -2483,6 +2689,11 @@ def main_page():
                                               key="btn_cancel_transfer_" + s(x["id"]),
                                               use_container_width=True):
                                     st.session_state["open_cancel_transfer_" + s(x["id"])] = True
+                            if can("edit_trace", role) and tr_to:
+                                if tc2.button("✏ Переназначить",
+                                              key="btn_reassign_" + s(x["id"]),
+                                              use_container_width=True):
+                                    st.session_state["open_reassign_" + s(x["id"])] = True
                             if tc3.button("📜 История",
                                           key="btn_hist_" + s(x["id"]),
                                           use_container_width=True):
@@ -2517,49 +2728,72 @@ def main_page():
 
                         st.markdown("</div>", unsafe_allow_html=True)
 
-                        # ---- Форма редактирования следа ----
-                        if is_trace and st.session_state.get("edit_trace_" + s(x["id"])):
-                            with st.form("edit_trace_form_" + s(x["id"])):
-                                st.markdown("**Редактировать запись-след**")
-                                t_car = st.text_input("Марка / модель",
-                                                       value=s(x.get("car_model", "")))
-                                t_vin = st.text_input("VIN",
-                                                       value=s(x.get("vin", ""))[:17])
-                                t_city = st.text_input("Город доставки",
-                                                        value=s(x.get("delivery_city", "")))
-                                t_pos = st.number_input("Позиция",
-                                                         min_value=1, max_value=MAX_CARS,
-                                                         value=int(to_float(x.get("position")) or 1),
-                                                         step=1)
-                                t_ok = st.form_submit_button("Сохранить")
-                                t_no = st.form_submit_button("Отмена")
-                            if t_no:
-                                st.session_state.pop("edit_trace_" + s(x["id"]), None)
-                                st.rerun()
-                            if t_ok:
-                                update_trace_shipment(x["id"], t_car, t_vin, t_city, t_pos)
-                                log_action(u["login"], role, "edit_trace",
-                                           "trace " + s(x["id"]))
-                                st.session_state.pop("edit_trace_" + s(x["id"]), None)
-                                st.success("Запись-след обновлена")
-                                st.rerun()
-
-                        # ---- Перенос обычного авто ----
-                        if view_mode == "active" and not is_trace and \
-                                st.session_state.get("open_transfer_" + s(x["id"])):
-                            other_trips = [tt for tt in trips
+                        if view_mode == "active" and not is_trace and tr_to and \
+                                st.session_state.get("open_reassign_" + s(x["id"])):
+                            other_trips = [tt for tt in get_trips()
                                            if not is_archived(tt.get("archived", "0"))
                                            and not is_deleted(tt.get("deleted_at", ""))
-                                           and s(tt.get("id")) != s(trip_id)]
+                                           and not check_completed(tt.get("completed", "0"))
+                                           and s(tt.get("id")) != s(tr_to)]
                             if not other_trips:
-                                st.warning("Нет других активных рейсов для переноса")
+                                st.warning("Нет других активных рейсов для переназначения.")
                             else:
                                 options = []
                                 for tt in other_trips:
-                                    label = (s(tt.get("tractor_number", ""))
-                                             + " — " + s(tt.get("route", ""))
-                                             + " — выезд " + date_to_display_safe(tt.get("date_departure", "")))
-                                    options.append((label, tt.get("id")))
+                                    options.append((describe_trip(tt), tt.get("id")))
+                                current_label = resolve_target_trip_label(
+                                    tr_to, trips, transfer_history)
+                                with st.form("reassign_form_" + s(x["id"])):
+                                    st.markdown("**Переназначить перенос авто**  \n"
+                                                "Сейчас: " + current_label)
+                                    labels = [o[0] for o in options]
+                                    chosen_label = st.selectbox("Новый рейс",
+                                                                 labels,
+                                                                 key="reas_sel_" + s(x["id"]))
+                                    target_cars = [c for c in shipments
+                                                   if s(c.get("trip_id")) == s(
+                                                       next(o[1] for o in options if o[0] == chosen_label))]
+                                    suggested_pos = next_free_position(target_cars) or 1
+                                    new_pos = st.number_input("Позиция на новом рейсе",
+                                                                min_value=1, max_value=MAX_CARS,
+                                                                value=suggested_pos,
+                                                                step=1,
+                                                                key="reas_pos_" + s(x["id"]))
+                                    r_ok = st.form_submit_button("Переназначить")
+                                    r_no = st.form_submit_button("Отмена")
+                                if r_no:
+                                    st.session_state.pop("open_reassign_" + s(x["id"]), None)
+                                    st.rerun()
+                                if r_ok:
+                                    chosen_id = next(o[1] for o in options
+                                                     if o[0] == chosen_label)
+                                    ok_flag, err = reassign_transfer_for_car(
+                                        x["id"], chosen_id, new_pos, u["login"], role
+                                    )
+                                    st.session_state.pop("open_reassign_" + s(x["id"]), None)
+                                    if ok_flag:
+                                        log_action(u["login"], role, "reassign_transfer",
+                                                   "shipment " + s(x["id"])
+                                                   + " → trip " + s(chosen_id))
+                                        st.success("Перенос переназначен")
+                                    else:
+                                        st.error("Не удалось: " + s(err))
+                                    st.rerun()
+
+                        if view_mode == "active" and not is_trace and \
+                                st.session_state.get("open_transfer_" + s(x["id"])):
+                            other_trips = [tt for tt in get_trips()
+                                           if not is_archived(tt.get("archived", "0"))
+                                           and not is_deleted(tt.get("deleted_at", ""))
+                                           and not check_completed(tt.get("completed", "0"))
+                                           and s(tt.get("id")) != s(trip_id)]
+                            if not other_trips:
+                                st.warning("Нет других активных рейсов для переноса. "
+                                           "Завершённые и архивные рейсы недоступны.")
+                            else:
+                                options = []
+                                for tt in other_trips:
+                                    options.append((describe_trip(tt), tt.get("id")))
                                 with st.form("transfer_form_" + s(x["id"])):
                                     st.markdown("**Перенос авто на другой рейс**")
                                     labels = [o[0] for o in options]
@@ -2590,18 +2824,13 @@ def main_page():
                                     st.success("Авто перенесено")
                                     st.rerun()
 
-                        # ---- Отмена переноса обычного авто ----
                         if view_mode == "active" and not is_trace and can_cancel_parent and \
                                 st.session_state.get("open_cancel_transfer_" + s(x["id"])):
-                            src_trip = next((tt for tt in trips
-                                             if s(tt.get("id")) == s(tr_from)), None)
-                            src_label = ""
-                            if src_trip:
-                                src_label = (s(src_trip.get("tractor_number", ""))
-                                             + " — " + s(src_trip.get("route", "")))
+                            src_label = resolve_target_trip_label(
+                                tr_from, trips, transfer_history)
                             st.warning(
                                 "Отменить перенос авто обратно на рейс: **"
-                                + (src_label or ("#" + tr_from)) + "**?"
+                                + src_label + "**?"
                             )
                             cc1, cc2 = st.columns(2)
                             if cc1.button("↩ Да, вернуть",
@@ -2633,6 +2862,21 @@ def main_page():
                     sum_cols[3].markdown("**Авто:** " + s(active_count) + "/" + s(MAX_CARS))
                     if total_nds > 0:
                         st.markdown("**НДС 22%:** " + fmt_money(total_nds))
+
+                    incoming_cars = [x for x in cars
+                                     if not is_trace_row(x)
+                                     and s(x.get("transferred_from_trip", "")).strip() != ""]
+                    if incoming_cars:
+                        st.markdown("**↩ Перенесено из других рейсов: " + s(len(incoming_cars)) + " авто**")
+                        for x in incoming_cars:
+                            src_id = s(x.get("transferred_from_trip", ""))
+                            src_label = resolve_target_trip_label(
+                                src_id, trips, transfer_history)
+                            st.markdown(
+                                "- " + s(x.get("car_model", ""))
+                                + " · VIN: " + (s(x.get("vin", ""))[:17] or "—")
+                                + "  \n  перенесён из рейса: **" + src_label + "**"
+                            )
 
                     for x in sorted(cars, key=lambda z: int(to_float(z.get("position")))):
                         if st.session_state.get("edit_ship_" + s(x["id"])):
@@ -2732,10 +2976,6 @@ def main_page():
             unsafe_allow_html=True,
         )
 
-
-# ============================================================
-# ТОЧКА ВХОДА
-# ============================================================
 
 def main():
     st.set_page_config(page_title="Учёт рейсов", page_icon="🚛", layout="wide")
