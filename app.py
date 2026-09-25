@@ -1,5 +1,5 @@
 # ============================================================
-# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.9.9
+# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.10.0
 # Streamlit + Google Sheets
 # ЧАСТЬ 1/2
 # ============================================================
@@ -1792,7 +1792,7 @@ def render_trip_payment_button(trip_id, cars, role, user_login, trip_label=""):
 
 
 # ============================================================
-# УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ (админ + директор)
+# УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ
 # ============================================================
 
 def _update_user_lockout(login, attempts, locked_until):
@@ -1818,7 +1818,6 @@ def _upgrade_password_hash(login, new_hash):
 
 
 def admin_set_password(login, new_password):
-    """Устанавливает новый пароль (bcrypt) и снимает блокировку."""
     if not login or not new_password:
         return False, "Логин и пароль обязательны"
     if len(new_password) < 8:
@@ -1962,9 +1961,9 @@ def can(action, role):
                        "manage_passwords"},
         "director":   {"create_trip", "edit_trip", "delete_trip",
                        "create_ship", "edit_ship", "delete_ship",
-                       "export", "print_act", "archive", "complete_trip",
-                       "transfer_ship", "cancel_transfer", "edit_invoice",
-                       "edit_trace",
+                       "export", "print_act", "manage_users", "view_log",
+                       "archive", "complete_trip", "transfer_ship",
+                       "cancel_transfer", "edit_invoice", "edit_trace",
                        "manage_passwords"},
         "logist":     {"create_trip", "edit_trip", "create_ship", "edit_ship",
                        "export", "print_act", "archive", "complete_trip",
@@ -1980,26 +1979,18 @@ def can(action, role):
 
 
 # ============================================================
-# ПАНЕЛЬ УПРАВЛЕНИЯ ДОСТУПОМ (admin + director)
+# АДМИН-ПАНЕЛЬ (полный доступ для admin и director)
 # ============================================================
 
 def admin_panel():
     admin_role = st.session_state["user"]["role"]
     admin_login = st.session_state["user"]["login"]
-    is_full_admin = (admin_role == "admin")
+    # Полный доступ у admin и director
+    is_full_admin = (admin_role in ("admin", "director"))
 
-    # Директор видит только управление доступом (пароли/разблокировка),
-    # без создания пользователей и без журналов.
-    if is_full_admin:
-        st.header("Админ-панель")
-        tab_users, tab_audit, tab_acts = st.tabs(
-            ["Пользователи", "Журнал действий", "Журнал печати актов"])
-        tab1 = tab_users
-        tab2 = tab_audit
-        tab3 = tab_acts
-    else:
-        st.header("Управление доступом")
-        tab1 = st.container()
+    st.header("Админ-панель")
+    tab1, tab2, tab3 = st.tabs(
+        ["Пользователи", "Журнал действий", "Журнал печати актов"])
 
     with tab1:
         st.subheader("Пользователи")
@@ -2014,55 +2005,46 @@ def admin_panel():
             locked_until = s(u.get("locked_until", "")).strip()
             is_locked = bool(locked_until)
 
-            # Директор не может трогать учётку администратора
-            is_target_admin = (role_u == "admin")
-            can_edit_target = is_full_admin or not is_target_admin
-
             st.markdown(
                 "---\n"
                 "**" + login_u + "** · роль: `" + role_u + "` · " + name_u
                 + ("  \n🟢 активен" if active_u else "  \n🔴 отключён")
                 + ("  \n🔒 **заблокирован** до " + locked_until if is_locked else "")
                 + ("  \n⚠️ неудачных попыток: " + s(attempts) if attempts > 0 else "")
-                + ("  \n_(изменение недоступно: только полный админ)_"
-                   if not can_edit_target else "")
             )
 
             c1, c2, c3, c4 = st.columns(4)
 
             if c1.button("🔑 Сменить пароль",
                          key="btn_pwd_" + login_u,
-                         use_container_width=True,
-                         disabled=not can_edit_target):
+                         use_container_width=True):
                 st.session_state["show_pwd_form_" + login_u] = True
                 st.rerun()
 
             if is_locked or attempts > 0:
                 if c2.button("🔓 Разблокировать",
                              key="btn_unlock_" + login_u,
-                             use_container_width=True,
-                             disabled=not can_edit_target):
+                             use_container_width=True):
                     if admin_unlock_user(login_u):
                         log_action(admin_login, admin_role, "unlock_user", login_u)
                         st.success("Блокировка снята: " + login_u)
                         st.rerun()
 
-            if is_full_admin:
-                if c3.button("Отключить" if active_u else "Включить",
-                             key="toggle_user_" + login_u,
-                             use_container_width=True):
-                    ws = get_ws_cached("users")
-                    all_rows = ws.get_all_values()
-                    for i, row in enumerate(all_rows[1:], start=2):
-                        if s(row[0]).strip() == login_u:
-                            new_val = "0" if active_u else "1"
-                            ws.update_cell(i, 5, new_val)
-                            invalidate_cache("users")
-                            log_action(admin_login, admin_role, "toggle_user",
-                                       login_u + " -> " + new_val)
-                            st.rerun()
+            if c3.button("Отключить" if active_u else "Включить",
+                         key="toggle_user_" + login_u,
+                         use_container_width=True):
+                ws = get_ws_cached("users")
+                all_rows = ws.get_all_values()
+                for i, row in enumerate(all_rows[1:], start=2):
+                    if s(row[0]).strip() == login_u:
+                        new_val = "0" if active_u else "1"
+                        ws.update_cell(i, 5, new_val)
+                        invalidate_cache("users")
+                        log_action(admin_login, admin_role, "toggle_user",
+                                   login_u + " -> " + new_val)
+                        st.rerun()
 
-            if st.session_state.get("show_pwd_form_" + login_u) and can_edit_target:
+            if st.session_state.get("show_pwd_form_" + login_u):
                 with st.form("pwd_form_" + login_u):
                     st.markdown("**Смена пароля для `" + login_u + "`**")
                     new_pwd = st.text_input("Новый пароль (минимум 8 символов)",
@@ -2096,51 +2078,47 @@ def admin_panel():
                         else:
                             st.error("Не удалось: " + s(err))
 
-        if is_full_admin:
-            st.markdown("---")
-            st.subheader("Добавить пользователя")
-            with st.form("add_user"):
-                new_login = st.text_input("Логин")
-                new_pwd = st.text_input("Пароль", type="password")
-                new_role = st.selectbox("Роль", ROLES)
-                new_name = st.text_input("ФИО")
-                ok = st.form_submit_button("Создать")
-            if ok:
-                if not new_login or not new_pwd or not new_name:
-                    st.error("Заполните все поля")
-                elif len(new_pwd) < 8:
-                    st.error("Пароль минимум 8 символов")
-                elif any(s(x.get("login")) == new_login for x in users):
-                    st.error("Такой логин уже есть")
-                else:
-                    append_row("users", {
-                        "login": new_login, "password_hash": hash_password(new_pwd),
-                        "role": new_role, "full_name": new_name, "active": "1",
-                        "failed_attempts": "0", "locked_until": "",
-                    })
-                    log_action(admin_login, admin_role,
-                               "create_user", new_login + " / " + new_role)
-                    st.success("Пользователь " + new_login + " создан")
-                    st.rerun()
+        st.markdown("---")
+        st.subheader("Добавить пользователя")
+        with st.form("add_user"):
+            new_login = st.text_input("Логин")
+            new_pwd = st.text_input("Пароль", type="password")
+            new_role = st.selectbox("Роль", ROLES)
+            new_name = st.text_input("ФИО")
+            ok = st.form_submit_button("Создать")
+        if ok:
+            if not new_login or not new_pwd or not new_name:
+                st.error("Заполните все поля")
+            elif len(new_pwd) < 8:
+                st.error("Пароль минимум 8 символов")
+            elif any(s(x.get("login")) == new_login for x in users):
+                st.error("Такой логин уже есть")
+            else:
+                append_row("users", {
+                    "login": new_login, "password_hash": hash_password(new_pwd),
+                    "role": new_role, "full_name": new_name, "active": "1",
+                    "failed_attempts": "0", "locked_until": "",
+                })
+                log_action(admin_login, admin_role,
+                           "create_user", new_login + " / " + new_role)
+                st.success("Пользователь " + new_login + " создан")
+                st.rerun()
+
+    with tab2:
+        st.subheader("Журнал действий")
+        rows = list(reversed(read_all("audit_log")))[:200]
+        if rows:
+            st.dataframe(safe_df(rows), use_container_width=True)
         else:
-            st.info("Создание и удаление пользователей доступно только роли «admin».")
+            st.info("Пока пусто")
 
-    if is_full_admin:
-        with tab2:
-            st.subheader("Журнал действий")
-            rows = list(reversed(read_all("audit_log")))[:200]
-            if rows:
-                st.dataframe(safe_df(rows), use_container_width=True)
-            else:
-                st.info("Пока пусто")
-
-        with tab3:
-            st.subheader("Журнал печати актов")
-            rows = list(reversed(read_all("act_log")))[:200]
-            if rows:
-                st.dataframe(safe_df(rows), use_container_width=True)
-            else:
-                st.info("Пока пусто")# ============================================================
+    with tab3:
+        st.subheader("Журнал печати актов")
+        rows = list(reversed(read_all("act_log")))[:200]
+        if rows:
+            st.dataframe(safe_df(rows), use_container_width=True)
+        else:
+            st.info("Пока пусто")# ============================================================
 # ЧАСТЬ 2/2: главная страница и точка входа
 # ============================================================
 
@@ -2152,9 +2130,9 @@ def main_page():
     if st.sidebar.button("Выйти", key="btn_logout", use_container_width=True):
         logout()
 
+    # Полный доступ к админ-панели для admin и director
     if role in ("admin", "director"):
-        panel_title = "Админ-панель" if role == "admin" else "Управление доступом"
-        with st.sidebar.expander(panel_title):
+        with st.sidebar.expander("Админ-панель"):
             admin_panel()
 
     view_mode = st.session_state.get("view_mode", "active")
@@ -2690,7 +2668,7 @@ def main_page():
                                 st.success("Рейс обновлён")
                                 st.rerun()
 
-                if role == "admin" and view_mode == "active":
+                if role in ("admin", "director") and view_mode == "active":
                     with st.expander("Опасная зона"):
                         st.warning("Рейс будет помечен как удалённый. Данные сохранятся.")
                         if st.button("🗑 Пометить рейс удалённым",
@@ -3250,26 +3228,8 @@ def main_page():
                     if total_nds > 0:
                         st.markdown("**НДС 22%:** " + fmt_money(total_nds))
 
-                    incoming_cars = [x for x in cars if is_transferred_car(x)]
-                    if incoming_cars:
-                        st.markdown(
-                            '<div style="background:#ede7f6; '
-                            'border-left:4px solid #5e35b1; '
-                            'padding:8px 12px; margin-top:8px; '
-                            'border-radius:4px; font-size:14px;">'
-                            '<b>↘ Перенесено в этот рейс: '
-                            + s(len(incoming_cars)) + ' авто</b>'
-                            '</div>',
-                            unsafe_allow_html=True,
-                        )
-                        for x in incoming_cars:
-                            src_label = resolve_source_trip_label_for_car(
-                                x, trips, transfer_history)
-                            st.markdown(
-                                "- " + s(x.get("car_model", ""))
-                                + " · VIN: " + (s(x.get("vin", ""))[:17] or "—")
-                                + "  \n  перенесён из рейса: **" + src_label + "**"
-                            )
+                    # Дублирующий список внизу УБРАН.
+                    # Информация о переносе показывается под каждой машиной.
 
                     for x in sorted(cars, key=lambda z: int(to_float(z.get("position")))):
                         if st.session_state.get("edit_ship_" + s(x["id"])):
