@@ -1,5 +1,5 @@
 # ============================================================
-# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.4
+# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.9
 # Streamlit + Google Sheets
 # ============================================================
 
@@ -44,7 +44,8 @@ SHEET_SCHEMAS = {
                   "transferred_to_trip", "transferred_at",
                   "transferred_from_trip"],
     "transfer_history": ["id", "ts", "shipment_id", "from_trip", "to_trip",
-                         "from_position", "to_position", "user_login", "note"],
+                         "from_position", "to_position", "user_login", "note",
+                         "cancelled"],
     "audit_log": ["id", "ts", "login", "role", "action", "details"],
     "act_log": ["id", "ts", "login", "trip_id", "shipment_id", "client"],
 }
@@ -397,7 +398,6 @@ def calculate_financials(row):
     paid_flag = check_paid(row.get("paid", "0"))
     payer_type = s(row.get("payer_type"))
 
-    # Долг = amount - advance. Флаг paid дополнительно обнуляет долг.
     debt = amount - advance
     if debt < 0.01 or paid_flag:
         debt = 0.0
@@ -570,6 +570,23 @@ def soft_delete_trip(trip_id):
     return True
 
 
+def delete_trip(trip_id):
+    ws = get_ws_cached("trips")
+    row_idx = _find_row_index_by_id("trips", trip_id)
+    if row_idx is not None:
+        ws.delete_rows(row_idx)
+        invalidate_cache("trips")
+    ws2 = get_ws_cached("shipments")
+    to_del = [i for i, row in enumerate(ws2.get_all_values()[1:], start=2)
+              if s(row[1]) == s(trip_id)]
+    for i in reversed(to_del):
+        try:
+            ws2.delete_rows(i)
+        except Exception:
+            pass
+    invalidate_cache("shipments")
+
+
 # ============================================================
 # CRUD: SHIPMENTS
 # ============================================================
@@ -659,10 +676,6 @@ def toggle_issued(shipment_id, current_value, current_ever):
 
 
 def toggle_paid(shipment_id, current_paid, current_amount, current_advance):
-    """Оплачен / снять оплату.
-    При оплате: paid_amount := advance (запоминаем старый аванс),
-                advance := amount (долг = 0), paid := 1.
-    При снятии: advance := paid_amount (возвращаем), paid_amount := 0, paid := 0."""
     ws = get_ws_cached("shipments")
     row_idx = _find_row_index_by_id("shipments", shipment_id)
     if row_idx is None:
@@ -703,8 +716,6 @@ def delete_shipment(shipment_id):
 # ============================================================
 
 def pay_entire_trip_nds(trip_id, user_login, role):
-    """Оплата всех авто с безналом НДС в рейсе.
-    advance := amount (долг = 0), старый аванс сохраняется в paid_amount."""
     shipments = read_all("shipments", fresh=True)
     cars = [x for x in shipments
             if s(x.get("trip_id")) == s(trip_id)
@@ -752,8 +763,6 @@ def pay_entire_trip_nds(trip_id, user_login, role):
 
 
 def unpay_entire_trip_nds(trip_id, user_login, role):
-    """Снятие оплаты со всех авто с безналом НДС в рейсе.
-    advance := paid_amount (возвращаем прежний), paid_amount := 0, paid := 0."""
     shipments = read_all("shipments", fresh=True)
     cars = [x for x in shipments
             if s(x.get("trip_id")) == s(trip_id)
@@ -790,7 +799,6 @@ def unpay_entire_trip_nds(trip_id, user_login, role):
 
 
 def render_trip_payment_button(trip_id, cars, role, user_login, trip_label=""):
-    """Кнопки 'Оплатить весь рейс' и 'Снять оплату с рейса'."""
     nds_cars = [x for x in cars
                 if s(x.get("payer_type", "")).strip() == NDS_PAYER]
     if not nds_cars:
@@ -883,7 +891,8 @@ def render_trip_payment_button(trip_id, cars, role, user_login, trip_label=""):
 # ============================================================
 
 def log_transfer(shipment_id, from_trip, to_trip,
-                 from_position, to_position, user_login, note=""):
+                 from_position, to_position, user_login, note="",
+                 cancelled=""):
     append_row("transfer_history", {
         "id": new_uuid(),
         "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -894,6 +903,7 @@ def log_transfer(shipment_id, from_trip, to_trip,
         "to_position": s(to_position),
         "user_login": s(user_login),
         "note": s(note),
+        "cancelled": s(cancelled),
     })
 
 
@@ -925,12 +935,148 @@ def transfer_shipment_to_trip(shipment_id, target_trip_id, new_position,
     ]
     ws.batch_update(payload, value_input_option="USER_ENTERED")
 
+    trace = {
+        "id": next_shipment_id(),
+        "trip_id": source_trip_id,
+        "position": source_position,
+        "car_model": "Перенесён: " + s(src.get("car_model", "")),
+        "client": "",
+        "amount": 0,
+        "date_pay": "",
+        "paid_to": "",
+        "delivery_city": s(src.get("delivery_city", "")),
+        "vin": s(src.get("vin", "")),
+        "advance": 0,
+        "advance_date": "",
+        "payer_type": "",
+        "customer": "",
+        "contract_number": "",
+        "nds_amount": 0,
+        "amount_no_nds": 0,
+        "created_by": s(user_login),
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "issued": "0",
+        "issued_ever": "0",
+        "paid": "1",
+        "archived": "0",
+        "paid_amount": 0,
+        "invoice_number": "",
+        "invoice_date": "",
+        "transferred_to_trip": s(target_trip_id),
+        "transferred_at": datetime.now().strftime("%d.%m.%Y"),
+        "transferred_from_trip": s(shipment_id),   # ← ID самого авто
+    }
+    append_row("shipments", trace)
+
     log_transfer(shipment_id, source_trip_id, target_trip_id,
                  source_position, new_position, user_login,
                  note="Перенос авто")
 
     invalidate_cache("shipments")
     return True
+
+
+def update_trace_shipment(trace_id, new_car_model, new_vin, new_delivery_city,
+                          new_position=None):
+    """Редактирует запись-след «Перенесён: …».
+    Позволяет изменить марку, VIN, город доставки, позицию следа."""
+    ws = get_ws_cached("shipments")
+    row_idx = _find_row_index_by_id("shipments", trace_id)
+    if row_idx is None:
+        return False
+    payload = [
+        {"range": "D" + str(row_idx), "values": [[s(new_car_model)]]},
+        {"range": "J" + str(row_idx), "values": [[s(new_vin)]]},
+        {"range": "I" + str(row_idx), "values": [[s(new_delivery_city)]]},
+    ]
+    if new_position is not None:
+        payload.append({"range": "C" + str(row_idx),
+                        "values": [[int(new_position)]]})
+    ws.batch_update(payload, value_input_option="USER_ENTERED")
+    invalidate_cache("shipments")
+    return True
+
+
+def delete_trace_shipment(trace_id):
+    """Удаляет запись-след. Само авто не трогает."""
+    ws = get_ws_cached("shipments")
+    row_idx = _find_row_index_by_id("shipments", trace_id)
+    if row_idx is None:
+        return False
+    ws.delete_rows(row_idx)
+    invalidate_cache("shipments")
+    return True
+
+
+def cancel_transfer(shipment_id, user_login, role, new_position=None):
+    """Отменяет перенос авто.
+    shipment_id — ID самого авто (не следа).
+    Возвращает авто на рейс из transferred_from_trip,
+    удаляет запись-след в исходном рейсе,
+    пишет запись в transfer_history с cancelled=1."""
+    ws = get_ws_cached("shipments")
+    row_idx = _find_row_index_by_id("shipments", shipment_id)
+    if row_idx is None:
+        return False, "Авто не найдено"
+
+    rows = read_all_cached("shipments")
+    src = None
+    for r in rows:
+        if s(r.get("id")) == s(shipment_id):
+            src = r
+            break
+    if src is None:
+        return False, "Авто не найдено"
+
+    source_trip_id = s(src.get("transferred_from_trip", ""))
+    if not source_trip_id:
+        return False, "Нет данных о переносе — отменить нечего"
+
+    current_trip_id = s(src.get("trip_id", ""))
+    current_position = s(src.get("position", ""))
+
+    if new_position is None:
+        siblings = [x for x in rows
+                    if s(x.get("trip_id")) == source_trip_id
+                    and s(x.get("id")) != s(shipment_id)
+                    and not s(x.get("transferred_to_trip", ""))]
+        new_position = next_free_position(siblings) or 1
+
+    payload = [
+        {"range": "B" + str(row_idx), "values": [[source_trip_id]]},
+        {"range": "C" + str(row_idx), "values": [[new_position]]},
+        {"range": "AB" + str(row_idx), "values": [[datetime.now().strftime("%d.%m.%Y")]]},
+        {"range": "AC" + str(row_idx), "values": [[""]]},
+    ]
+    ws.batch_update(payload, value_input_option="USER_ENTERED")
+
+    try:
+        ws2 = get_ws_cached("shipments")
+        all_vals = ws2.get_all_values()
+        to_del = []
+        for i, row in enumerate(all_vals[1:], start=2):
+            if len(row) > 28:
+                car_model = s(row[3]) if len(row) > 3 else ""
+                tr_from = s(row[28]) if len(row) > 28 else ""
+                if car_model.startswith("Перенесён:") and tr_from == s(shipment_id):
+                    to_del.append(i)
+        for i in reversed(to_del):
+            try:
+                ws2.delete_rows(i)
+            except Exception:
+                pass
+    except Exception as e:
+        _log_system_error("cancel_transfer_del_trace", shipment_id, e)
+
+    log_transfer(shipment_id,
+                 current_trip_id, source_trip_id,
+                 current_position, new_position,
+                 user_login,
+                 note="Отмена переноса",
+                 cancelled="1")
+
+    invalidate_cache("shipments")
+    return True, ""
 
 
 def get_shipment_history(shipment_id):
@@ -1055,7 +1201,7 @@ def show_act(trip, shipment):
 
 
 # ============================================================
-# СПИСОК ДЛЯ ВОДИТЕЛЯ (.doc) — с VIN
+# СПИСОК ДЛЯ ВОДИТЕЛЯ (.doc) — VIN + Примечание
 # ============================================================
 
 def render_print_list_doc(rows, title="Список перевозимых автомобилей"):
@@ -1105,7 +1251,9 @@ def render_print_list_doc(rows, title="Список перевозимых ав�
              "font-size: 10pt; }")
     p.append(".debt { width: 110px; text-align: right; font-weight: bold; }")
     p.append(".city { width: 130px; }")
-    p.append(".fio { width: 160px; }")
+    p.append(".fio { width: 150px; }")
+    p.append(".note { width: 170px; font-size: 10pt; color: #444; }")
+    p.append("tr.trace td { background: #f0f0f0; font-style: italic; }")
     p.append(".header-trip { background: #f0f0f0; padding: 6px 8px; "
              "border: 1px solid #333; margin-bottom: 6px; }")
     p.append("</style></head><body>")
@@ -1131,6 +1279,7 @@ def render_print_list_doc(rows, title="Список перевозимых ав�
         p.append('<th class="fio">ФИО</th>')
         p.append('<th class="city">Город доставки</th>')
         p.append('<th class="debt">Задолж., ₽</th>')
+        p.append('<th class="note">Примечание</th>')
         p.append("</tr></thead><tbody>")
 
         total_debt = 0.0
@@ -1138,7 +1287,9 @@ def render_print_list_doc(rows, title="Список перевозимых ав�
             fio = s(r.get("client", "")) or s(r.get("customer", ""))
             debt = to_float(r.get("debt"))
             total_debt += debt
-            p.append("<tr>")
+            note = s(r.get("note", ""))
+            row_class = ' class="trace"' if note else ""
+            p.append("<tr" + row_class + ">")
             p.append('<td class="num">' + s(i) + "</td>")
             p.append('<td class="pos">' + s(r.get("position", "")) + "</td>")
             p.append("<td>" + s(r.get("car_model", "")) + "</td>")
@@ -1147,12 +1298,14 @@ def render_print_list_doc(rows, title="Список перевозимых ав�
             p.append('<td class="fio">' + fio + "</td>")
             p.append('<td class="city">' + s(r.get("delivery_city", "")) + "</td>")
             p.append('<td class="debt">' + fmt_money(debt) + "</td>")
+            p.append('<td class="note">' + note + "</td>")
             p.append("</tr>")
 
         p.append("<tr>")
         p.append('<td colspan="6" style="text-align: right; font-weight: bold;">'
                  "Итого по рейсу:</td>")
         p.append('<td class="debt">' + fmt_money(total_debt) + "</td>")
+        p.append("<td></td>")
         p.append("</tr>")
         p.append("</tbody></table>")
 
@@ -1278,7 +1431,7 @@ def render_shipment_form(form_key, c=None, submit_label="Сохранить ав
 
 
 # ============================================================
-# ШАПКА РЕЙСА
+# ШАПКА РЕЙСА — с подсветкой переносов
 # ============================================================
 
 def render_trip_header(trip_id, tractor, driver, route, dep, ret,
@@ -1286,9 +1439,12 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
                        active_count, issued_count,
                        total, total_advance, total_debt, total_nds,
                        has_nds=False,
-                       trip_invoice_number="", trip_invoice_date=""):
-    if active_count == 0 and issued_count == 0:
+                       trip_invoice_number="", trip_invoice_date="",
+                       has_transfers=False):
+    if active_count == 0 and issued_count == 0 and not has_transfers:
         bg, bd = "#fafafa", "#dddddd"
+    elif has_transfers:
+        bg, bd = "#ffcdd2", "#e53935"
     elif total_debt > 0.01:
         bg, bd = "#ffcdd2", "#e53935"
     else:
@@ -1324,6 +1480,13 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
                         'font-weight:bold; white-space:nowrap; margin-left:6px;">'
                         '📄 Счёт: не выставлен</span>')
 
+    transfers_html = ""
+    if has_transfers:
+        transfers_html = ('<span style="background:#b71c1c; color:#fff; '
+                          'padding:2px 10px; border-radius:12px; font-size:12px; '
+                          'font-weight:bold; white-space:nowrap; margin-left:6px;">'
+                          '↔ есть переносы</span>')
+
     completed_html = ""
     if trip_completed:
         badge_text = "✅ Рейс завершён" + (
@@ -1331,7 +1494,7 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
         completed_html = (
             '<span style="background:#2e7d32; color:#fff; '
             'padding:2px 10px; border-radius:12px; font-size:12px; '
-            'font-weight:bold; white-space:nowrap;">'
+            'font-weight:bold; white-space:nowrap; margin-left:6px;">'
             + badge_text + '</span>')
 
     st.markdown(
@@ -1344,7 +1507,7 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
         '<div style="font-weight:bold; flex:1; min-width:200px;">'
         + title +
         '</div>'
-        '<div>' + completed_html + '</div>'
+        '<div>' + transfers_html + completed_html + '</div>'
         '</div>'
         '<div style="color:#333; margin-top:4px; display:flex; '
         'align-items:center; flex-wrap:wrap;">'
@@ -1560,17 +1723,21 @@ def can(action, role):
                        "create_ship", "edit_ship", "delete_ship",
                        "export", "print_act", "manage_users", "view_log",
                        "archive", "complete_trip", "transfer_ship",
-                       "edit_invoice"},
+                       "cancel_transfer", "edit_invoice", "edit_trace"},
         "director":   {"create_trip", "edit_trip", "delete_trip",
                        "create_ship", "edit_ship", "delete_ship",
                        "export", "print_act", "archive", "complete_trip",
-                       "transfer_ship", "edit_invoice"},
+                       "transfer_ship", "cancel_transfer", "edit_invoice",
+                       "edit_trace"},
         "logist":     {"create_trip", "edit_trip", "create_ship", "edit_ship",
                        "export", "print_act", "archive", "complete_trip",
-                       "transfer_ship", "edit_invoice"},
-        "dispatcher": {"create_trip", "edit_trip", "create_ship", "edit_ship",
+                       "transfer_ship", "cancel_transfer", "edit_invoice",
+                       "edit_trace"},
+        "dispatcher": {"create_trip", "edit_trip", "delete_trip",
+                       "create_ship", "edit_ship", "delete_ship",
                        "export", "print_act", "archive", "complete_trip",
-                       "transfer_ship", "edit_invoice"},
+                       "transfer_ship", "cancel_transfer", "edit_invoice",
+                       "edit_trace"},
     }
     return action in rights.get(role, set())
 
@@ -1608,6 +1775,7 @@ def main_page():
 
     st.title("Учёт рейсов и перевозок")
 
+    # ============ ПЕЧАТЬ ОБЩЕГО СПИСКА ============
     if st.session_state.get("show_print_all"):
         if st.button("Назад к списку", key="btn_back_from_print"):
             st.session_state.pop("show_print_all", None)
@@ -1624,13 +1792,24 @@ def main_page():
             reverse=True,
         )
         all_ships = get_shipments()
+        trip_by_id = {s(t.get("id")): t for t in get_trips()}
         for t in active_trips:
             tid = s(t.get("id"))
             cars = [x for x in all_ships if s(x.get("trip_id")) == tid]
             for x in sorted(cars, key=lambda z: int(to_float(z.get("position")))):
-                if not is_car_active_on_avtovoz(x):
+                if check_issued(s(x.get("issued", "0"))):
                     continue
                 fin = calculate_financials(x)
+                tr_to = s(x.get("transferred_to_trip", ""))
+                note = ""
+                if tr_to:
+                    target_trip = trip_by_id.get(tr_to)
+                    if target_trip:
+                        note = ("Перенесён на: "
+                                + s(target_trip.get("tractor_number", ""))
+                                + " " + s(target_trip.get("route", "")))
+                    else:
+                        note = "Перенесён на рейс #" + tr_to
                 print_rows.append({
                     "tractor": s(t.get("tractor_number", "")),
                     "driver": s(t.get("driver", "")),
@@ -1643,6 +1822,7 @@ def main_page():
                     "customer": s(x.get("customer", "")),
                     "delivery_city": s(x.get("delivery_city", "")),
                     "debt": fin["debt"],
+                    "note": note,
                 })
         if not print_rows:
             st.info("Нет активных авто для печати.")
@@ -1650,6 +1830,7 @@ def main_page():
             show_print_list(print_rows)
         return
 
+    # ============ АКТ ============
     if st.session_state.get("show_act_for"):
         sid = st.session_state["show_act_for"]
         shipments = get_shipments(fresh=True)
@@ -1666,6 +1847,7 @@ def main_page():
                 return
         st.session_state.pop("show_act_for", None)
 
+    # ============ ИСТОРИЯ ============
     if st.session_state.get("show_history_for"):
         sid = st.session_state["show_history_for"]
         shipments = get_shipments(fresh=True)
@@ -1682,16 +1864,22 @@ def main_page():
             st.info("Перемещений не найдено.")
         else:
             for h in hist:
+                cancelled = s(h.get("cancelled", "")) == "1"
+                prefix = "🔴 " if cancelled else ""
+                suffix = "  ❌ отменён" if cancelled else ""
                 st.markdown(
-                    "**" + s(h.get("ts")) + "** — "
+                    prefix + "**" + s(h.get("ts")) + "** — "
                     + "Рейс #" + s(h.get("from_trip"))
                     + " (поз. " + s(h.get("from_position")) + ")  →  "
                     + "Рейс #" + s(h.get("to_trip"))
                     + " (поз. " + s(h.get("to_position")) + ")"
+                    + ("  · " + s(h.get("note")) if h.get("note") else "")
                     + ("  · " + s(h.get("user_login")) if h.get("user_login") else "")
+                    + suffix
                 )
         return
 
+    # ============ ПЕЧАТЬ ОДНОГО РЕЙСА ============
     if st.session_state.get("show_print_trip"):
         rows = st.session_state["show_print_trip"]
         if st.button("Назад к списку", key="btn_back_from_print_trip"):
@@ -1825,6 +2013,8 @@ def main_page():
             issued_count = count_issued_cars(cars)
             free_pos = next_free_position(cars)
 
+            has_transfers = any(s(x.get("transferred_to_trip", "")) for x in cars)
+
             has_nds = any(s(x.get("payer_type", "")).strip() == NDS_PAYER
                           for x in cars)
 
@@ -1834,9 +2024,9 @@ def main_page():
                                total, total_advance, total_debt, total_nds,
                                has_nds=has_nds,
                                trip_invoice_number=trip_inv_num,
-                               trip_invoice_date=trip_inv_date)
+                               trip_invoice_date=trip_inv_date,
+                               has_transfers=has_transfers)
 
-            # Кнопка «Оплатить весь рейс» — в активных и завершённых
             if has_nds and can("edit_ship", role) and view_mode in ("active", "completed"):
                 render_trip_payment_button(trip_id, cars, role, u["login"],
                                            trip_label=tractor + " " + driver)
@@ -1941,16 +2131,54 @@ def main_page():
                                        s(tractor) + " " + s(driver))
                             st.rerun()
 
+                if can("delete_trip", role) and view_mode == "active":
+                    dc1, dc2 = st.columns([5, 1])
+                    with dc2:
+                        if st.button("🗑 Удалить рейс",
+                                     key="btn_show_deltrip_" + s(trip_id),
+                                     use_container_width=True):
+                            st.session_state["open_deltrip_" + s(trip_id)] = True
+
+                if st.session_state.get("open_deltrip_" + s(trip_id)):
+                    st.warning("Удалить рейс «" + s(tractor) + " — " + s(driver)
+                               + "» вместе со всеми авто? Действие необратимо.")
+                    cc1, cc2 = st.columns(2)
+                    if cc1.button("Да, удалить",
+                                  key="btn_yes_del_trip_" + s(trip_id),
+                                  use_container_width=True):
+                        delete_trip(trip_id)
+                        log_action(u["login"], role, "delete_trip",
+                                   s(tractor) + " " + s(driver))
+                        st.session_state.pop("open_deltrip_" + s(trip_id), None)
+                        st.success("Рейс удалён")
+                        st.rerun()
+                    if cc2.button("Отмена",
+                                  key="btn_no_del_trip_" + s(trip_id),
+                                  use_container_width=True):
+                        st.session_state.pop("open_deltrip_" + s(trip_id), None)
+                        st.rerun()
+
                 if cars:
                     if st.button("🖨 Печать списка по рейсу",
                                  key="btn_print_trip_" + s(trip_id),
                                  use_container_width=True):
                         rows = []
+                        trip_by_id_local = {s(tt.get("id")): tt for tt in trips}
                         for x in sorted(cars,
                                         key=lambda z: int(to_float(z.get("position")))):
-                            if not is_car_active_on_avtovoz(x):
+                            if check_issued(s(x.get("issued", "0"))):
                                 continue
                             fin = calculate_financials(x)
+                            tr_to_x = s(x.get("transferred_to_trip", ""))
+                            note_x = ""
+                            if tr_to_x:
+                                tgt = trip_by_id_local.get(tr_to_x)
+                                if tgt:
+                                    note_x = ("Перенесён на: "
+                                              + s(tgt.get("tractor_number", ""))
+                                              + " " + s(tgt.get("route", "")))
+                                else:
+                                    note_x = "Перенесён на рейс #" + tr_to_x
                             rows.append({
                                 "tractor": tractor,
                                 "driver": driver,
@@ -1963,6 +2191,7 @@ def main_page():
                                 "customer": s(x.get("customer", "")),
                                 "delivery_city": s(x.get("delivery_city", "")),
                                 "debt": fin["debt"],
+                                "note": note_x,
                             })
                         st.session_state["show_print_trip"] = rows
                         st.rerun()
@@ -2095,6 +2324,8 @@ def main_page():
                         tr_at = s(x.get("transferred_at", ""))
                         tr_from = s(x.get("transferred_from_trip", ""))
                         is_trace = bool(tr_to)
+                        parent_id = tr_from if is_trace else ""
+                        can_cancel_parent = bool(tr_from) and not is_trace
 
                         if is_trace:
                             bg = "#eeeeee"; bd = "#bdbdbd"
@@ -2117,38 +2348,96 @@ def main_page():
                             'font-size:14px; word-wrap:break-word;">',
                             unsafe_allow_html=True)
 
-                        client_display = s(x.get("client", "")) or s(x.get("customer", ""))
-                        st.markdown(
-                            "**Поз. " + s(x.get("position", "")) + "** · "
-                            + s(x.get("car_model", "")) + " · "
-                            + client_display + " · VIN: "
-                            + (s(x.get("vin", ""))[:17] or "—") + "  \n"
-                            "Сумма: **" + fmt_money(amount_val) + "** | "
-                            "Аванс: **" + fmt_money(advance_val) + "** | "
-                            "Задолж.: **" + fmt_money(debt_val) + "**" +
-                            (" | НДС: " + fmt_money(nds_val) if nds_val > 0 else "") +
-                            "  \nСтатус: **" + status_text + "**"
-                        )
-                        details = []
-                        if s(x.get("delivery_city", "")):
-                            details.append("Город: " + s(x.get("delivery_city", "")))
-                        if s(x.get("advance_date", "")):
-                            details.append("Дата аванса: " + date_to_display_safe(x.get("advance_date", "")))
-                        if s(x.get("payer_type", "")):
-                            details.append("Оплата: " + s(x.get("payer_type", "")))
-                        if s(x.get("paid_to", "")):
-                            details.append("Кому: " + s(x.get("paid_to", "")))
-                        if s(x.get("contract_number", "")):
-                            details.append("№ договора: " + s(x.get("contract_number", "")))
-                        if details:
+                        if is_trace:
+                            # ==== КАРТОЧКА СЛЕДА «ПЕРЕНЕСЁН» ====
+                            target_trip = next((tt for tt in trips
+                                                if s(tt.get("id")) == s(tr_to)), None)
+                            target_label = ""
+                            if target_trip:
+                                target_label = (s(target_trip.get("tractor_number", ""))
+                                                + " " + s(target_trip.get("route", "")))
                             st.markdown(
-                                '<div style="font-weight:bold; font-size:14px; '
-                                'margin-top:4px; color:#222; word-wrap:break-word;">'
-                                + " · ".join(details) +
-                                '</div>',
-                                unsafe_allow_html=True,
+                                "**" + s(x.get("car_model", "")) + "**  \n"
+                                "Перенесён на рейс: **" + (target_label or ("#" + tr_to)) + "**"
+                                + ("  \nДата переноса: **" + s(tr_at) + "**" if tr_at else "")
                             )
 
+                            # Кнопки для следа: вернуть, изменить, удалить
+                            if view_mode == "active":
+                                tc1, tc2, tc3 = st.columns(3)
+                                if can("cancel_transfer", role) and parent_id:
+                                    if tc1.button("↩ Вернуть авто в рейс",
+                                                  key="btn_cancel_trace_" + s(x["id"]),
+                                                  use_container_width=True):
+                                        ok_flag, err = cancel_transfer(
+                                            parent_id, u["login"], role
+                                        )
+                                        if ok_flag:
+                                            log_action(u["login"], role, "cancel_transfer",
+                                                       "trace " + s(x["id"])
+                                                       + " → parent " + parent_id)
+                                            st.success("Перенос отменён, авто вернулось")
+                                        else:
+                                            st.error("Не удалось: " + s(err))
+                                        st.rerun()
+                                if can("edit_trace", role):
+                                    if tc2.button("✏ Изменить след",
+                                                  key="btn_edit_trace_" + s(x["id"]),
+                                                  use_container_width=True):
+                                        st.session_state["edit_trace_" + s(x["id"])] = True
+                                if can("delete_ship", role):
+                                    if tc3.button("🗑 Удалить след",
+                                                  key="btn_del_trace_" + s(x["id"]),
+                                                  use_container_width=True):
+                                        delete_trace_shipment(x["id"])
+                                        log_action(u["login"], role, "delete_trace",
+                                                   "trace " + s(x["id"]))
+                                        st.success("След удалён")
+                                        st.rerun()
+                        else:
+                            # ==== ОБЫЧНАЯ КАРТОЧКА АВТО ====
+                            client_display = s(x.get("client", "")) or s(x.get("customer", ""))
+                            st.markdown(
+                                "**Поз. " + s(x.get("position", "")) + "** · "
+                                + s(x.get("car_model", "")) + " · "
+                                + client_display + " · VIN: "
+                                + (s(x.get("vin", ""))[:17] or "—") + "  \n"
+                                "Сумма: **" + fmt_money(amount_val) + "** | "
+                                "Аванс: **" + fmt_money(advance_val) + "** | "
+                                "Задолж.: **" + fmt_money(debt_val) + "**" +
+                                (" | НДС: " + fmt_money(nds_val) if nds_val > 0 else "") +
+                                "  \nСтатус: **" + status_text + "**"
+                            )
+                            if can_cancel_parent:
+                                src_trip = next((tt for tt in trips
+                                                 if s(tt.get("id")) == s(tr_from)), None)
+                                src_label = ""
+                                if src_trip:
+                                    src_label = (s(src_trip.get("tractor_number", ""))
+                                                 + " " + s(src_trip.get("route", "")))
+                                st.info("↩ Авто перенесено с рейса: **"
+                                        + (src_label or ("#" + tr_from)) + "**")
+                            details = []
+                            if s(x.get("delivery_city", "")):
+                                details.append("Город: " + s(x.get("delivery_city", "")))
+                            if s(x.get("advance_date", "")):
+                                details.append("Дата аванса: " + date_to_display_safe(x.get("advance_date", "")))
+                            if s(x.get("payer_type", "")):
+                                details.append("Оплата: " + s(x.get("payer_type", "")))
+                            if s(x.get("paid_to", "")):
+                                details.append("Кому: " + s(x.get("paid_to", "")))
+                            if s(x.get("contract_number", "")):
+                                details.append("№ договора: " + s(x.get("contract_number", "")))
+                            if details:
+                                st.markdown(
+                                    '<div style="font-weight:bold; font-size:14px; '
+                                    'margin-top:4px; color:#222; word-wrap:break-word;">'
+                                    + " · ".join(details) +
+                                    '</div>',
+                                    unsafe_allow_html=True,
+                                )
+
+                        # Кнопки управления обычной карточкой
                         if view_mode == "active" and not is_trace:
                             bc1, bc2, bc3, bc4 = st.columns(4)
                             paid_label = "❌ Снять" if is_paid_flag else "✅ Оплачен"
@@ -2183,26 +2472,31 @@ def main_page():
                                           use_container_width=True):
                                 st.session_state["edit_ship_" + s(x["id"])] = True
 
-                            tc1, tc2, tc3 = st.columns(3)
+                            tc1, tc2, tc3, tc4 = st.columns(4)
                             if can("transfer_ship", role):
                                 if tc1.button("📦 Перенести",
                                               key="btn_transfer_" + s(x["id"]),
                                               use_container_width=True):
                                     st.session_state["open_transfer_" + s(x["id"])] = True
-                            if tc2.button("📜 История",
+                            if can("cancel_transfer", role) and can_cancel_parent:
+                                if tc2.button("↩ Отменить перенос",
+                                              key="btn_cancel_transfer_" + s(x["id"]),
+                                              use_container_width=True):
+                                    st.session_state["open_cancel_transfer_" + s(x["id"])] = True
+                            if tc3.button("📜 История",
                                           key="btn_hist_" + s(x["id"]),
                                           use_container_width=True):
                                 st.session_state["show_history_for"] = x["id"]
                                 st.rerun()
                             if can("delete_ship", role):
-                                if tc3.button("🗑 Удалить авто", key="btn_delship_" + s(x["id"]),
+                                if tc4.button("🗑 Удалить авто", key="btn_delship_" + s(x["id"]),
                                               use_container_width=True):
                                     delete_shipment(x["id"])
                                     log_action(u["login"], role, "delete_ship",
                                                "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
                                     st.rerun()
                         elif view_mode == "completed" and not is_trace:
-                            bc1, bc2, bc3, bc4 = st.columns(4)
+                            bc1, bc2, bc3 = st.columns(3)
                             if bc1.button("📄 Акт", key="btn_act_inline_" + s(x["id"]),
                                           use_container_width=True):
                                 st.session_state["show_act_for"] = x["id"]
@@ -2212,9 +2506,45 @@ def main_page():
                                           use_container_width=True):
                                 st.session_state["show_history_for"] = x["id"]
                                 st.rerun()
+                            if can("delete_ship", role):
+                                if bc3.button("🗑 Удалить авто",
+                                              key="btn_delship_" + s(x["id"]),
+                                              use_container_width=True):
+                                    delete_shipment(x["id"])
+                                    log_action(u["login"], role, "delete_ship",
+                                               "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
+                                    st.rerun()
 
                         st.markdown("</div>", unsafe_allow_html=True)
 
+                        # ---- Форма редактирования следа ----
+                        if is_trace and st.session_state.get("edit_trace_" + s(x["id"])):
+                            with st.form("edit_trace_form_" + s(x["id"])):
+                                st.markdown("**Редактировать запись-след**")
+                                t_car = st.text_input("Марка / модель",
+                                                       value=s(x.get("car_model", "")))
+                                t_vin = st.text_input("VIN",
+                                                       value=s(x.get("vin", ""))[:17])
+                                t_city = st.text_input("Город доставки",
+                                                        value=s(x.get("delivery_city", "")))
+                                t_pos = st.number_input("Позиция",
+                                                         min_value=1, max_value=MAX_CARS,
+                                                         value=int(to_float(x.get("position")) or 1),
+                                                         step=1)
+                                t_ok = st.form_submit_button("Сохранить")
+                                t_no = st.form_submit_button("Отмена")
+                            if t_no:
+                                st.session_state.pop("edit_trace_" + s(x["id"]), None)
+                                st.rerun()
+                            if t_ok:
+                                update_trace_shipment(x["id"], t_car, t_vin, t_city, t_pos)
+                                log_action(u["login"], role, "edit_trace",
+                                           "trace " + s(x["id"]))
+                                st.session_state.pop("edit_trace_" + s(x["id"]), None)
+                                st.success("Запись-след обновлена")
+                                st.rerun()
+
+                        # ---- Перенос обычного авто ----
                         if view_mode == "active" and not is_trace and \
                                 st.session_state.get("open_transfer_" + s(x["id"])):
                             other_trips = [tt for tt in trips
@@ -2259,6 +2589,41 @@ def main_page():
                                     st.session_state.pop("open_transfer_" + s(x["id"]), None)
                                     st.success("Авто перенесено")
                                     st.rerun()
+
+                        # ---- Отмена переноса обычного авто ----
+                        if view_mode == "active" and not is_trace and can_cancel_parent and \
+                                st.session_state.get("open_cancel_transfer_" + s(x["id"])):
+                            src_trip = next((tt for tt in trips
+                                             if s(tt.get("id")) == s(tr_from)), None)
+                            src_label = ""
+                            if src_trip:
+                                src_label = (s(src_trip.get("tractor_number", ""))
+                                             + " — " + s(src_trip.get("route", "")))
+                            st.warning(
+                                "Отменить перенос авто обратно на рейс: **"
+                                + (src_label or ("#" + tr_from)) + "**?"
+                            )
+                            cc1, cc2 = st.columns(2)
+                            if cc1.button("↩ Да, вернуть",
+                                          key="ok_cancel_transfer_" + s(x["id"]),
+                                          use_container_width=True):
+                                ok_flag, err = cancel_transfer(
+                                    x["id"], u["login"], role
+                                )
+                                st.session_state.pop("open_cancel_transfer_" + s(x["id"]), None)
+                                if ok_flag:
+                                    log_action(u["login"], role, "cancel_transfer",
+                                               "shipment " + s(x["id"])
+                                               + " ← trip " + s(tr_from))
+                                    st.success("Перенос отменён")
+                                else:
+                                    st.error("Не удалось отменить: " + s(err))
+                                st.rerun()
+                            if cc2.button("Отмена",
+                                          key="no_cancel_transfer_" + s(x["id"]),
+                                          use_container_width=True):
+                                st.session_state.pop("open_cancel_transfer_" + s(x["id"]), None)
+                                st.rerun()
 
                     st.markdown("---")
                     sum_cols = st.columns(4)
@@ -2317,9 +2682,6 @@ def main_page():
                 else:
                     st.info("В этом рейсе ещё нет авто.")
 
-    # ============================================================
-    # ИТОГО
-    # ============================================================
     st.markdown("---")
 
     active_trip_ids = {s(t.get("id")) for t in trips
