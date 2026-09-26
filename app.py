@@ -1,5 +1,5 @@
 # ============================================================
-# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.10.1
+# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.10.2
 # Streamlit + Google Sheets
 # ЧАСТЬ 1/2
 # ============================================================
@@ -475,6 +475,98 @@ def sum_incoming_transfers(cars):
         total_advance += f["advance"]
         total_debt += f["debt"]
     return total_amount, total_advance, total_debt
+
+
+# ---- v2.10.2: раздельные итоги по типам оплаты ----
+
+def _is_nal_or_acquiring(x):
+    """Нал или эквайринг (не безнал с НДС)."""
+    pt = s(x.get("payer_type", "")).strip()
+    return pt in ("нал", "эквайринг")
+
+
+def _is_beznal_nds(x):
+    """Безнал с НДС 22%."""
+    return s(x.get("payer_type", "")).strip() == NDS_PAYER
+
+
+def compute_grand_totals(trips, shipments):
+    """
+    Итоги для блока «Итого (активные, без завершённых)»:
+      - active_trips   — число активных рейсов
+      - active_cars    — активные невыданные авто
+      - total_amount   — общая сумма
+      - total_advance  — общая оплата
+      - debt_nal       — задолженность нал+эквайринг (только активные)
+      - debt_beznal    — задолженность безнал БЕЗ НДС (активные + завершённые
+                         неоплаченные)
+      - nds_beznal     — НДС 22% по безналу (активные + завершённые неоплаченные)
+    """
+    active_trip_ids = {s(t.get("id")) for t in trips
+                       if not is_archived(t.get("archived", "0"))
+                       and not is_deleted(t.get("deleted_at", ""))
+                       and not check_completed(t.get("completed", "0"))}
+
+    completed_trip_ids = {s(t.get("id")) for t in trips
+                          if check_completed(t.get("completed", "0"))
+                          and not is_archived(t.get("archived", "0"))
+                          and not is_deleted(t.get("deleted_at", ""))}
+
+    active_cars = [x for x in shipments
+                   if s(x.get("trip_id")) in active_trip_ids]
+
+    total_amount = 0.0
+    total_advance = 0.0
+    active_cars_count = 0
+    for x in active_cars:
+        if check_issued(s(x.get("issued", "0"))):
+            continue
+        active_cars_count += 1
+        f = calculate_financials(x)
+        total_amount += f["amount"]
+        total_advance += f["advance"]
+
+    # нал/эквайринг — только активные невыданные неоплаченные
+    debt_nal = 0.0
+    for x in active_cars:
+        if not _is_nal_or_acquiring(x):
+            continue
+        if check_issued(s(x.get("issued", "0"))):
+            continue
+        if check_paid(s(x.get("paid", "0"))):
+            continue
+        f = calculate_financials(x)
+        if f["debt"] > 0.01:
+            debt_nal += f["debt"]
+
+    # безнал — активные + завершённые, неоплаченные
+    beznal_trip_ids = active_trip_ids | completed_trip_ids
+    debt_beznal = 0.0
+    nds_beznal = 0.0
+    for x in shipments:
+        if s(x.get("trip_id")) not in beznal_trip_ids:
+            continue
+        if not _is_beznal_nds(x):
+            continue
+        if check_paid(s(x.get("paid", "0"))):
+            continue
+        f = calculate_financials(x)
+        if f["debt"] > 0.01:
+            debt_no_nds = f["debt"] - f["nds"]
+            if debt_no_nds < 0:
+                debt_no_nds = 0.0
+            debt_beznal += debt_no_nds
+            nds_beznal += f["nds"]
+
+    return {
+        "active_trips": len(active_trip_ids),
+        "active_cars": active_cars_count,
+        "total_amount": total_amount,
+        "total_advance": total_advance,
+        "debt_nal": debt_nal,
+        "debt_beznal": debt_beznal,
+        "nds_beznal": nds_beznal,
+    }
 
 
 def next_free_position(cars):
@@ -1302,7 +1394,7 @@ def show_act(trip, shipment):
 
 
 # ============================================================
-# ПЕЧАТЬ СПИСКА — v2.10.1 (убрана «Поз», крупный шрифт)
+# ПЕЧАТЬ СПИСКА — 1 рейс = 1 альбомный лист, крупный шрифт
 # ============================================================
 
 def render_print_list_doc(rows, title="СПИСОК ПЕРЕВОЗИМЫХ АВТОМОБИЛЕЙ"):
@@ -1336,7 +1428,6 @@ def render_print_list_doc(rows, title="СПИСОК ПЕРЕВОЗИМЫХ АВ�
     p.append('<meta charset="utf-8">')
     p.append("<title>" + title + "</title>")
     p.append("<style>")
-    # --- A4 Landscape, узкие поля, крупный шрифт ---
     p.append("@page { size: A4 landscape; margin: 0.6cm 0.7cm 0.6cm 0.7cm; }")
     p.append("html, body { margin: 0; padding: 0; }")
     p.append('body { font-family: "Times New Roman", Times, serif; '
@@ -1345,18 +1436,15 @@ def render_print_list_doc(rows, title="СПИСОК ПЕРЕВОЗИМЫХ АВ�
              "text-transform: uppercase; margin: 0 0 8px 0; "
              "font-weight: bold; }")
 
-    # --- 1 рейс = 1 лист ---
     p.append(".trip-block { page-break-after: always; }")
     p.append(".trip-block:last-child { page-break-after: auto; }")
 
-    # --- Шапка рейса ---
     p.append(".header-trip { "
              "background: #f0f0f0; border: 1px solid #333; "
              "padding: 4px 8px; margin-bottom: 4px; "
              "font-size: 11pt; line-height: 1.25; }")
     p.append(".header-trip b { font-weight: bold; }")
 
-    # --- Таблица ---
     p.append("table { width: 100%; border-collapse: collapse; "
              "table-layout: fixed; }")
     p.append("th, td { border: 1px solid #333; "
@@ -1366,7 +1454,6 @@ def render_print_list_doc(rows, title="СПИСОК ПЕРЕВОЗИМЫХ АВ�
     p.append("th { background: #e0e0e0; font-weight: bold; "
              "text-align: left; padding: 3px 5px; }")
 
-    # --- Ширины колонок (без «Поз») ---
     p.append("col.c-num    { width: 4%; }")
     p.append("col.c-model  { width: 21%; }")
     p.append("col.c-vin    { width: 17%; }")
@@ -3227,9 +3314,6 @@ def main_page():
                     if total_nds > 0:
                         st.markdown("**НДС 22%:** " + fmt_money(total_nds))
 
-                    # Дублирующий список внизу УБРАН — информация о переносе
-                    # показывается под каждой машиной выше.
-
                     for x in sorted(cars, key=lambda z: int(to_float(z.get("position")))):
                         if st.session_state.get("edit_ship_" + s(x["id"])):
                             st.markdown("**Редактировать авто (позиция " + s(x.get("position")) + ")**")
@@ -3279,55 +3363,58 @@ def main_page():
                     st.info("В этом рейсе ещё нет авто.")
 
     # ============================================================
-    # ИТОГИ ПО АКТИВНЫМ
+    # ИТОГИ — v2.10.2 (раздельные задолженности нал/безнал + НДС)
     # ============================================================
     st.markdown("---")
 
-    active_trip_ids = {s(t.get("id")) for t in trips
-                       if not is_archived(t.get("archived", "0"))
-                       and not is_deleted(t.get("deleted_at", ""))
-                       and not check_completed(t.get("completed", "0"))}
-
-    all_active_cars = [x for x in shipments
-                       if s(x.get("trip_id")) in active_trip_ids]
-
-    grand_total = 0.0
-    grand_advance = 0.0
-    grand_debt = 0.0
-    grand_nds = 0.0
-    for x in all_active_cars:
-        if check_issued(s(x.get("issued", "0"))):
-            continue
-        f = calculate_financials(x)
-        grand_total += f["amount"]
-        grand_advance += f["advance"]
-        grand_debt += f["debt"]
-        grand_nds += f["nds"]
+    totals_data = compute_grand_totals(trips, shipments)
 
     spacer, totals = st.columns([1, 2])
     with totals:
+        debt_nal = totals_data["debt_nal"]
+        debt_beznal = totals_data["debt_beznal"]
+        nds_beznal = totals_data["nds_beznal"]
+
         st.markdown(
             '<div style="background:#f5f5f5; border:1px solid #cccccc; '
             'border-radius:8px; padding:14px 18px; font-size:14px;">'
+
             '<div style="font-size:18px; font-weight:bold; margin-bottom:8px;">'
             'Итого (активные, без завершённых)</div>'
+
             '<div style="display:flex; justify-content:space-between; margin:4px 0; flex-wrap:wrap;">'
-            '<span>Активных рейсов:</span><b>' + s(len(active_trip_ids)) + '</b></div>'
+            '<span>Активных рейсов:</span><b>'
+            + s(totals_data["active_trips"]) + '</b></div>'
+
             '<div style="display:flex; justify-content:space-between; margin:4px 0; flex-wrap:wrap;">'
-            '<span>Авто:</span><b>' + s(len(all_active_cars)) + '</b></div>'
+            '<span>Авто:</span><b>'
+            + s(totals_data["active_cars"]) + '</b></div>'
+
             '<div style="display:flex; justify-content:space-between; margin:4px 0; flex-wrap:wrap;">'
-            '<span>Общая сумма:</span><b>' + fmt_money(grand_total) + ' ₽</b></div>'
+            '<span>Общая сумма:</span><b>'
+            + fmt_money(totals_data["total_amount"]) + ' ₽</b></div>'
+
             '<div style="display:flex; justify-content:space-between; margin:4px 0; flex-wrap:wrap;">'
-            '<span>Общая оплата:</span><b>' + fmt_money(grand_advance) + ' ₽</b></div>'
+            '<span>Общая оплата:</span><b>'
+            + fmt_money(totals_data["total_advance"]) + ' ₽</b></div>'
+
             '<div style="display:flex; justify-content:space-between; margin:4px 0; '
             'border-top:1px solid #cccccc; padding-top:6px; flex-wrap:wrap;">'
-            '<span>Общая задолженность:</span>'
-            '<b style="color:' + ("#c62828" if grand_debt > 0.01 else "#2e7d32") + ';">'
-            + fmt_money(grand_debt) + ' ₽</b></div>'
-            + ('<div style="display:flex; justify-content:space-between; margin:4px 0; flex-wrap:wrap;">'
-               '<span>НДС 22%:</span><b>' + fmt_money(grand_nds) + ' ₽</b></div>'
-               if grand_nds > 0 else '')
-            + '</div>',
+            '<span><b>Задолженность нал / эквайринг</b> (активные):</span>'
+            '<b style="color:' + ("#c62828" if debt_nal > 0.01 else "#2e7d32") + ';">'
+            + fmt_money(debt_nal) + ' ₽</b></div>'
+
+            '<div style="display:flex; justify-content:space-between; margin:4px 0; flex-wrap:wrap;">'
+            '<span><b>Задолженность безнал</b> (без НДС, активные + завершённые неоплаченные):</span>'
+            '<b style="color:' + ("#c62828" if debt_beznal > 0.01 else "#2e7d32") + ';">'
+            + fmt_money(debt_beznal) + ' ₽</b></div>'
+
+            '<div style="display:flex; justify-content:space-between; margin:4px 0; flex-wrap:wrap;">'
+            '<span><b>НДС 22%</b> (по безналу):</span>'
+            '<b style="color:' + ("#c62828" if nds_beznal > 0.01 else "#2e7d32") + ';">'
+            + fmt_money(nds_beznal) + ' ₽</b></div>'
+
+            '</div>',
             unsafe_allow_html=True,
         )
 
