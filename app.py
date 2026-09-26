@@ -1,5 +1,5 @@
 # ============================================================
-# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.10.5
+# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.10.6
 # Streamlit + Google Sheets
 # ЧАСТЬ 1/2
 # ============================================================
@@ -1631,7 +1631,7 @@ def render_shipment_form(form_key, c=None, submit_label="Сохранить ав
 
 
 # ============================================================
-# ШАПКА РЕЙСА — возвращает HTML (не рендерит)
+# ШАПКА РЕЙСА — возвращает HTML
 # ============================================================
 
 def render_trip_header(trip_id, tractor, driver, route, dep, ret,
@@ -1766,7 +1766,7 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
 
 
 # ============================================================
-# БЛОК ОПЛАТЫ РЕЙСА (безнал с НДС) — v2.10.5 (принимает container)
+# БЛОК ОПЛАТЫ РЕЙСА (безнал с НДС)
 # ============================================================
 
 def render_trip_payment_button(trip_id, cars, role, user_login,
@@ -2591,7 +2591,7 @@ def main_page():
                                 st.success("Счёт сохранён")
                                 st.rerun()
 
-            # ---- Кнопки управления рейсом (активные / архив / завершённые) ----
+            # ---- Кнопки управления рейсом ----
             if view_mode == "active":
                 bc1, bc2, bc3, bc4 = st.columns([1, 1, 1, 1])
                 if can("create_ship", role):
@@ -2639,7 +2639,6 @@ def main_page():
                         st.success("Рейс возвращён из архива")
                         st.rerun()
             else:
-                # view_mode == "completed"
                 cc1, cc2 = st.columns(2)
                 if can("complete_trip", role):
                     if cc1.button("↩ Вернуть в активные",
@@ -2659,7 +2658,7 @@ def main_page():
                         st.success("Рейс отправлен в архив")
                         st.rerun()
 
-            # ---- Удалить рейс / Опасная зона ----
+            # ---- Удалить рейс ----
             if can("delete_trip", role) and view_mode == "active":
                 dc1, dc2 = st.columns([5, 1])
                 with dc2:
@@ -2786,7 +2785,7 @@ def main_page():
                             st.success("Рейс обновлён")
                             st.rerun()
 
-            # ---- Опасная зона (soft delete) ----
+            # ---- Опасная зона ----
             if role in ("admin", "director") and view_mode == "active":
                 with st.expander("Опасная зона"):
                     st.warning("Рейс будет помечен как удалённый. Данные сохранятся.")
@@ -3405,7 +3404,11 @@ def main_page():
             st.markdown("---")  # разделитель между рейсами
 
     # ============================================================
-    # ИТОГИ — v2.10.5
+    # ИТОГИ — v2.10.6
+    #   - Убрана строка «Общая сумма» (вводит в заблуждение)
+    #   - Остались: Активных рейсов, Авто, Общая оплата,
+    #     Задолженность нал/эквайринг, Задолженность безнал (с НДС),
+    #     НДС 22% (по безналу)
     # ============================================================
     st.markdown("---")
 
@@ -3431,10 +3434,6 @@ def main_page():
             '<div style="display:flex; justify-content:space-between; margin:4px 0; flex-wrap:wrap;">'
             '<span>Авто:</span><b>'
             + s(totals_data["active_cars"]) + '</b></div>'
-
-            '<div style="display:flex; justify-content:space-between; margin:4px 0; flex-wrap:wrap;">'
-            '<span>Общая сумма:</span><b>'
-            + fmt_money(totals_data["total_amount"]) + ' ₽</b></div>'
 
             '<div style="display:flex; justify-content:space-between; margin:4px 0; flex-wrap:wrap;">'
             '<span>Общая оплата:</span><b>'
