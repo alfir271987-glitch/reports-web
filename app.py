@@ -1,5 +1,5 @@
 # ============================================================
-# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.10.3
+# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.10.4
 # Streamlit + Google Sheets
 # ЧАСТЬ 1/2
 # ============================================================
@@ -477,31 +477,16 @@ def sum_incoming_transfers(cars):
     return total_amount, total_advance, total_debt
 
 
-# ---- v2.10.3: раздельные итоги по типам оплаты ----
-
 def _is_nal_or_acquiring(x):
-    """Нал или эквайринг (не безнал с НДС)."""
     pt = s(x.get("payer_type", "")).strip()
     return pt in ("нал", "эквайринг")
 
 
 def _is_beznal_nds(x):
-    """Безнал с НДС 22%."""
     return s(x.get("payer_type", "")).strip() == NDS_PAYER
 
 
 def compute_grand_totals(trips, shipments):
-    """
-    Итоги для блока «Итого»:
-      - active_trips   — число активных рейсов
-      - active_cars    — активные невыданные авто
-      - total_amount   — общая сумма
-      - total_advance  — общая оплата
-      - debt_nal       — задолженность нал+эквайринг (только активные)
-      - debt_beznal    — задолженность безнал С НДС (активные + завершённые
-                         неоплаченные)
-      - nds_beznal     — НДС 22% по безналу (активные + завершённые неоплаченные)
-    """
     active_trip_ids = {s(t.get("id")) for t in trips
                        if not is_archived(t.get("archived", "0"))
                        and not is_deleted(t.get("deleted_at", ""))
@@ -526,7 +511,6 @@ def compute_grand_totals(trips, shipments):
         total_amount += f["amount"]
         total_advance += f["advance"]
 
-    # нал/эквайринг — только активные невыданные неоплаченные
     debt_nal = 0.0
     for x in active_cars:
         if not _is_nal_or_acquiring(x):
@@ -539,7 +523,6 @@ def compute_grand_totals(trips, shipments):
         if f["debt"] > 0.01:
             debt_nal += f["debt"]
 
-    # безнал — активные + завершённые, неоплаченные (С НДС)
     beznal_trip_ids = active_trip_ids | completed_trip_ids
     debt_beznal = 0.0
     nds_beznal = 0.0
@@ -552,7 +535,7 @@ def compute_grand_totals(trips, shipments):
             continue
         f = calculate_financials(x)
         if f["debt"] > 0.01:
-            debt_beznal += f["debt"]      # полный долг С НДС
+            debt_beznal += f["debt"]
             nds_beznal += f["nds"]
 
     return {
@@ -1391,7 +1374,7 @@ def show_act(trip, shipment):
 
 
 # ============================================================
-# ПЕЧАТЬ СПИСКА — 1 рейс = 1 альбомный лист, крупный шрифт
+# ПЕЧАТЬ СПИСКА
 # ============================================================
 
 def render_print_list_doc(rows, title="СПИСОК ПЕРЕВОЗИМЫХ АВТОМОБИЛЕЙ"):
@@ -2619,13 +2602,25 @@ def main_page():
                             st.success("Рейс возвращён из архива")
                             st.rerun()
                 else:
+                    # view_mode == "completed"
+                    # НОВОЕ: доступны и "вернуть в активные" и "в архив"
+                    cc1, cc2 = st.columns(2)
                     if can("complete_trip", role):
-                        if st.button("↩ Вернуть в активные",
-                                     key="btn_uncomplete_c_" + s(trip_id),
-                                     use_container_width=True):
+                        if cc1.button("↩ Вернуть в активные",
+                                      key="btn_uncomplete_c_" + s(trip_id),
+                                      use_container_width=True):
                             uncomplete_trip(trip_id)
                             log_action(u["login"], role, "uncomplete_trip",
                                        s(tractor) + " " + s(driver))
+                            st.rerun()
+                    if can("archive", role):
+                        if cc2.button("📦 В архив",
+                                      key="btn_arch_c_" + s(trip_id),
+                                      use_container_width=True):
+                            archive_trip(trip_id)
+                            log_action(u["login"], role, "archive_trip",
+                                       s(tractor) + " " + s(driver) + " (из завершённых)")
+                            st.success("Рейс отправлен в архив")
                             st.rerun()
 
                 if can("delete_trip", role) and view_mode == "active":
@@ -3360,11 +3355,7 @@ def main_page():
                     st.info("В этом рейсе ещё нет авто.")
 
     # ============================================================
-    # ИТОГИ — v2.10.3
-    #   - Заголовок «Итого»
-    #   - Задолженность нал/эквайринг (активные)
-    #   - Задолженность безнал С НДС (активные + завершённые неоплаченные)
-    #   - НДС 22% по безналу
+    # ИТОГИ
     # ============================================================
     st.markdown("---")
 
