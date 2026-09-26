@@ -1,5 +1,5 @@
 # ============================================================
-# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.10.0
+# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.10.1
 # Streamlit + Google Sheets
 # ЧАСТЬ 1/2
 # ============================================================
@@ -1302,10 +1302,10 @@ def show_act(trip, shipment):
 
 
 # ============================================================
-# ПЕЧАТЬ СПИСКА — 1 рейс = 1 альбомный лист
+# ПЕЧАТЬ СПИСКА — v2.10.1 (убрана «Поз», крупный шрифт)
 # ============================================================
 
-def render_print_list_doc(rows, title="Список перевозимых автомобилей"):
+def render_print_list_doc(rows, title="СПИСОК ПЕРЕВОЗИМЫХ АВТОМОБИЛЕЙ"):
     groups = []
     cur_key = None
     cur_group = None
@@ -1336,47 +1336,51 @@ def render_print_list_doc(rows, title="Список перевозимых ав�
     p.append('<meta charset="utf-8">')
     p.append("<title>" + title + "</title>")
     p.append("<style>")
-    p.append("@page { size: A4 landscape; margin: 0.7cm 0.8cm 0.7cm 0.8cm; }")
+    # --- A4 Landscape, узкие поля, крупный шрифт ---
+    p.append("@page { size: A4 landscape; margin: 0.6cm 0.7cm 0.6cm 0.7cm; }")
     p.append("html, body { margin: 0; padding: 0; }")
     p.append('body { font-family: "Times New Roman", Times, serif; '
-             'font-size: 9pt; line-height: 1.15; color: #000; }')
-    p.append("h1 { text-align: center; font-size: 12pt; "
-             "text-transform: uppercase; margin: 0 0 6px 0; "
+             'font-size: 11pt; line-height: 1.2; color: #000; }')
+    p.append("h1 { text-align: center; font-size: 14pt; "
+             "text-transform: uppercase; margin: 0 0 8px 0; "
              "font-weight: bold; }")
 
+    # --- 1 рейс = 1 лист ---
     p.append(".trip-block { page-break-after: always; }")
     p.append(".trip-block:last-child { page-break-after: auto; }")
 
+    # --- Шапка рейса ---
     p.append(".header-trip { "
              "background: #f0f0f0; border: 1px solid #333; "
-             "padding: 3px 6px; margin-bottom: 3px; "
-             "font-size: 9.5pt; line-height: 1.2; }")
+             "padding: 4px 8px; margin-bottom: 4px; "
+             "font-size: 11pt; line-height: 1.25; }")
     p.append(".header-trip b { font-weight: bold; }")
 
+    # --- Таблица ---
     p.append("table { width: 100%; border-collapse: collapse; "
              "table-layout: fixed; }")
     p.append("th, td { border: 1px solid #333; "
-             "padding: 2px 4px; vertical-align: top; "
-             "font-size: 9pt; line-height: 1.15; "
+             "padding: 3px 5px; vertical-align: top; "
+             "font-size: 11pt; line-height: 1.2; "
              "overflow: hidden; }")
     p.append("th { background: #e0e0e0; font-weight: bold; "
-             "text-align: left; padding: 2px 4px; }")
+             "text-align: left; padding: 3px 5px; }")
 
-    p.append("col.c-num    { width: 3%; }")
-    p.append("col.c-pos    { width: 4%; }")
-    p.append("col.c-model  { width: 18%; }")
-    p.append("col.c-vin    { width: 15%; }")
-    p.append("col.c-fio    { width: 14%; }")
-    p.append("col.c-city   { width: 12%; }")
-    p.append("col.c-debt   { width: 11%; }")
-    p.append("col.c-note   { width: 23%; }")
+    # --- Ширины колонок (без «Поз») ---
+    p.append("col.c-num    { width: 4%; }")
+    p.append("col.c-model  { width: 21%; }")
+    p.append("col.c-vin    { width: 17%; }")
+    p.append("col.c-fio    { width: 16%; }")
+    p.append("col.c-city   { width: 13%; }")
+    p.append("col.c-debt   { width: 12%; }")
+    p.append("col.c-note   { width: 17%; }")
 
-    p.append(".num, .pos { text-align: center; }")
+    p.append(".num { text-align: center; }")
     p.append(".debt { text-align: right; font-weight: bold; "
              "white-space: nowrap; }")
     p.append(".vin { font-family: 'Courier New', monospace; "
-             "font-size: 8pt; word-break: break-all; }")
-    p.append(".note { font-size: 8pt; color: #222; }")
+             "font-size: 9.5pt; word-break: break-all; }")
+    p.append(".note { font-size: 10pt; color: #222; }")
     p.append("tr.trace td { background: #f5f5f5; font-style: italic; }")
     p.append("tr.total td { background: #f0f0f0; font-weight: bold; "
              "border-top: 1.5px solid #333; }")
@@ -1397,7 +1401,6 @@ def render_print_list_doc(rows, title="Список перевозимых ав�
         p.append("<table>")
         p.append("<colgroup>")
         p.append('<col class="c-num">')
-        p.append('<col class="c-pos">')
         p.append('<col class="c-model">')
         p.append('<col class="c-vin">')
         p.append('<col class="c-fio">')
@@ -1408,7 +1411,6 @@ def render_print_list_doc(rows, title="Список перевозимых ав�
 
         p.append("<thead><tr>")
         p.append('<th class="num">№</th>')
-        p.append('<th class="pos">Поз</th>')
         p.append("<th>Марка / модель</th>")
         p.append('<th class="vin">VIN</th>')
         p.append("<th>ФИО</th>")
@@ -1426,7 +1428,6 @@ def render_print_list_doc(rows, title="Список перевозимых ав�
             row_class = ' class="trace"' if note else ""
             p.append("<tr" + row_class + ">")
             p.append('<td class="num">' + s(i) + "</td>")
-            p.append('<td class="pos">' + s(r.get("position", "")) + "</td>")
             p.append("<td>" + s(r.get("car_model", "")) + "</td>")
             p.append('<td class="vin">' + (s(r.get("vin", ""))[:17] or "—")
                      + "</td>")
@@ -1437,7 +1438,7 @@ def render_print_list_doc(rows, title="Список перевозимых ав�
             p.append("</tr>")
 
         p.append('<tr class="total">')
-        p.append('<td colspan="6" style="text-align:right;">Итого по рейсу:</td>')
+        p.append('<td colspan="5" style="text-align:right;">Итого по рейсу:</td>')
         p.append('<td class="debt">' + fmt_money(total_debt) + "</td>")
         p.append("<td></td>")
         p.append("</tr>")
@@ -1985,8 +1986,6 @@ def can(action, role):
 def admin_panel():
     admin_role = st.session_state["user"]["role"]
     admin_login = st.session_state["user"]["login"]
-    # Полный доступ у admin и director
-    is_full_admin = (admin_role in ("admin", "director"))
 
     st.header("Админ-панель")
     tab1, tab2, tab3 = st.tabs(
@@ -3228,8 +3227,8 @@ def main_page():
                     if total_nds > 0:
                         st.markdown("**НДС 22%:** " + fmt_money(total_nds))
 
-                    # Дублирующий список внизу УБРАН.
-                    # Информация о переносе показывается под каждой машиной.
+                    # Дублирующий список внизу УБРАН — информация о переносе
+                    # показывается под каждой машиной выше.
 
                     for x in sorted(cars, key=lambda z: int(to_float(z.get("position")))):
                         if st.session_state.get("edit_ship_" + s(x["id"])):
