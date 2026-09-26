@@ -1,5 +1,5 @@
 # ============================================================
-# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.10.2
+# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.10.3
 # Streamlit + Google Sheets
 # ЧАСТЬ 1/2
 # ============================================================
@@ -477,7 +477,7 @@ def sum_incoming_transfers(cars):
     return total_amount, total_advance, total_debt
 
 
-# ---- v2.10.2: раздельные итоги по типам оплаты ----
+# ---- v2.10.3: раздельные итоги по типам оплаты ----
 
 def _is_nal_or_acquiring(x):
     """Нал или эквайринг (не безнал с НДС)."""
@@ -492,13 +492,13 @@ def _is_beznal_nds(x):
 
 def compute_grand_totals(trips, shipments):
     """
-    Итоги для блока «Итого (активные, без завершённых)»:
+    Итоги для блока «Итого»:
       - active_trips   — число активных рейсов
       - active_cars    — активные невыданные авто
       - total_amount   — общая сумма
       - total_advance  — общая оплата
       - debt_nal       — задолженность нал+эквайринг (только активные)
-      - debt_beznal    — задолженность безнал БЕЗ НДС (активные + завершённые
+      - debt_beznal    — задолженность безнал С НДС (активные + завершённые
                          неоплаченные)
       - nds_beznal     — НДС 22% по безналу (активные + завершённые неоплаченные)
     """
@@ -539,7 +539,7 @@ def compute_grand_totals(trips, shipments):
         if f["debt"] > 0.01:
             debt_nal += f["debt"]
 
-    # безнал — активные + завершённые, неоплаченные
+    # безнал — активные + завершённые, неоплаченные (С НДС)
     beznal_trip_ids = active_trip_ids | completed_trip_ids
     debt_beznal = 0.0
     nds_beznal = 0.0
@@ -552,10 +552,7 @@ def compute_grand_totals(trips, shipments):
             continue
         f = calculate_financials(x)
         if f["debt"] > 0.01:
-            debt_no_nds = f["debt"] - f["nds"]
-            if debt_no_nds < 0:
-                debt_no_nds = 0.0
-            debt_beznal += debt_no_nds
+            debt_beznal += f["debt"]      # полный долг С НДС
             nds_beznal += f["nds"]
 
     return {
@@ -3363,7 +3360,11 @@ def main_page():
                     st.info("В этом рейсе ещё нет авто.")
 
     # ============================================================
-    # ИТОГИ — v2.10.2 (раздельные задолженности нал/безнал + НДС)
+    # ИТОГИ — v2.10.3
+    #   - Заголовок «Итого»
+    #   - Задолженность нал/эквайринг (активные)
+    #   - Задолженность безнал С НДС (активные + завершённые неоплаченные)
+    #   - НДС 22% по безналу
     # ============================================================
     st.markdown("---")
 
@@ -3380,7 +3381,7 @@ def main_page():
             'border-radius:8px; padding:14px 18px; font-size:14px;">'
 
             '<div style="font-size:18px; font-weight:bold; margin-bottom:8px;">'
-            'Итого (активные, без завершённых)</div>'
+            'Итого</div>'
 
             '<div style="display:flex; justify-content:space-between; margin:4px 0; flex-wrap:wrap;">'
             '<span>Активных рейсов:</span><b>'
@@ -3405,7 +3406,8 @@ def main_page():
             + fmt_money(debt_nal) + ' ₽</b></div>'
 
             '<div style="display:flex; justify-content:space-between; margin:4px 0; flex-wrap:wrap;">'
-            '<span><b>Задолженность безнал</b> (без НДС, активные + завершённые неоплаченные):</span>'
+            '<span><b>Задолженность безнал (с НДС)</b> '
+            '(активные + завершённые неоплаченные):</span>'
             '<b style="color:' + ("#c62828" if debt_beznal > 0.01 else "#2e7d32") + ';">'
             + fmt_money(debt_beznal) + ' ₽</b></div>'
 
