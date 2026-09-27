@@ -1,5 +1,5 @@
 # ============================================================
-# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.10.6
+# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.10.7
 # Streamlit + Google Sheets
 # ЧАСТЬ 1/2
 # ============================================================
@@ -39,7 +39,9 @@ SHEET_SCHEMAS = {
                   "paid", "archived", "paid_amount",
                   "invoice_number", "invoice_date",
                   "transferred_to_trip", "transferred_at",
-                  "transferred_from_trip"],
+                  "transferred_from_trip",
+                  # ---- v2.10.7: второй аванс ----
+                  "advance_2", "advance_date_2", "paid_to_2"],
     "transfer_history": ["id", "ts", "shipment_id", "from_trip", "to_trip",
                          "from_position", "to_position", "user_login", "note",
                          "cancelled"],
@@ -384,9 +386,24 @@ def next_shipment_id():
 # ФИНАНСЫ И СТАТУСЫ
 # ============================================================
 
+def _adv1(x):
+    return to_float(x.get("advance"))
+
+
+def _adv2(x):
+    return to_float(x.get("advance_2"))
+
+
+def _total_advance(x):
+    """Общая сумма авансов (аванс 1 + аванс 2)."""
+    return _adv1(x) + _adv2(x)
+
+
 def calculate_financials(row):
     amount = to_float(row.get("amount"))
-    advance = to_float(row.get("advance"))
+    adv1 = to_float(row.get("advance"))
+    adv2 = to_float(row.get("advance_2"))
+    advance = adv1 + adv2     # общий аванс
     paid_amount = to_float(row.get("paid_amount"))
     paid_flag = check_paid(row.get("paid", "0"))
     payer_type = s(row.get("payer_type"))
@@ -409,7 +426,9 @@ def calculate_financials(row):
 
     return {
         "amount": amount,
-        "advance": advance,
+        "advance": advance,        # общий аванс
+        "advance_1": adv1,
+        "advance_2": adv2,
         "paid_amount": paid_amount,
         "debt": debt,
         "nds": nds,
@@ -765,14 +784,15 @@ def delete_trip(trip_id):
 
 
 # ============================================================
-# CRUD: АВТОМОБИЛИ
+# CRUD: АВТОМОБИЛИ — v2.10.7 (с двумя авансами)
 # ============================================================
 
 def create_shipment(trip_id, position, car_model, client, amount,
                     date_pay, paid_to, delivery_city, vin,
                     advance, advance_date,
                     payer_type, customer, contract_number,
-                    nds_amount, amount_no_nds, created_by):
+                    nds_amount, amount_no_nds, created_by,
+                    advance_2=0, advance_date_2="", paid_to_2=""):
     append_row("shipments", {
         "id": next_shipment_id(),
         "trip_id": trip_id,
@@ -803,17 +823,30 @@ def create_shipment(trip_id, position, car_model, client, amount,
         "transferred_to_trip": "",
         "transferred_at": "",
         "transferred_from_trip": "",
+        # ---- v2.10.7 ----
+        "advance_2": money_value(advance_2),
+        "advance_date_2": s(advance_date_2),
+        "paid_to_2": s(paid_to_2),
     })
 
 
 def update_shipment(shipment_id, position, car_model, client, amount,
                     date_pay, paid_to, delivery_city, vin, advance, advance_date,
                     payer_type, customer, contract_number,
-                    nds_amount, amount_no_nds):
+                    nds_amount, amount_no_nds,
+                    advance_2=0, advance_date_2="", paid_to_2=""):
     ws = get_ws_cached("shipments")
     row_idx = _find_row_index_by_id("shipments", shipment_id)
     if row_idx is None:
         return False
+    # Важно: адресация по столбцам.
+    # A=id, B=trip_id, C=position, D=car_model, E=client, F=amount, G=date_pay,
+    # H=paid_to, I=delivery_city, J=vin, K=advance, L=advance_date, M=payer_type,
+    # N=customer, O=contract_number, P=nds_amount, Q=amount_no_nds,
+    # R=created_by, S=created_at, T=issued, U=issued_ever, V=paid, W=archived,
+    # X=paid_amount, Y=invoice_number, Z=invoice_date, AA=transferred_to_trip,
+    # AB=transferred_at, AC=transferred_from_trip, AD=advance_2,
+    # AE=advance_date_2, AF=paid_to_2.
     payload = [
         {"range": "C" + str(row_idx), "values": [[position]]},
         {"range": "D" + str(row_idx), "values": [[s(car_model)]]},
@@ -830,6 +863,9 @@ def update_shipment(shipment_id, position, car_model, client, amount,
         {"range": "O" + str(row_idx), "values": [[s(contract_number)]]},
         {"range": "P" + str(row_idx), "values": [[money_value(nds_amount)]]},
         {"range": "Q" + str(row_idx), "values": [[money_value(amount_no_nds)]]},
+        {"range": "AD" + str(row_idx), "values": [[money_value(advance_2)]]},
+        {"range": "AE" + str(row_idx), "values": [[s(advance_date_2)]]},
+        {"range": "AF" + str(row_idx), "values": [[s(paid_to_2)]]},
     ]
     ws.batch_update(payload, value_input_option="USER_ENTERED")
     invalidate_cache("shipments")
@@ -853,6 +889,7 @@ def toggle_issued(shipment_id, current_value, current_ever):
 
 
 def toggle_paid(shipment_id, current_paid, current_amount, current_advance):
+    """current_advance здесь — уже общая сумма (adv1+adv2)."""
     ws = get_ws_cached("shipments")
     row_idx = _find_row_index_by_id("shipments", shipment_id)
     if row_idx is None:
@@ -862,6 +899,7 @@ def toggle_paid(shipment_id, current_paid, current_amount, current_advance):
     advance_val = money_value(current_advance)
 
     if not was_paid:
+        # Включили "Оплачен": paid_amount = текущий общий аванс, amount = amount
         payload = [
             {"range": "X" + str(row_idx), "values": [[advance_val]]},
             {"range": "K" + str(row_idx), "values": [[amount_val]]},
@@ -912,7 +950,7 @@ def pay_entire_trip_nds(trip_id, user_login, role):
 
         was_paid = check_paid(x.get("paid", "0"))
         amount_val = money_value(x.get("amount"))
-        advance_val = money_value(x.get("advance"))
+        advance_val = money_value(_total_advance(x))
         debt_val = amount_val - advance_val
         if debt_val < 0:
             debt_val = 0.0
@@ -1054,6 +1092,10 @@ def transfer_shipment_to_trip(shipment_id, target_trip_id, new_position,
         "transferred_to_trip": s(shipment_id),
         "transferred_at": datetime.now().strftime("%d.%m.%Y"),
         "transferred_from_trip": s(shipment_id),
+        # v2.10.7
+        "advance_2": 0,
+        "advance_date_2": "",
+        "paid_to_2": "",
     }
     append_row("shipments", trace)
 
@@ -1101,8 +1143,8 @@ def reassign_transfer_for_car(car_id, new_target_trip_id, new_position,
     try:
         all_vals = ws.get_all_values()
         for i, row in enumerate(all_vals[1:], start=2):
-            if len(row) < 29:
-                row = row + [""] * (29 - len(row))
+            if len(row) < 32:
+                row = row + [""] * (32 - len(row))
             car_model = s(row[3])
             aa_val = s(row[26]) if len(row) > 26 else ""
             ac_val = s(row[28]) if len(row) > 28 else ""
@@ -1224,8 +1266,8 @@ def cancel_transfer(shipment_id, user_login, role, new_position=None):
         all_vals = ws2.get_all_values()
         to_del = []
         for i, row in enumerate(all_vals[1:], start=2):
-            if len(row) < 29:
-                row = row + [""] * (29 - len(row))
+            if len(row) < 32:
+                row = row + [""] * (32 - len(row))
             car_model = s(row[3]) if len(row) > 3 else ""
             ac_val = s(row[28]) if len(row) > 28 else ""
             aa_val = s(row[26]) if len(row) > 26 else ""
@@ -1533,7 +1575,7 @@ def show_print_list(rows):
 
 
 # ============================================================
-# ФОРМА АВТО
+# ФОРМА АВТО — v2.10.7 (два аванса)
 # ============================================================
 
 def render_shipment_form(form_key, c=None, submit_label="Сохранить авто",
@@ -1544,6 +1586,8 @@ def render_shipment_form(form_key, c=None, submit_label="Сохранить ав
         "delivery_city": "", "amount": "", "date_pay": "", "paid_to": "",
         "advance": "", "advance_date": "", "payer_type": "нал",
         "customer": "", "contract_number": "",
+        # v2.10.7
+        "advance_2": "", "advance_date_2": "", "paid_to_2": "",
     }
     if c:
         try:
@@ -1564,6 +1608,11 @@ def render_shipment_form(form_key, c=None, submit_label="Сохранить ав
         defaults["payer_type"] = s(c.get("payer_type", "нал")) or "нал"
         defaults["customer"] = s(c.get("customer", ""))
         defaults["contract_number"] = s(c.get("contract_number", ""))
+        # v2.10.7
+        av2 = c.get("advance_2", "")
+        defaults["advance_2"] = "" if av2 in ("", None) else "{:.2f}".format(to_float(av2)).replace(".", ",")
+        defaults["advance_date_2"] = date_to_display_safe(c.get("advance_date_2", ""))
+        defaults["paid_to_2"] = s(c.get("paid_to_2", ""))
 
     try:
         payer_index = PAYER_TYPES.index(defaults["payer_type"])
@@ -1602,19 +1651,40 @@ def render_shipment_form(form_key, c=None, submit_label="Сохранить ав
         col9, col10 = st.columns(2)
         date_pay = col9.text_input("Дата оплаты (ДД.ММ.ГГГГ)",
                                     value=defaults["date_pay"], key=form_key + "_dpay")
-        paid_to = col10.text_input("Кому произведён перевод",
-                                    value=defaults["paid_to"], key=form_key + "_paidto")
+        contract_number = col10.text_input("№ договора",
+                                             value=defaults["contract_number"],
+                                             key=form_key + "_contract")
 
-        col11, col12 = st.columns(2)
-        advance = col11.text_input("Аванс (сумма)", value=defaults["advance"],
+        st.markdown("---")
+        st.markdown("### 💰 Аванс № 1")
+
+        colA1, colA2 = st.columns(2)
+        advance = colA1.text_input("Сумма аванса № 1", value=defaults["advance"],
                                     key=form_key + "_adv")
-        advance_date = col12.text_input("Дата аванса (ДД.ММ.ГГГГ)",
+        advance_date = colA2.text_input("Дата аванса № 1 (ДД.ММ.ГГГГ)",
                                          value=defaults["advance_date"],
                                          key=form_key + "_advd")
+        paid_to = st.text_input("Кому передан аванс № 1 (комментарий)",
+                                 value=defaults["paid_to"], key=form_key + "_paidto")
 
-        contract_number = st.text_input("№ договора",
-                                         value=defaults["contract_number"],
-                                         key=form_key + "_contract")
+        st.markdown("### 💰 Аванс № 2")
+        colB1, colB2 = st.columns(2)
+        advance_2 = colB1.text_input("Сумма аванса № 2", value=defaults["advance_2"],
+                                      key=form_key + "_adv2")
+        advance_date_2 = colB2.text_input("Дата аванса № 2 (ДД.ММ.ГГГГ)",
+                                           value=defaults["advance_date_2"],
+                                           key=form_key + "_advd2")
+        paid_to_2 = st.text_input("Кому передан аванс № 2 (комментарий)",
+                                   value=defaults["paid_to_2"], key=form_key + "_paidto2")
+
+        # Показываем общий аванс
+        try:
+            adv1_val = money_value(advance)
+            adv2_val = money_value(advance_2)
+            total_adv_val = adv1_val + adv2_val
+        except Exception:
+            total_adv_val = 0.0
+        st.info("Общий аванс (1 + 2): **" + fmt_money(total_adv_val) + " ₽**")
 
         save = st.form_submit_button(submit_label)
         cancel = st.form_submit_button("Отмена")
@@ -1626,12 +1696,16 @@ def render_shipment_form(form_key, c=None, submit_label="Сохранить ав
         "advance": advance, "advance_date": s(advance_date),
         "payer_type": s(payer_type), "customer": s(customer),
         "contract_number": s(contract_number),
+        # v2.10.7
+        "advance_2": advance_2,
+        "advance_date_2": s(advance_date_2),
+        "paid_to_2": s(paid_to_2),
         "save": save, "cancel": cancel,
     }
 
 
 # ============================================================
-# ШАПКА РЕЙСА — возвращает HTML
+# ШАПКА РЕЙСА
 # ============================================================
 
 def render_trip_header(trip_id, tractor, driver, route, dep, ret,
@@ -2466,7 +2540,7 @@ def main_page():
             for x in cars:
                 f = calculate_financials(x)
                 total += f["amount"]
-                total_advance += f["advance"]
+                total_advance += f["advance"]        # общий аванс
                 total_debt += f["debt"]
                 total_nds += f["nds"]
 
@@ -2528,7 +2602,6 @@ def main_page():
                     st.session_state[open_key] = not is_open
                     st.rerun()
 
-            # Если содержимое свёрнуто — переходим к следующему рейсу
             if not st.session_state.get(open_key, False):
                 continue
 
@@ -2536,7 +2609,6 @@ def main_page():
             # РАСКРЫТОЕ СОДЕРЖИМОЕ РЕЙСА
             # ====================================================
 
-            # ---- Оплата рейса + счёт в одну строку ----
             if has_nds and view_mode in ("active", "completed"):
                 col_pay, col_inv = st.columns([3, 2])
 
@@ -2797,7 +2869,7 @@ def main_page():
                         st.success("Рейс помечен удалённым")
                         st.rerun()
 
-            # ---- Форма добавления авто ----
+            # ---- Форма добавления авто (с двумя авансами) ----
             if view_mode == "active" and st.session_state.get("open_addcar_" + s(trip_id)):
                 f = render_shipment_form("newcar_" + s(trip_id), c=None,
                                          submit_label="Сохранить авто",
@@ -2815,23 +2887,30 @@ def main_page():
                         try:
                             dp = parse_date_ui(f["date_pay"])
                             dpa = parse_date_ui(f["advance_date"])
+                            dpa2 = parse_date_ui(f["advance_date_2"])
                         except ValueError as e:
                             st.error(str(e))
                         else:
                             amt_val = money_value(f["amount"])
-                            adv_val = money_value(f["advance"])
+                            adv1_val = money_value(f["advance"])
+                            adv2_val = money_value(f["advance_2"])
                             if f["payer_type"] == NDS_PAYER:
                                 nds_val = amt_val * NDS_RATE / (1 + NDS_RATE)
                                 no_nds_val = amt_val - nds_val
                             else:
                                 nds_val = 0.0
                                 no_nds_val = amt_val
-                            create_shipment(trip_id, f["position"], f["car_model"],
-                                            f["client"], amt_val, dp, f["paid_to"],
-                                            f["delivery_city"], f["vin"][:17],
-                                            adv_val, dpa, f["payer_type"],
-                                            f["customer"], f["contract_number"],
-                                            nds_val, no_nds_val, u["login"])
+                            create_shipment(
+                                trip_id, f["position"], f["car_model"],
+                                f["client"], amt_val, dp, f["paid_to"],
+                                f["delivery_city"], f["vin"][:17],
+                                adv1_val, dpa, f["payer_type"],
+                                f["customer"], f["contract_number"],
+                                nds_val, no_nds_val, u["login"],
+                                advance_2=adv2_val,
+                                advance_date_2=dpa2,
+                                paid_to_2=f["paid_to_2"],
+                            )
                             log_action(u["login"], role, "create_ship",
                                        "рейс " + s(trip_id) + ", поз " + s(f["position"]))
                             st.session_state.pop("open_addcar_" + s(trip_id), None)
@@ -2845,9 +2924,16 @@ def main_page():
                 for x in sorted(cars, key=lambda z: int(to_float(z.get("position")))):
                     f = calculate_financials(x)
                     amount_val = f["amount"]
-                    advance_val = f["advance"]
+                    advance_val = f["advance"]           # общий аванс
+                    advance_1_val = f["advance_1"]
+                    advance_2_val = f["advance_2"]
                     debt_val = f["debt"]
                     nds_val = f["nds"]
+
+                    adv2_date_val = date_to_display_safe(x.get("advance_date_2", ""))
+                    adv1_date_val = date_to_display_safe(x.get("advance_date", ""))
+                    paid_to_2_val = s(x.get("paid_to_2", ""))
+                    paid_to_1_val = s(x.get("paid_to", ""))
 
                     issued_val = s(x.get("issued", "0")).strip()
                     paid_val = s(x.get("paid", "0")).strip()
@@ -3070,6 +3156,28 @@ def main_page():
                             (" | НДС: " + fmt_money(nds_val) if nds_val > 0 else "") +
                             "  \nСтатус: **" + status_text + "**"
                         )
+
+                        # ---- v2.10.7: разбивка по двум авансам ----
+                        adv_details_html = (
+                            '<div style="background:#fff8e1; '
+                            'border-left:4px solid #ffb300; '
+                            'padding:6px 10px; margin-top:6px; '
+                            'border-radius:4px; font-size:13px; '
+                            'word-wrap:break-word;">'
+                            '<b>Авансы:</b><br>'
+                            'Аванс № 1: <b>' + fmt_money(advance_1_val) + ' ₽</b>'
+                            + (' · Дата: ' + adv1_date_val if adv1_date_val else '')
+                            + (' · ' + paid_to_1_val if paid_to_1_val else '')
+                            + '<br>'
+                            'Аванс № 2: <b>' + fmt_money(advance_2_val) + ' ₽</b>'
+                            + (' · Дата: ' + adv2_date_val if adv2_date_val else '')
+                            + (' · ' + paid_to_2_val if paid_to_2_val else '')
+                            + '<br>'
+                            '<b>Общий аванс: ' + fmt_money(advance_val) + ' ₽</b>'
+                            '</div>'
+                        )
+                        st.markdown(adv_details_html, unsafe_allow_html=True)
+
                         if is_transferred_car(x):
                             st.markdown(
                                 '<div style="background:#ede7f6; '
@@ -3085,12 +3193,8 @@ def main_page():
                         details = []
                         if s(x.get("delivery_city", "")):
                             details.append("Город: " + s(x.get("delivery_city", "")))
-                        if s(x.get("advance_date", "")):
-                            details.append("Дата аванса: " + date_to_display_safe(x.get("advance_date", "")))
                         if s(x.get("payer_type", "")):
                             details.append("Оплата: " + s(x.get("payer_type", "")))
-                        if s(x.get("paid_to", "")):
-                            details.append("Кому: " + s(x.get("paid_to", "")))
                         if s(x.get("contract_number", "")):
                             details.append("№ договора: " + s(x.get("contract_number", "")))
                         if details:
@@ -3107,6 +3211,8 @@ def main_page():
                         paid_label = "❌ Снять оплату" if is_paid_flag else "✅ Оплачен"
                         if bc1.button(paid_label, key="btn_paid_" + s(x["id"]),
                                       use_container_width=True):
+                            # toggle_paid принимает: shipment_id, current_paid,
+                            # current_amount, current_advance (общий)
                             toggle_paid(x["id"], paid_val, amount_val, advance_val)
                             log_action(u["login"], role, "toggle_paid",
                                        "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
@@ -3346,13 +3452,13 @@ def main_page():
                 st.markdown("---")
                 sum_cols = st.columns(4)
                 sum_cols[0].markdown("**Сумма:** " + fmt_money(total))
-                sum_cols[1].markdown("**Аванс:** " + fmt_money(total_advance))
+                sum_cols[1].markdown("**Аванс (общий):** " + fmt_money(total_advance))
                 sum_cols[2].markdown("**Задолженность:** " + fmt_money(total_debt))
                 sum_cols[3].markdown("**Авто:** " + s(total_in_route) + "/" + s(MAX_CARS))
                 if total_nds > 0:
                     st.markdown("**НДС 22%:** " + fmt_money(total_nds))
 
-                # ---- Редактирование авто ----
+                # ---- Редактирование авто (с двумя авансами) ----
                 for x in sorted(cars, key=lambda z: int(to_float(z.get("position")))):
                     if st.session_state.get("edit_ship_" + s(x["id"])):
                         st.markdown("**Редактировать авто (позиция " + s(x.get("position")) + ")**")
@@ -3368,23 +3474,30 @@ def main_page():
                                 try:
                                     e_dp = parse_date_ui(fedit["date_pay"])
                                     e_dpa = parse_date_ui(fedit["advance_date"])
+                                    e_dpa2 = parse_date_ui(fedit["advance_date_2"])
                                 except ValueError as ex:
                                     st.error(str(ex))
                                 else:
                                     amt_val = money_value(fedit["amount"])
-                                    adv_val = money_value(fedit["advance"])
+                                    adv1_val = money_value(fedit["advance"])
+                                    adv2_val = money_value(fedit["advance_2"])
                                     if fedit["payer_type"] == NDS_PAYER:
                                         nds_val = amt_val * NDS_RATE / (1 + NDS_RATE)
                                         no_nds_val = amt_val - nds_val
                                     else:
                                         nds_val = 0.0
                                         no_nds_val = amt_val
-                                    update_shipment(x["id"], fedit["position"], fedit["car_model"],
-                                                    fedit["client"], amt_val, e_dp, fedit["paid_to"],
-                                                    fedit["delivery_city"], fedit["vin"][:17],
-                                                    adv_val, e_dpa, fedit["payer_type"],
-                                                    fedit["customer"], fedit["contract_number"],
-                                                    nds_val, no_nds_val)
+                                    update_shipment(
+                                        x["id"], fedit["position"], fedit["car_model"],
+                                        fedit["client"], amt_val, e_dp, fedit["paid_to"],
+                                        fedit["delivery_city"], fedit["vin"][:17],
+                                        adv1_val, e_dpa, fedit["payer_type"],
+                                        fedit["customer"], fedit["contract_number"],
+                                        nds_val, no_nds_val,
+                                        advance_2=adv2_val,
+                                        advance_date_2=e_dpa2,
+                                        paid_to_2=fedit["paid_to_2"],
+                                    )
                                     log_action(u["login"], role, "edit_ship",
                                                "рейс " + s(trip_id) + ", поз " + s(fedit["position"]))
                                     st.session_state.pop("edit_ship_" + s(x["id"]), None)
@@ -3404,11 +3517,7 @@ def main_page():
             st.markdown("---")  # разделитель между рейсами
 
     # ============================================================
-    # ИТОГИ — v2.10.6
-    #   - Убрана строка «Общая сумма» (вводит в заблуждение)
-    #   - Остались: Активных рейсов, Авто, Общая оплата,
-    #     Задолженность нал/эквайринг, Задолженность безнал (с НДС),
-    #     НДС 22% (по безналу)
+    # ИТОГИ
     # ============================================================
     st.markdown("---")
 
