@@ -1,5 +1,5 @@
 # ============================================================
-# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.10.8
+# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.10.9
 # Streamlit + Google Sheets
 # ЧАСТЬ 1/2
 # ============================================================
@@ -40,7 +40,6 @@ SHEET_SCHEMAS = {
                   "invoice_number", "invoice_date",
                   "transferred_to_trip", "transferred_at",
                   "transferred_from_trip",
-                  # v2.10.7: второй аванс
                   "advance_2", "advance_date_2", "paid_to_2"],
     "transfer_history": ["id", "ts", "shipment_id", "from_trip", "to_trip",
                          "from_position", "to_position", "user_login", "note",
@@ -319,7 +318,6 @@ def ensure_sheets_once():
                 except Exception as e:
                     _log_system_error("update_cell_header", name, e)
 
-        # v2.10.7-fix: для shipments жёстко проверим AD/AE/AF
         if name == "shipments":
             try:
                 current2 = ws.row_values(1)
@@ -425,6 +423,31 @@ def _total_advance(x):
     return _adv1(x) + _adv2(x)
 
 
+def is_advance_covers(x):
+    """
+    v2.10.9: общий аванс (adv1 + adv2) покрывает сумму перевозки.
+    Возвращает True, если amount > 0 и advance_1 + advance_2 >= amount - 0.01.
+    """
+    amount = to_float(x.get("amount"))
+    if amount <= 0.01:
+        return False
+    total_adv = _total_advance(x)
+    return total_adv >= amount - 0.01
+
+
+def is_effectively_issued(x):
+    """
+    v2.10.9: авто считается выданным, если:
+      - явно стоит флаг issued = 1, ИЛИ
+      - авансы покрывают сумму перевозки (advance + advance_2 >= amount).
+    """
+    if check_issued(s(x.get("issued", "0"))):
+        return True
+    if is_advance_covers(x):
+        return True
+    return False
+
+
 def calculate_financials(row):
     amount = to_float(row.get("amount"))
     adv1 = to_float(row.get("advance"))
@@ -464,7 +487,12 @@ def calculate_financials(row):
 
 
 def is_car_active_on_avtovoz(x):
-    if check_issued(s(x.get("issued", "0"))):
+    """
+    v2.10.9: авто «в пути», если:
+      - не выдано эффективно (нет флага issued=1 и авансы не покрывают сумму),
+      - не помечено как перенесённое.
+    """
+    if is_effectively_issued(x):
         return False
     if s(x.get("transferred_to_trip", "")):
         return False
@@ -476,7 +504,7 @@ def count_active_cars(cars):
 
 
 def count_issued_cars(cars):
-    return sum(1 for x in cars if check_issued(s(x.get("issued", "0"))))
+    return sum(1 for x in cars if is_effectively_issued(x))
 
 
 def is_trace_row(x):
@@ -504,7 +532,7 @@ def count_incoming_on_route(cars):
     return sum(
         1 for x in cars
         if is_transferred_car(x)
-        and not check_issued(s(x.get("issued", "0")))
+        and not is_effectively_issued(x)
     )
 
 
@@ -549,7 +577,7 @@ def compute_grand_totals(trips, shipments):
     total_advance = 0.0
     active_cars_count = 0
     for x in active_cars:
-        if check_issued(s(x.get("issued", "0"))):
+        if is_effectively_issued(x):
             continue
         active_cars_count += 1
         f = calculate_financials(x)
@@ -560,7 +588,7 @@ def compute_grand_totals(trips, shipments):
     for x in active_cars:
         if not _is_nal_or_acquiring(x):
             continue
-        if check_issued(s(x.get("issued", "0"))):
+        if is_effectively_issued(x):
             continue
         if check_paid(s(x.get("paid", "0"))):
             continue
@@ -810,7 +838,7 @@ def delete_trip(trip_id):
 
 
 # ============================================================
-# CRUD: АВТОМОБИЛИ (два аванса)
+# CRUD: АВТОМОБИЛИ
 # ============================================================
 
 def create_shipment(trip_id, position, car_model, client, amount,
@@ -864,6 +892,35 @@ def update_shipment(shipment_id, position, car_model, client, amount,
     row_idx = _find_row_index_by_id("shipments", shipment_id)
     if row_idx is None:
         return False
+
+    # v2.10.9: если общий аванс >= amount, ставим issued = 1
+    # иначе, если issued был выставлен вручную — оставляем как есть.
+    try:
+        amount_val = money_value(amount)
+        adv_total = money_value(advance) + money_value(advance_2)
+        auto_issued = (amount_val > 0.01 and adv_total >= amount_val - 0.01)
+    except Exception:
+        auto_issued = False
+
+    # читаем текущий флаг issued
+    current_issued_val = "0"
+    try:
+        current_rows = read_all_cached("shipments")
+        for r in current_rows:
+            if s(r.get("id")) == s(shipment_id):
+                current_issued_val = s(r.get("issued", "0")).strip() or "0"
+                break
+    except Exception:
+        pass
+
+    new_issued_val = current_issued_val
+    if auto_issued:
+        new_issued_val = "1"
+    elif current_issued_val == "1" and not auto_issued:
+        # если аванс перестал покрывать, но флаг был выставлен вручную —
+        # оставляем как 1 (вручную отмечено)
+        new_issued_val = "1"
+
     payload = [
         {"range": "C" + str(row_idx), "values": [[position]]},
         {"range": "D" + str(row_idx), "values": [[s(car_model)]]},
@@ -880,6 +937,7 @@ def update_shipment(shipment_id, position, car_model, client, amount,
         {"range": "O" + str(row_idx), "values": [[s(contract_number)]]},
         {"range": "P" + str(row_idx), "values": [[money_value(nds_amount)]]},
         {"range": "Q" + str(row_idx), "values": [[money_value(amount_no_nds)]]},
+        {"range": "T" + str(row_idx), "values": [[new_issued_val]]},
         {"range": "AD" + str(row_idx), "values": [[money_value(advance_2)]]},
         {"range": "AE" + str(row_idx), "values": [[s(advance_date_2)]]},
         {"range": "AF" + str(row_idx), "values": [[s(paid_to_2)]]},
@@ -2330,7 +2388,7 @@ def main_page():
             tid = s(t.get("id"))
             cars = [x for x in all_ships if s(x.get("trip_id")) == tid]
             for x in sorted(cars, key=lambda z: int(to_float(z.get("position")))):
-                if check_issued(s(x.get("issued", "0"))):
+                if is_effectively_issued(x):
                     continue
                 fin = calculate_financials(x)
                 tr_to = s(x.get("transferred_to_trip", ""))
@@ -2775,7 +2833,7 @@ def main_page():
                     rows = []
                     for x in sorted(cars,
                                     key=lambda z: int(to_float(z.get("position")))):
-                        if check_issued(s(x.get("issued", "0"))):
+                        if is_effectively_issued(x):
                             continue
                         fin = calculate_financials(x)
                         tr_to_x = s(x.get("transferred_to_trip", ""))
@@ -2920,6 +2978,22 @@ def main_page():
                                 advance_date_2=dpa2,
                                 paid_to_2=f["paid_to_2"],
                             )
+                            # v2.10.9: если авансы покрывают сумму — сразу issued=1
+                            if (amt_val > 0.01
+                                    and (adv1_val + adv2_val) >= amt_val - 0.01):
+                                try:
+                                    rows_now = read_all("shipments", fresh=True)
+                                    last_ship = None
+                                    for r in rows_now:
+                                        if (s(r.get("trip_id")) == s(trip_id)
+                                                and s(r.get("position")) == s(f["position"])):
+                                            last_ship = r
+                                    if last_ship is not None:
+                                        toggle_issued(s(last_ship.get("id")),
+                                                      "0", "0")
+                                except Exception as e_iss:
+                                    _log_system_error("auto_issue_on_create",
+                                                      s(trip_id), e_iss)
                             log_action(u["login"], role, "create_ship",
                                        "рейс " + s(trip_id) + ", поз " + s(f["position"]))
                             st.session_state.pop("open_addcar_" + s(trip_id), None)
@@ -2947,7 +3021,10 @@ def main_page():
                     issued_val = s(x.get("issued", "0")).strip()
                     paid_val = s(x.get("paid", "0")).strip()
                     is_paid_flag = check_paid(paid_val)
-                    is_issued_flag = check_issued(issued_val)
+
+                    # v2.10.9: фактическая выдача — либо флаг, либо авансы покрывают сумму
+                    auto_issued = is_advance_covers(x)
+                    is_issued_flag = is_effectively_issued(x)
                     has_debt = debt_val > 0.01
 
                     tr_to = s(x.get("transferred_to_trip", ""))
@@ -2967,19 +3044,20 @@ def main_page():
                         target_trip_label = resolve_target_trip_label(
                             tr_to, trips, transfer_history)
 
-                    advance_covers = (amount_val > 0.01
-                                      and advance_val >= amount_val - 0.01)
-
+                    # ---- Статус / цвет ----
                     if is_trace:
                         bg = "#eeeeee"; bd = "#bdbdbd"
                         status_text = "⚪ Перенесён"
+                    elif not has_debt and is_issued_flag and auto_issued and not check_issued(issued_val):
+                        bg = "#c8e6c9"; bd = "#4caf50"
+                        status_text = "🟢 Выдан (аванс покрыл сумму)"
                     elif not has_debt and is_issued_flag:
                         bg = "#c8e6c9"; bd = "#4caf50"
                         status_text = "🟢 Выдан"
                     elif not has_debt and is_paid_flag:
                         bg = "#c8e6c9"; bd = "#4caf50"
                         status_text = "🟢 Оплачен"
-                    elif not has_debt and advance_covers:
+                    elif not has_debt and auto_issued:
                         bg = "#c8e6c9"; bd = "#4caf50"
                         status_text = "🟢 Аванс закрыт"
                     elif not has_debt:
@@ -3000,7 +3078,7 @@ def main_page():
                         unsafe_allow_html=True)
 
                     # ==================================================
-                    # TRACE-СТРОКА (перенос из этого рейса)
+                    # TRACE-СТРОКА
                     # ==================================================
                     if is_trace:
                         parent_ship_id = (s(x.get("transferred_to_trip", ""))
@@ -3157,7 +3235,7 @@ def main_page():
                                         st.rerun()
                     else:
                         # ==================================================
-                        # ОБЫЧНОЕ АВТО (карточка в рейсе)
+                        # ОБЫЧНОЕ АВТО
                         # ==================================================
                         client_display = s(x.get("client", "")) or s(x.get("customer", ""))
                         st.markdown(
@@ -3172,7 +3250,6 @@ def main_page():
                             "  \nСтатус: **" + status_text + "**"
                         )
 
-                        # Разбивка по двум авансам
                         adv_details_html = (
                             '<div style="background:#fff8e1; '
                             'border-left:4px solid #ffb300; '
@@ -3189,11 +3266,13 @@ def main_page():
                             + (' · ' + paid_to_2_val if paid_to_2_val else '')
                             + '<br>'
                             '<b>Общий аванс: ' + fmt_money(advance_val) + ' ₽</b>'
-                            '</div>'
+                            + ('  <span style="color:#2e7d32; font-weight:bold;">'
+                               '✓ покрывает сумму</span>'
+                               if auto_issued else '')
+                            + '</div>'
                         )
                         st.markdown(adv_details_html, unsafe_allow_html=True)
 
-                        # Комментарий о переносе — только если авто реально перенесено
                         if is_transferred_car(x):
                             st.markdown(
                                 '<div style="background:#ede7f6; '
@@ -3234,7 +3313,8 @@ def main_page():
                                        "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
                             st.rerun()
 
-                        if is_issued_flag:
+                        # v2.10.9: кнопка "Выдан"/"Снять выдан"
+                        if check_issued(issued_val):
                             if bc2.button("↩ Снять выдан", key="btn_issued_" + s(x["id"]),
                                           use_container_width=True):
                                 toggle_issued(x["id"], issued_val, "0")
@@ -3242,7 +3322,12 @@ def main_page():
                                            "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
                                 st.rerun()
                         else:
-                            if bc2.button("✅ Выдан", key="btn_issued_" + s(x["id"]),
+                            # Если покрыто авансом — помечаем как "Выдан (аванс)" и
+                            # кнопка доступна для ручной отметки
+                            issued_btn_label = "✅ Выдан"
+                            if auto_issued:
+                                issued_btn_label = "✅ Выдан (аванс)"
+                            if bc2.button(issued_btn_label, key="btn_issued_" + s(x["id"]),
                                           use_container_width=True):
                                 toggle_issued(x["id"], issued_val, "0")
                                 log_action(u["login"], role, "toggle_issued",
@@ -3297,7 +3382,7 @@ def main_page():
                             log_action(u["login"], role, "toggle_paid",
                                        "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
                             st.rerun()
-                        if is_issued_flag:
+                        if check_issued(issued_val):
                             if bc2.button("↩ Снять выдан",
                                           key="btn_issued_c_" + s(x["id"]),
                                           use_container_width=True):
@@ -3306,7 +3391,10 @@ def main_page():
                                            "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
                                 st.rerun()
                         else:
-                            if bc2.button("✅ Выдан",
+                            issued_btn_label = "✅ Выдан"
+                            if auto_issued:
+                                issued_btn_label = "✅ Выдан (аванс)"
+                            if bc2.button(issued_btn_label,
                                           key="btn_issued_c_" + s(x["id"]),
                                           use_container_width=True):
                                 toggle_issued(x["id"], issued_val, "0")
