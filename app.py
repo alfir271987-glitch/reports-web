@@ -1,5 +1,5 @@
 # ============================================================
-# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.10.7
+# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.10.8
 # Streamlit + Google Sheets
 # ЧАСТЬ 1/2
 # ============================================================
@@ -40,7 +40,7 @@ SHEET_SCHEMAS = {
                   "invoice_number", "invoice_date",
                   "transferred_to_trip", "transferred_at",
                   "transferred_from_trip",
-                  # ---- v2.10.7: второй аванс ----
+                  # v2.10.7: второй аванс
                   "advance_2", "advance_date_2", "paid_to_2"],
     "transfer_history": ["id", "ts", "shipment_id", "from_trip", "to_trip",
                          "from_position", "to_position", "user_login", "note",
@@ -295,26 +295,52 @@ def ensure_sheets_once():
         if name not in existing:
             ws = book.add_worksheet(title=name, rows=1000, cols=len(headers))
             ws.append_row(headers)
-        else:
-            ws = book.worksheet(name)
+            continue
+
+        ws = book.worksheet(name)
+        try:
+            if ws.col_count < len(headers):
+                ws.add_cols(len(headers) - ws.col_count)
+        except Exception as e:
+            _log_system_error("ensure_cols", name, e)
+
+        try:
+            current = ws.row_values(1)
+        except Exception as e:
+            _log_system_error("row_values", name, e)
+            current = []
+
+        missing = [h for h in headers if h not in current]
+        if missing:
+            start_col = len(current) + 1
+            for idx, h in enumerate(missing):
+                try:
+                    ws.update_cell(1, start_col + idx, h)
+                except Exception as e:
+                    _log_system_error("update_cell_header", name, e)
+
+        # v2.10.7-fix: для shipments жёстко проверим AD/AE/AF
+        if name == "shipments":
             try:
-                if ws.col_count < len(headers):
-                    ws.add_cols(len(headers) - ws.col_count)
+                current2 = ws.row_values(1)
+                required_at = {
+                    "AD": "advance_2",
+                    "AE": "advance_date_2",
+                    "AF": "paid_to_2",
+                }
+                for col_letter, header_name in required_at.items():
+                    idx = 0
+                    for ch in col_letter:
+                        idx = idx * 26 + (ord(ch) - ord('A') + 1)
+                    idx0 = idx - 1
+                    val = current2[idx0] if idx0 < len(current2) else ""
+                    if s(val).strip() != header_name:
+                        try:
+                            ws.update_cell(1, idx, header_name)
+                        except Exception as e:
+                            _log_system_error("fix_v2107_col_" + col_letter, name, e)
             except Exception as e:
-                _log_system_error("ensure_cols", name, e)
-            try:
-                current = ws.row_values(1)
-            except Exception as e:
-                _log_system_error("row_values", name, e)
-                current = []
-            missing = [h for h in headers if h not in current]
-            if missing:
-                start_col = len(current) + 1
-                for idx, h in enumerate(missing):
-                    try:
-                        ws.update_cell(1, start_col + idx, h)
-                    except Exception as e:
-                        _log_system_error("update_cell_header", name, e)
+                _log_system_error("ensure_v2107_cols", name, e)
     return True
 
 
@@ -403,7 +429,7 @@ def calculate_financials(row):
     amount = to_float(row.get("amount"))
     adv1 = to_float(row.get("advance"))
     adv2 = to_float(row.get("advance_2"))
-    advance = adv1 + adv2     # общий аванс
+    advance = adv1 + adv2
     paid_amount = to_float(row.get("paid_amount"))
     paid_flag = check_paid(row.get("paid", "0"))
     payer_type = s(row.get("payer_type"))
@@ -426,7 +452,7 @@ def calculate_financials(row):
 
     return {
         "amount": amount,
-        "advance": advance,        # общий аванс
+        "advance": advance,
         "advance_1": adv1,
         "advance_2": adv2,
         "paid_amount": paid_amount,
@@ -784,7 +810,7 @@ def delete_trip(trip_id):
 
 
 # ============================================================
-# CRUD: АВТОМОБИЛИ — v2.10.7 (с двумя авансами)
+# CRUD: АВТОМОБИЛИ (два аванса)
 # ============================================================
 
 def create_shipment(trip_id, position, car_model, client, amount,
@@ -823,7 +849,6 @@ def create_shipment(trip_id, position, car_model, client, amount,
         "transferred_to_trip": "",
         "transferred_at": "",
         "transferred_from_trip": "",
-        # ---- v2.10.7 ----
         "advance_2": money_value(advance_2),
         "advance_date_2": s(advance_date_2),
         "paid_to_2": s(paid_to_2),
@@ -839,14 +864,6 @@ def update_shipment(shipment_id, position, car_model, client, amount,
     row_idx = _find_row_index_by_id("shipments", shipment_id)
     if row_idx is None:
         return False
-    # Важно: адресация по столбцам.
-    # A=id, B=trip_id, C=position, D=car_model, E=client, F=amount, G=date_pay,
-    # H=paid_to, I=delivery_city, J=vin, K=advance, L=advance_date, M=payer_type,
-    # N=customer, O=contract_number, P=nds_amount, Q=amount_no_nds,
-    # R=created_by, S=created_at, T=issued, U=issued_ever, V=paid, W=archived,
-    # X=paid_amount, Y=invoice_number, Z=invoice_date, AA=transferred_to_trip,
-    # AB=transferred_at, AC=transferred_from_trip, AD=advance_2,
-    # AE=advance_date_2, AF=paid_to_2.
     payload = [
         {"range": "C" + str(row_idx), "values": [[position]]},
         {"range": "D" + str(row_idx), "values": [[s(car_model)]]},
@@ -889,7 +906,6 @@ def toggle_issued(shipment_id, current_value, current_ever):
 
 
 def toggle_paid(shipment_id, current_paid, current_amount, current_advance):
-    """current_advance здесь — уже общая сумма (adv1+adv2)."""
     ws = get_ws_cached("shipments")
     row_idx = _find_row_index_by_id("shipments", shipment_id)
     if row_idx is None:
@@ -899,7 +915,6 @@ def toggle_paid(shipment_id, current_paid, current_amount, current_advance):
     advance_val = money_value(current_advance)
 
     if not was_paid:
-        # Включили "Оплачен": paid_amount = текущий общий аванс, amount = amount
         payload = [
             {"range": "X" + str(row_idx), "values": [[advance_val]]},
             {"range": "K" + str(row_idx), "values": [[amount_val]]},
@@ -1092,7 +1107,6 @@ def transfer_shipment_to_trip(shipment_id, target_trip_id, new_position,
         "transferred_to_trip": s(shipment_id),
         "transferred_at": datetime.now().strftime("%d.%m.%Y"),
         "transferred_from_trip": s(shipment_id),
-        # v2.10.7
         "advance_2": 0,
         "advance_date_2": "",
         "paid_to_2": "",
@@ -1575,7 +1589,7 @@ def show_print_list(rows):
 
 
 # ============================================================
-# ФОРМА АВТО — v2.10.7 (два аванса)
+# ФОРМА АВТО — два аванса
 # ============================================================
 
 def render_shipment_form(form_key, c=None, submit_label="Сохранить авто",
@@ -1586,7 +1600,6 @@ def render_shipment_form(form_key, c=None, submit_label="Сохранить ав
         "delivery_city": "", "amount": "", "date_pay": "", "paid_to": "",
         "advance": "", "advance_date": "", "payer_type": "нал",
         "customer": "", "contract_number": "",
-        # v2.10.7
         "advance_2": "", "advance_date_2": "", "paid_to_2": "",
     }
     if c:
@@ -1608,7 +1621,6 @@ def render_shipment_form(form_key, c=None, submit_label="Сохранить ав
         defaults["payer_type"] = s(c.get("payer_type", "нал")) or "нал"
         defaults["customer"] = s(c.get("customer", ""))
         defaults["contract_number"] = s(c.get("contract_number", ""))
-        # v2.10.7
         av2 = c.get("advance_2", "")
         defaults["advance_2"] = "" if av2 in ("", None) else "{:.2f}".format(to_float(av2)).replace(".", ",")
         defaults["advance_date_2"] = date_to_display_safe(c.get("advance_date_2", ""))
@@ -1657,7 +1669,6 @@ def render_shipment_form(form_key, c=None, submit_label="Сохранить ав
 
         st.markdown("---")
         st.markdown("### 💰 Аванс № 1")
-
         colA1, colA2 = st.columns(2)
         advance = colA1.text_input("Сумма аванса № 1", value=defaults["advance"],
                                     key=form_key + "_adv")
@@ -1677,7 +1688,6 @@ def render_shipment_form(form_key, c=None, submit_label="Сохранить ав
         paid_to_2 = st.text_input("Кому передан аванс № 2 (комментарий)",
                                    value=defaults["paid_to_2"], key=form_key + "_paidto2")
 
-        # Показываем общий аванс
         try:
             adv1_val = money_value(advance)
             adv2_val = money_value(advance_2)
@@ -1696,7 +1706,6 @@ def render_shipment_form(form_key, c=None, submit_label="Сохранить ав
         "advance": advance, "advance_date": s(advance_date),
         "payer_type": s(payer_type), "customer": s(customer),
         "contract_number": s(contract_number),
-        # v2.10.7
         "advance_2": advance_2,
         "advance_date_2": s(advance_date_2),
         "paid_to_2": s(paid_to_2),
@@ -2540,7 +2549,7 @@ def main_page():
             for x in cars:
                 f = calculate_financials(x)
                 total += f["amount"]
-                total_advance += f["advance"]        # общий аванс
+                total_advance += f["advance"]
                 total_debt += f["debt"]
                 total_nds += f["nds"]
 
@@ -2569,7 +2578,7 @@ def main_page():
                 if lbl and lbl != "—" and lbl not in incoming_from_labels:
                     incoming_from_labels.append(lbl)
 
-            # ---- Шапка рейса + кнопка «▸ / ▾» в одной строке ----
+            # ---- Шапка рейса + кнопка ▸/▾ ----
             header_html = render_trip_header(
                 trip_id, tractor, driver, route, dep, ret,
                 trip_completed, trip_completed_at,
@@ -2869,7 +2878,7 @@ def main_page():
                         st.success("Рейс помечен удалённым")
                         st.rerun()
 
-            # ---- Форма добавления авто (с двумя авансами) ----
+            # ---- Форма добавления авто ----
             if view_mode == "active" and st.session_state.get("open_addcar_" + s(trip_id)):
                 f = render_shipment_form("newcar_" + s(trip_id), c=None,
                                          submit_label="Сохранить авто",
@@ -2924,7 +2933,7 @@ def main_page():
                 for x in sorted(cars, key=lambda z: int(to_float(z.get("position")))):
                     f = calculate_financials(x)
                     amount_val = f["amount"]
-                    advance_val = f["advance"]           # общий аванс
+                    advance_val = f["advance"]
                     advance_1_val = f["advance_1"]
                     advance_2_val = f["advance_2"]
                     debt_val = f["debt"]
@@ -2990,6 +2999,9 @@ def main_page():
                         'font-size:14px; word-wrap:break-word;">',
                         unsafe_allow_html=True)
 
+                    # ==================================================
+                    # TRACE-СТРОКА (перенос из этого рейса)
+                    # ==================================================
                     if is_trace:
                         parent_ship_id = (s(x.get("transferred_to_trip", ""))
                                           or s(x.get("transferred_from_trip", "")))
@@ -3144,6 +3156,9 @@ def main_page():
                                             st.error("Не удалось: " + s(err))
                                         st.rerun()
                     else:
+                        # ==================================================
+                        # ОБЫЧНОЕ АВТО (карточка в рейсе)
+                        # ==================================================
                         client_display = s(x.get("client", "")) or s(x.get("customer", ""))
                         st.markdown(
                             "**Поз. " + s(x.get("position", "")) + "** · "
@@ -3157,7 +3172,7 @@ def main_page():
                             "  \nСтатус: **" + status_text + "**"
                         )
 
-                        # ---- v2.10.7: разбивка по двум авансам ----
+                        # Разбивка по двум авансам
                         adv_details_html = (
                             '<div style="background:#fff8e1; '
                             'border-left:4px solid #ffb300; '
@@ -3178,6 +3193,7 @@ def main_page():
                         )
                         st.markdown(adv_details_html, unsafe_allow_html=True)
 
+                        # Комментарий о переносе — только если авто реально перенесено
                         if is_transferred_car(x):
                             st.markdown(
                                 '<div style="background:#ede7f6; '
@@ -3190,6 +3206,7 @@ def main_page():
                                 '</div>',
                                 unsafe_allow_html=True,
                             )
+
                         details = []
                         if s(x.get("delivery_city", "")):
                             details.append("Город: " + s(x.get("delivery_city", "")))
@@ -3206,13 +3223,12 @@ def main_page():
                                 unsafe_allow_html=True,
                             )
 
+                    # ---- Кнопки действий для авто (активный рейс) ----
                     if view_mode == "active" and not is_trace:
                         bc1, bc2, bc3, bc4 = st.columns(4)
                         paid_label = "❌ Снять оплату" if is_paid_flag else "✅ Оплачен"
                         if bc1.button(paid_label, key="btn_paid_" + s(x["id"]),
                                       use_container_width=True):
-                            # toggle_paid принимает: shipment_id, current_paid,
-                            # current_amount, current_advance (общий)
                             toggle_paid(x["id"], paid_val, amount_val, advance_val)
                             log_action(u["login"], role, "toggle_paid",
                                        "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
@@ -3458,7 +3474,7 @@ def main_page():
                 if total_nds > 0:
                     st.markdown("**НДС 22%:** " + fmt_money(total_nds))
 
-                # ---- Редактирование авто (с двумя авансами) ----
+                # ---- Редактирование авто ----
                 for x in sorted(cars, key=lambda z: int(to_float(z.get("position")))):
                     if st.session_state.get("edit_ship_" + s(x["id"])):
                         st.markdown("**Редактировать авто (позиция " + s(x.get("position")) + ")**")
