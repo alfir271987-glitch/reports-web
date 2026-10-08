@@ -1,5 +1,5 @@
 # ============================================================
-# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.10.9
+# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.11.0
 # Streamlit + Google Sheets
 # ЧАСТЬ 1/2
 # ============================================================
@@ -28,7 +28,9 @@ SHEET_SCHEMAS = {
     "trips": ["id", "tractor_number", "driver", "route",
               "date_departure", "date_return", "created_by", "created_at",
               "archived", "completed", "completed_at",
-              "invoice_number", "invoice_date", "deleted_at"],
+              "invoice_number", "invoice_date", "deleted_at",
+              # v2.11.0: погрузка от
+              "loading_from"],
     "shipments": ["id", "trip_id", "position", "car_model", "client",
                   "amount", "date_pay", "paid_to",
                   "delivery_city", "vin",
@@ -53,7 +55,7 @@ PAYER_TYPES = ["нал", "эквайринг", "безнал с НДС 22%"]
 NDS_RATE = 0.22
 NDS_PAYER = "безнал с НДС 22%"
 MAX_CARS = 8
-CACHE_TTL = 90
+CACHE_TTL = 300
 LOGIN_MAX_ATTEMPTS = 5
 LOGIN_LOCK_MINUTES = 15
 
@@ -191,7 +193,7 @@ except ImportError:
 
 def hash_password(p):
     if HAS_BCRYPT:
-        return bcrypt.hashpw(p.encode("utf-8"), bcrypt.gensalt(rounds=12)).decode("utf-8")
+        return bcrypt.hashpw(p.encode("utf-8"), bcrypt.gensalt(rounds=10)).decode("utf-8")
     return hashlib.sha256(p.encode("utf-8")).hexdigest()
 
 
@@ -272,7 +274,7 @@ def invalidate_cache(name=None):
         pass
 
 
-@st.cache_data(ttl=30, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def _id_to_row_index(name):
     rows = read_all_cached(name)
     result = {}
@@ -419,15 +421,10 @@ def _adv2(x):
 
 
 def _total_advance(x):
-    """Общая сумма авансов (аванс 1 + аванс 2)."""
     return _adv1(x) + _adv2(x)
 
 
 def is_advance_covers(x):
-    """
-    v2.10.9: общий аванс (adv1 + adv2) покрывает сумму перевозки.
-    Возвращает True, если amount > 0 и advance_1 + advance_2 >= amount - 0.01.
-    """
     amount = to_float(x.get("amount"))
     if amount <= 0.01:
         return False
@@ -436,11 +433,6 @@ def is_advance_covers(x):
 
 
 def is_effectively_issued(x):
-    """
-    v2.10.9: авто считается выданным, если:
-      - явно стоит флаг issued = 1, ИЛИ
-      - авансы покрывают сумму перевозки (advance + advance_2 >= amount).
-    """
     if check_issued(s(x.get("issued", "0"))):
         return True
     if is_advance_covers(x):
@@ -453,6 +445,9 @@ def calculate_financials(row):
     adv1 = to_float(row.get("advance"))
     adv2 = to_float(row.get("advance_2"))
     advance = adv1 + adv2
+    # v2.11.0: аванс не может превышать сумму перевозки
+    if amount > 0.01 and advance > amount:
+        advance = amount
     paid_amount = to_float(row.get("paid_amount"))
     paid_flag = check_paid(row.get("paid", "0"))
     payer_type = s(row.get("payer_type"))
@@ -487,11 +482,6 @@ def calculate_financials(row):
 
 
 def is_car_active_on_avtovoz(x):
-    """
-    v2.10.9: авто «в пути», если:
-      - не выдано эффективно (нет флага issued=1 и авансы не покрывают сумму),
-      - не помечено как перенесённое.
-    """
     if is_effectively_issued(x):
         return False
     if s(x.get("transferred_to_trip", "")):
@@ -645,6 +635,8 @@ def describe_trip(trip):
         parts.append(s(trip.get("tractor_number", "")))
     if s(trip.get("driver", "")):
         parts.append(s(trip.get("driver", "")))
+    if s(trip.get("loading_from", "")):
+        parts.append("погрузка от " + s(trip.get("loading_from", "")))
     if s(trip.get("route", "")):
         parts.append(s(trip.get("route", "")))
     dep = date_to_display_safe(trip.get("date_departure", ""))
@@ -711,10 +703,10 @@ def resolve_source_trip_label_for_car(x, all_trips, transfer_history):
 
 
 # ============================================================
-# CRUD: РЕЙСЫ
+# CRUD: РЕЙСЫ — v2.11.0 (с полем loading_from)
 # ============================================================
 
-def create_trip(tractor, driver, route, dep, ret, created_by):
+def create_trip(tractor, driver, route, dep, ret, created_by, loading_from=""):
     append_row("trips", {
         "id": next_trip_id(),
         "tractor_number": s(tractor), "driver": s(driver), "route": s(route),
@@ -727,20 +719,23 @@ def create_trip(tractor, driver, route, dep, ret, created_by):
         "invoice_number": "",
         "invoice_date": "",
         "deleted_at": "",
+        "loading_from": s(loading_from),
     })
 
 
-def update_trip(trip_id, tractor, driver, route, dep, ret):
+def update_trip(trip_id, tractor, driver, route, dep, ret, loading_from=""):
     ws = get_ws_cached("trips")
     row_idx = _find_row_index_by_id("trips", trip_id)
     if row_idx is None:
         return False
+    # N = 14-я колонка = loading_from
     payload = [
         {"range": "B" + str(row_idx), "values": [[s(tractor)]]},
         {"range": "C" + str(row_idx), "values": [[s(driver)]]},
         {"range": "D" + str(row_idx), "values": [[s(route)]]},
         {"range": "E" + str(row_idx), "values": [[s(dep)]]},
         {"range": "F" + str(row_idx), "values": [[s(ret)]]},
+        {"range": "N" + str(row_idx), "values": [[s(loading_from)]]},
     ]
     ws.batch_update(payload, value_input_option="USER_ENTERED")
     invalidate_cache("trips")
@@ -838,8 +833,51 @@ def delete_trip(trip_id):
 
 
 # ============================================================
-# CRUD: АВТОМОБИЛИ
+# CRUD: АВТОМОБИЛИ (с контролем авансов)
 # ============================================================
+
+def _normalize_advances(amount, adv1, adv2):
+    """
+    v2.11.0: общая сумма авансов не может превышать amount.
+    Если превышает — подрезаем:
+      - сначала обрезаем adv2 до остатка,
+      - если всё ещё много, обрезаем adv1.
+    Возвращает (adv1_new, adv2_new, was_trimmed).
+    """
+    amount = money_value(amount)
+    adv1 = money_value(adv1)
+    adv2 = money_value(adv2)
+    was_trimmed = False
+
+    if amount <= 0.01:
+        # если суммы нет, авансы обнуляем
+        if adv1 > 0 or adv2 > 0:
+            return 0.0, 0.0, True
+        return adv1, adv2, False
+
+    total = adv1 + adv2
+    if total <= amount + 0.01:
+        return adv1, adv2, False
+
+    # сначала урезаем второй аванс
+    if adv2 >= (total - amount) - 0.01:
+        adv2 = max(0.0, adv2 - (total - amount))
+    else:
+        adv2 = 0.0
+        adv1 = max(0.0, amount)
+
+    # финальная проверка
+    total = adv1 + adv2
+    if total > amount:
+        # если adv1 больше — обрезаем его
+        adv1 = max(0.0, amount - adv2)
+        total = adv1 + adv2
+        if total > amount:
+            adv1 = amount
+            adv2 = 0.0
+    was_trimmed = True
+    return money_value(adv1), money_value(adv2), was_trimmed
+
 
 def create_shipment(trip_id, position, car_model, client, amount,
                     date_pay, paid_to, delivery_city, vin,
@@ -847,6 +885,8 @@ def create_shipment(trip_id, position, car_model, client, amount,
                     payer_type, customer, contract_number,
                     nds_amount, amount_no_nds, created_by,
                     advance_2=0, advance_date_2="", paid_to_2=""):
+    adv1_norm, adv2_norm, _ = _normalize_advances(amount, advance, advance_2)
+
     append_row("shipments", {
         "id": next_shipment_id(),
         "trip_id": trip_id,
@@ -858,7 +898,7 @@ def create_shipment(trip_id, position, car_model, client, amount,
         "paid_to": s(paid_to),
         "delivery_city": s(delivery_city),
         "vin": s(vin),
-        "advance": money_value(advance),
+        "advance": adv1_norm,
         "advance_date": s(advance_date),
         "payer_type": s(payer_type),
         "customer": s(customer),
@@ -877,7 +917,7 @@ def create_shipment(trip_id, position, car_model, client, amount,
         "transferred_to_trip": "",
         "transferred_at": "",
         "transferred_from_trip": "",
-        "advance_2": money_value(advance_2),
+        "advance_2": adv2_norm,
         "advance_date_2": s(advance_date_2),
         "paid_to_2": s(paid_to_2),
     })
@@ -893,16 +933,16 @@ def update_shipment(shipment_id, position, car_model, client, amount,
     if row_idx is None:
         return False
 
-    # v2.10.9: если общий аванс >= amount, ставим issued = 1
-    # иначе, если issued был выставлен вручную — оставляем как есть.
+    # v2.11.0: нормализуем авансы — они не могут превышать сумму
+    adv1_norm, adv2_norm, _ = _normalize_advances(amount, advance, advance_2)
+
     try:
         amount_val = money_value(amount)
-        adv_total = money_value(advance) + money_value(advance_2)
+        adv_total = adv1_norm + adv2_norm
         auto_issued = (amount_val > 0.01 and adv_total >= amount_val - 0.01)
     except Exception:
         auto_issued = False
 
-    # читаем текущий флаг issued
     current_issued_val = "0"
     try:
         current_rows = read_all_cached("shipments")
@@ -917,8 +957,6 @@ def update_shipment(shipment_id, position, car_model, client, amount,
     if auto_issued:
         new_issued_val = "1"
     elif current_issued_val == "1" and not auto_issued:
-        # если аванс перестал покрывать, но флаг был выставлен вручную —
-        # оставляем как 1 (вручную отмечено)
         new_issued_val = "1"
 
     payload = [
@@ -930,7 +968,7 @@ def update_shipment(shipment_id, position, car_model, client, amount,
         {"range": "H" + str(row_idx), "values": [[s(paid_to)]]},
         {"range": "I" + str(row_idx), "values": [[s(delivery_city)]]},
         {"range": "J" + str(row_idx), "values": [[s(vin)]]},
-        {"range": "K" + str(row_idx), "values": [[money_value(advance)]]},
+        {"range": "K" + str(row_idx), "values": [[adv1_norm]]},
         {"range": "L" + str(row_idx), "values": [[s(advance_date)]]},
         {"range": "M" + str(row_idx), "values": [[s(payer_type)]]},
         {"range": "N" + str(row_idx), "values": [[s(customer)]]},
@@ -938,7 +976,7 @@ def update_shipment(shipment_id, position, car_model, client, amount,
         {"range": "P" + str(row_idx), "values": [[money_value(nds_amount)]]},
         {"range": "Q" + str(row_idx), "values": [[money_value(amount_no_nds)]]},
         {"range": "T" + str(row_idx), "values": [[new_issued_val]]},
-        {"range": "AD" + str(row_idx), "values": [[money_value(advance_2)]]},
+        {"range": "AD" + str(row_idx), "values": [[adv2_norm]]},
         {"range": "AE" + str(row_idx), "values": [[s(advance_date_2)]]},
         {"range": "AF" + str(row_idx), "values": [[s(paid_to_2)]]},
     ]
@@ -971,6 +1009,9 @@ def toggle_paid(shipment_id, current_paid, current_amount, current_advance):
     was_paid = s(current_paid) == "1"
     amount_val = money_value(current_amount)
     advance_val = money_value(current_advance)
+    # контроль: paid_amount не больше amount
+    if amount_val > 0.01 and advance_val > amount_val:
+        advance_val = amount_val
 
     if not was_paid:
         payload = [
@@ -1024,6 +1065,8 @@ def pay_entire_trip_nds(trip_id, user_login, role):
         was_paid = check_paid(x.get("paid", "0"))
         amount_val = money_value(x.get("amount"))
         advance_val = money_value(_total_advance(x))
+        if amount_val > 0.01 and advance_val > amount_val:
+            advance_val = amount_val
         debt_val = amount_val - advance_val
         if debt_val < 0:
             debt_val = 0.0
@@ -1378,6 +1421,7 @@ def get_shipment_history(shipment_id):
 
 def render_act_html(trip, shipment):
     route = s(trip.get("route", "")) if trip else ""
+    loading_from = s(trip.get("loading_from", "")) if trip else ""
     car_model = s(shipment.get("car_model", ""))
     client = s(shipment.get("client", ""))
     customer = s(shipment.get("customer", ""))
@@ -1411,6 +1455,8 @@ def render_act_html(trip, shipment):
     p.append("<p><b>Марка автомобиля:</b> " + car_model + "</p>")
     p.append("<p><b>VIN:</b> " + (vin if vin else "_" * 20) + "</p>")
     p.append("<p><b>Маршрут:</b> " + route + "</p>")
+    if loading_from:
+        p.append("<p><b>Погрузка от:</b> " + loading_from + "</p>")
     p.append("<p>&nbsp;</p>")
     p.append('<p><b>Груз сдал:</b> <span class="mono">' + LINE_LONG +
              "</span> / Сагитдинов М.Н. /</p>")
@@ -1429,6 +1475,7 @@ def render_act_html(trip, shipment):
 
 def render_act_text(trip, shipment):
     route = s(trip.get("route", "")) if trip else ""
+    loading_from = s(trip.get("loading_from", "")) if trip else ""
     car_model = s(shipment.get("car_model", ""))
     client = s(shipment.get("client", ""))
     customer = s(shipment.get("customer", ""))
@@ -1444,7 +1491,12 @@ def render_act_text(trip, shipment):
         "Заказчик / Получатель: " + receiver,
         "Марка автомобиля: " + car_model,
         "VIN: " + (vin if vin else "_" * 20),
-        "Маршрут: " + route, "", "",
+        "Маршрут: " + route,
+    ]
+    if loading_from:
+        lines.append("Погрузка от: " + loading_from)
+    lines += [
+        "", "",
         "Груз сдал: " + LINE_LONG + " / Сагитдинов М.Н. /",
         "Груз принят: " + LINE_LONG + " / " + receiver + " /", "", "",
         "Дата вручения груза: " + LINE_SHORT + "   Время: " + LINE_SHORT,
@@ -1497,6 +1549,7 @@ def render_print_list_doc(rows, title="СПИСОК ПЕРЕВОЗИМЫХ АВ�
     cur_group = None
     for r in rows:
         key = (s(r.get("tractor")), s(r.get("driver")),
+               s(r.get("loading_from")),
                s(r.get("route")), s(r.get("dep")))
         if key != cur_key:
             if cur_group:
@@ -1505,6 +1558,7 @@ def render_print_list_doc(rows, title="СПИСОК ПЕРЕВОЗИМЫХ АВ�
             cur_group = {
                 "tractor": s(r.get("tractor")),
                 "driver": s(r.get("driver")),
+                "loading_from": s(r.get("loading_from")),
                 "route": s(r.get("route")),
                 "dep": s(r.get("dep")),
                 "cars": [],
@@ -1575,6 +1629,8 @@ def render_print_list_doc(rows, title="СПИСОК ПЕРЕВОЗИМЫХ АВ�
         p.append('<b>Дата выезда:</b> ' + s(g["dep"]))
         p.append(' &nbsp;·&nbsp; <b>Тягач:</b> ' + s(g["tractor"]))
         p.append(' &nbsp;·&nbsp; <b>Водитель:</b> ' + s(g["driver"]))
+        if s(g.get("loading_from", "")):
+            p.append(' &nbsp;·&nbsp; <b>Погрузка от:</b> ' + s(g["loading_from"]))
         if s(g["route"]):
             p.append(' &nbsp;·&nbsp; <b>Маршрут:</b> ' + s(g["route"]))
         p.append("</div>")
@@ -1647,7 +1703,7 @@ def show_print_list(rows):
 
 
 # ============================================================
-# ФОРМА АВТО — два аванса
+# ФОРМА АВТО — v2.11.0 (контроль авансов)
 # ============================================================
 
 def render_shipment_form(form_key, c=None, submit_label="Сохранить авто",
@@ -1746,13 +1802,26 @@ def render_shipment_form(form_key, c=None, submit_label="Сохранить ав
         paid_to_2 = st.text_input("Кому передан аванс № 2 (комментарий)",
                                    value=defaults["paid_to_2"], key=form_key + "_paidto2")
 
+        # v2.11.0: контроль авансов
         try:
+            amount_val_check = money_value(amount)
             adv1_val = money_value(advance)
             adv2_val = money_value(advance_2)
             total_adv_val = adv1_val + adv2_val
         except Exception:
+            amount_val_check = 0.0
+            adv1_val = 0.0
+            adv2_val = 0.0
             total_adv_val = 0.0
-        st.info("Общий аванс (1 + 2): **" + fmt_money(total_adv_val) + " ₽**")
+
+        if amount_val_check > 0.01 and total_adv_val > amount_val_check + 0.01:
+            st.error("⚠️ Общая сумма авансов (" + fmt_money(total_adv_val)
+                     + " ₽) больше суммы перевозки (" + fmt_money(amount_val_check)
+                     + " ₽). При сохранении авансы будут автоматически "
+                     "уменьшены до суммы перевозки.")
+        elif amount_val_check > 0.01:
+            st.info("Общий аванс (1 + 2): **" + fmt_money(total_adv_val)
+                    + " ₽** из **" + fmt_money(amount_val_check) + " ₽**")
 
         save = st.form_submit_button(submit_label)
         cancel = st.form_submit_button("Отмена")
@@ -1772,7 +1841,7 @@ def render_shipment_form(form_key, c=None, submit_label="Сохранить ав
 
 
 # ============================================================
-# ШАПКА РЕЙСА
+# ШАПКА РЕЙСА — v2.11.0 (с «Погрузка от»)
 # ============================================================
 
 def render_trip_header(trip_id, tractor, driver, route, dep, ret,
@@ -1786,7 +1855,8 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
                        incoming_total_amount=0.0,
                        incoming_total_advance=0.0,
                        incoming_total_debt=0.0,
-                       total_in_route=None):
+                       total_in_route=None,
+                       loading_from=""):
     if active_count == 0 and issued_count == 0 and not has_transfers and incoming_count == 0:
         bg, bd = "#fafafa", "#dddddd"
     elif total_debt > 0.01:
@@ -1794,7 +1864,12 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
     else:
         bg, bd = "#c8e6c9", "#43a047"
 
-    title = s(tractor) + " — " + s(driver) + " — " + s(route) + " — выезд " + s(dep)
+    title_parts = [s(tractor), s(driver)]
+    if s(loading_from):
+        title_parts.append("погрузка от " + s(loading_from))
+    title_parts.append(s(route))
+    title_parts.append("выезд " + s(dep))
+    title = " — ".join([p for p in title_parts if p])
     if ret:
         title += " — возврат " + s(ret)
 
@@ -1882,6 +1957,16 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
             '</div>'
         )
 
+    # v2.11.0: подзаголовок «Погрузка от»
+    loading_html = ""
+    if s(loading_from):
+        loading_html = (
+            '<div style="margin-top:4px; font-size:13px; '
+            'color:#0d47a1; font-weight:bold; word-wrap:break-word;">'
+            '📦 Погрузка от: ' + s(loading_from) +
+            '</div>'
+        )
+
     html = (
         '<div style="background-color:' + bg +
         '; border:2px solid ' + bd +
@@ -1894,6 +1979,7 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
         '</div>'
         '<div>' + badges + completed_html + '</div>'
         '</div>'
+        + loading_html +
         '<div style="color:#333; margin-top:4px; display:flex; '
         'align-items:center; flex-wrap:wrap;">'
         '<div>' + stats + '</div>'
@@ -1907,7 +1993,7 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
 
 
 # ============================================================
-# БЛОК ОПЛАТЫ РЕЙСА (безнал с НДС)
+# БЛОК ОПЛАТЫ РЕЙСА
 # ============================================================
 
 def render_trip_payment_button(trip_id, cars, role, user_login,
@@ -2341,7 +2427,6 @@ def main_page():
     if st.sidebar.button("Выйти", key="btn_logout", use_container_width=True):
         logout()
 
-    # Полный доступ к админ-панели для admin и director
     if role in ("admin", "director"):
         with st.sidebar.expander("Админ-панель"):
             admin_panel()
@@ -2405,6 +2490,7 @@ def main_page():
                 print_rows.append({
                     "tractor": s(t.get("tractor_number", "")),
                     "driver": s(t.get("driver", "")),
+                    "loading_from": s(t.get("loading_from", "")),
                     "route": s(t.get("route", "")),
                     "dep": date_to_display_safe(t.get("date_departure", "")),
                     "position": s(x.get("position", "")),
@@ -2558,6 +2644,10 @@ def main_page():
                 c3, c4 = st.columns(2)
                 route = c3.text_input("Маршрут")
                 dep = c4.text_input("Дата выезда (ДД.ММ.ГГГГ)", placeholder="12.05.2026")
+                loading_from = st.text_input(
+                    "Погрузка от (пример: СюрЛогистика)",
+                    placeholder="СюрЛогистика"
+                )
                 ret = st.text_input("Дата возвращения (можно пусто)", placeholder="20.05.2026")
                 ok = st.form_submit_button("Сохранить рейс")
                 cancel = st.form_submit_button("Отмена")
@@ -2574,9 +2664,12 @@ def main_page():
                     except ValueError as e:
                         st.error(str(e))
                     else:
-                        create_trip(tractor, driver, route, dep_fmt, ret_fmt, u["login"])
+                        create_trip(tractor, driver, route, dep_fmt, ret_fmt,
+                                    u["login"], loading_from=loading_from)
                         log_action(u["login"], role, "create_trip",
-                                   s(tractor) + " " + s(driver) + " " + s(dep_fmt))
+                                   s(tractor) + " " + s(driver) + " " + s(dep_fmt)
+                                   + (" | погрузка от " + s(loading_from)
+                                      if s(loading_from) else ""))
                         st.session_state.pop("show_new_trip", None)
                         st.success("Рейс добавлен")
                         st.rerun()
@@ -2593,6 +2686,7 @@ def main_page():
             route = s(t.get("route", ""))
             dep = date_to_display_safe(t.get("date_departure", ""))
             ret = date_to_display_safe(t.get("date_return", ""))
+            loading_from = s(t.get("loading_from", ""))
             trip_completed = check_completed(t.get("completed", "0"))
             trip_completed_at = date_to_display_safe(t.get("completed_at", ""))
             trip_inv_num = s(t.get("invoice_number", ""))
@@ -2653,6 +2747,7 @@ def main_page():
                 incoming_total_advance=incoming_advance,
                 incoming_total_debt=incoming_debt,
                 total_in_route=total_in_route,
+                loading_from=loading_from,
             )
 
             open_key = "open_details_" + s(trip_id)
@@ -2851,6 +2946,7 @@ def main_page():
                         rows.append({
                             "tractor": tractor,
                             "driver": driver,
+                            "loading_from": loading_from,
                             "route": route,
                             "dep": dep,
                             "position": s(x.get("position", "")),
@@ -2890,7 +2986,7 @@ def main_page():
                         st.success("Рейс завершён")
                         st.rerun()
 
-            # ---- Форма редактирования рейса ----
+            # ---- Форма редактирования рейса (с полем «Погрузка от») ----
             if st.session_state.get("open_edittrip_" + s(trip_id)):
                 with st.form("edit_trip_" + s(trip_id)):
                     st.markdown("**Редактировать рейс**")
@@ -2900,6 +2996,11 @@ def main_page():
                     ec3, ec4 = st.columns(2)
                     e_route = ec3.text_input("Маршрут", value=s(route))
                     e_dep = ec4.text_input("Дата выезда (ДД.ММ.ГГГГ)", value=s(dep))
+                    e_loading_from = st.text_input(
+                        "Погрузка от (пример: СюрЛогистика)",
+                        value=s(loading_from),
+                        placeholder="СюрЛогистика"
+                    )
                     e_ret = st.text_input("Дата возвращения (можно пусто)", value=s(ret))
                     e_ok = st.form_submit_button("Сохранить рейс")
                     e_cancel = st.form_submit_button("Отмена")
@@ -2917,9 +3018,12 @@ def main_page():
                             st.error(str(ex))
                         else:
                             update_trip(trip_id, e_tractor, e_driver, e_route,
-                                        e_dep_fmt, e_ret_fmt)
+                                        e_dep_fmt, e_ret_fmt,
+                                        loading_from=e_loading_from)
                             log_action(u["login"], role, "edit_trip",
-                                       s(e_tractor) + " " + s(e_driver) + " " + s(e_dep_fmt))
+                                       s(e_tractor) + " " + s(e_driver) + " " + s(e_dep_fmt)
+                                       + (" | погрузка от " + s(e_loading_from)
+                                          if s(e_loading_from) else ""))
                             st.session_state.pop("open_edittrip_" + s(trip_id), None)
                             st.success("Рейс обновлён")
                             st.rerun()
@@ -2961,6 +3065,15 @@ def main_page():
                             amt_val = money_value(f["amount"])
                             adv1_val = money_value(f["advance"])
                             adv2_val = money_value(f["advance_2"])
+                            # контроль: авансы не превышают сумму
+                            adv1_val, adv2_val, trimmed = _normalize_advances(
+                                amt_val, adv1_val, adv2_val)
+                            if trimmed:
+                                st.warning(
+                                    "Авансы приведены к сумме перевозки: "
+                                    "Аванс № 1 = " + fmt_money(adv1_val)
+                                    + " ₽, Аванс № 2 = " + fmt_money(adv2_val) + " ₽"
+                                )
                             if f["payer_type"] == NDS_PAYER:
                                 nds_val = amt_val * NDS_RATE / (1 + NDS_RATE)
                                 no_nds_val = amt_val - nds_val
@@ -2978,7 +3091,6 @@ def main_page():
                                 advance_date_2=dpa2,
                                 paid_to_2=f["paid_to_2"],
                             )
-                            # v2.10.9: если авансы покрывают сумму — сразу issued=1
                             if (amt_val > 0.01
                                     and (adv1_val + adv2_val) >= amt_val - 0.01):
                                 try:
@@ -3022,7 +3134,6 @@ def main_page():
                     paid_val = s(x.get("paid", "0")).strip()
                     is_paid_flag = check_paid(paid_val)
 
-                    # v2.10.9: фактическая выдача — либо флаг, либо авансы покрывают сумму
                     auto_issued = is_advance_covers(x)
                     is_issued_flag = is_effectively_issued(x)
                     has_debt = debt_val > 0.01
@@ -3077,9 +3188,6 @@ def main_page():
                         'font-size:14px; word-wrap:break-word;">',
                         unsafe_allow_html=True)
 
-                    # ==================================================
-                    # TRACE-СТРОКА
-                    # ==================================================
                     if is_trace:
                         parent_ship_id = (s(x.get("transferred_to_trip", ""))
                                           or s(x.get("transferred_from_trip", "")))
@@ -3234,9 +3342,6 @@ def main_page():
                                             st.error("Не удалось: " + s(err))
                                         st.rerun()
                     else:
-                        # ==================================================
-                        # ОБЫЧНОЕ АВТО
-                        # ==================================================
                         client_display = s(x.get("client", "")) or s(x.get("customer", ""))
                         st.markdown(
                             "**Поз. " + s(x.get("position", "")) + "** · "
@@ -3250,6 +3355,15 @@ def main_page():
                             "  \nСтатус: **" + status_text + "**"
                         )
 
+                        # ---- Блок авансов с проверкой ----
+                        adv_block_warn = ""
+                        if amount_val > 0.01 and advance_val > amount_val + 0.01:
+                            adv_block_warn = (
+                                '<div style="color:#c62828; font-weight:bold; '
+                                'margin-top:4px;">⚠ Превышение: аванс '
+                                + fmt_money(advance_val) + ' ₽ больше суммы '
+                                + fmt_money(amount_val) + ' ₽</div>'
+                            )
                         adv_details_html = (
                             '<div style="background:#fff8e1; '
                             'border-left:4px solid #ffb300; '
@@ -3269,6 +3383,7 @@ def main_page():
                             + ('  <span style="color:#2e7d32; font-weight:bold;">'
                                '✓ покрывает сумму</span>'
                                if auto_issued else '')
+                            + adv_block_warn
                             + '</div>'
                         )
                         st.markdown(adv_details_html, unsafe_allow_html=True)
@@ -3313,7 +3428,6 @@ def main_page():
                                        "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
                             st.rerun()
 
-                        # v2.10.9: кнопка "Выдан"/"Снять выдан"
                         if check_issued(issued_val):
                             if bc2.button("↩ Снять выдан", key="btn_issued_" + s(x["id"]),
                                           use_container_width=True):
@@ -3322,8 +3436,6 @@ def main_page():
                                            "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
                                 st.rerun()
                         else:
-                            # Если покрыто авансом — помечаем как "Выдан (аванс)" и
-                            # кнопка доступна для ручной отметки
                             issued_btn_label = "✅ Выдан"
                             if auto_issued:
                                 issued_btn_label = "✅ Выдан (аванс)"
@@ -3585,6 +3697,14 @@ def main_page():
                                     amt_val = money_value(fedit["amount"])
                                     adv1_val = money_value(fedit["advance"])
                                     adv2_val = money_value(fedit["advance_2"])
+                                    adv1_val, adv2_val, trimmed = _normalize_advances(
+                                        amt_val, adv1_val, adv2_val)
+                                    if trimmed:
+                                        st.warning(
+                                            "Авансы приведены к сумме перевозки: "
+                                            "Аванс № 1 = " + fmt_money(adv1_val)
+                                            + " ₽, Аванс № 2 = " + fmt_money(adv2_val) + " ₽"
+                                        )
                                     if fedit["payer_type"] == NDS_PAYER:
                                         nds_val = amt_val * NDS_RATE / (1 + NDS_RATE)
                                         no_nds_val = amt_val - nds_val
@@ -3618,7 +3738,7 @@ def main_page():
             else:
                 st.info("В этом рейсе ещё нет авто.")
 
-            st.markdown("---")  # разделитель между рейсами
+            st.markdown("---")
 
     # ============================================================
     # ИТОГИ
