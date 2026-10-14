@@ -1,5 +1,5 @@
 # ============================================================
-# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.11.1
+# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.11.2
 # Streamlit + Google Sheets
 # ЧАСТЬ 1/2
 # ============================================================
@@ -28,12 +28,14 @@ SHEET_SCHEMAS = {
     # ВАЖНО: порядок столбцов.
     # A=id, B=tractor_number, C=driver, D=route, E=date_departure, F=date_return,
     # G=created_by, H=created_at, I=archived, J=completed, K=completed_at,
-    # L=invoice_number, M=invoice_date, N=deleted_at, O=loading_from
+    # L=invoice_number, M=invoice_date, N=deleted_at, O=loading_from,
+    # P=payment_date, Q=payment_comment
     "trips": ["id", "tractor_number", "driver", "route",
               "date_departure", "date_return", "created_by", "created_at",
               "archived", "completed", "completed_at",
               "invoice_number", "invoice_date", "deleted_at",
-              "loading_from"],
+              "loading_from",
+              "payment_date", "payment_comment"],
     "shipments": ["id", "trip_id", "position", "car_model", "client",
                   "amount", "date_pay", "paid_to",
                   "delivery_city", "vin",
@@ -150,7 +152,6 @@ def date_sort_key(x):
 
 
 def looks_like_datetime(v):
-    """Проверяет, что строка похожа на дату/время (используется для deleted_at)."""
     t = s(v).strip()
     if not t:
         return False
@@ -188,17 +189,11 @@ def check_completed(v):
 
 
 def is_deleted(v):
-    """
-    v2.11.1: рейс считается удалённым только если в deleted_at
-    лежит похожее на дату значение. Если там случайно лежит текст
-    (например, название погрузки) — считаем НЕ удалённым.
-    """
     t = s(v).strip()
     if not t:
         return False
     if looks_like_datetime(t):
         return True
-    # текст, не похожий на дату — считаем "не удалён"
     return False
 
 
@@ -318,29 +313,17 @@ def _find_row_index_by_id(name, row_id):
 
 
 def _migrate_trips_n_to_o(ws):
-    """
-    v2.11.1: если в столбце N (deleted_at) лежит текст, не похожий на дату,
-    а в столбце O (loading_from) — пусто, переносим данные из N в O и
-    очищаем N. Так восстанавливаем рейсы, которые исчезли из-за старого бага.
-    """
     try:
         all_vals = ws.get_all_values()
         if len(all_vals) < 2:
             return
         updates = []
         for i, row in enumerate(all_vals[1:], start=2):
-            # N = индекс 13 (0-based) -> столбец 14
             n_val = s(row[13]).strip() if len(row) > 13 else ""
-            # O = индекс 14 -> столбец 15
             o_val = s(row[14]).strip() if len(row) > 14 else ""
             if n_val and not looks_like_datetime(n_val) and not o_val:
-                # N содержит текст (погрузку?), O пусто
-                updates.append(
-                    {"range": "O" + str(i), "values": [[n_val]]}
-                )
-                updates.append(
-                    {"range": "N" + str(i), "values": [[""]]}
-                )
+                updates.append({"range": "O" + str(i), "values": [[n_val]]})
+                updates.append({"range": "N" + str(i), "values": [[""]]})
         if updates:
             ws.batch_update(updates, value_input_option="USER_ENTERED")
     except Exception as e:
@@ -378,7 +361,6 @@ def ensure_sheets_once():
                 except Exception as e:
                     _log_system_error("update_cell_header", name, e)
 
-        # v2.11.1: миграция данных из N в O на листе trips
         if name == "trips":
             _migrate_trips_n_to_o(ws)
 
@@ -610,6 +592,14 @@ def _is_beznal_nds(x):
     return s(x.get("payer_type", "")).strip() == NDS_PAYER
 
 
+def is_trip_beznal_nds(trip_id, shipments):
+    """Возвращает True, если в рейсе есть хотя бы одно авто с безналом НДС."""
+    for x in shipments:
+        if s(x.get("trip_id")) == s(trip_id) and _is_beznal_nds(x):
+            return True
+    return False
+
+
 def compute_grand_totals(trips, shipments):
     active_trip_ids = {s(t.get("id")) for t in trips
                        if not is_archived(t.get("archived", "0"))
@@ -764,7 +754,7 @@ def resolve_source_trip_label_for_car(x, all_trips, transfer_history):
 
 
 # ============================================================
-# CRUD: РЕЙСЫ — v2.11.1 (исправлено N→O)
+# CRUD: РЕЙСЫ — v2.11.2 (с payment_date и payment_comment)
 # ============================================================
 
 def create_trip(tractor, driver, route, dep, ret, created_by, loading_from=""):
@@ -781,15 +771,18 @@ def create_trip(tractor, driver, route, dep, ret, created_by, loading_from=""):
         "invoice_date": "",
         "deleted_at": "",
         "loading_from": s(loading_from),
+        "payment_date": "",
+        "payment_comment": "",
     })
 
 
-def update_trip(trip_id, tractor, driver, route, dep, ret, loading_from=""):
+def update_trip(trip_id, tractor, driver, route, dep, ret,
+                loading_from="", payment_date="", payment_comment=""):
     ws = get_ws_cached("trips")
     row_idx = _find_row_index_by_id("trips", trip_id)
     if row_idx is None:
         return False
-    # v2.11.1: O — это loading_from.
+    # O = loading_from, P = payment_date, Q = payment_comment
     # N (deleted_at) НЕ трогаем!
     payload = [
         {"range": "B" + str(row_idx), "values": [[s(tractor)]]},
@@ -798,6 +791,23 @@ def update_trip(trip_id, tractor, driver, route, dep, ret, loading_from=""):
         {"range": "E" + str(row_idx), "values": [[s(dep)]]},
         {"range": "F" + str(row_idx), "values": [[s(ret)]]},
         {"range": "O" + str(row_idx), "values": [[s(loading_from)]]},
+        {"range": "P" + str(row_idx), "values": [[s(payment_date)]]},
+        {"range": "Q" + str(row_idx), "values": [[s(payment_comment)]]},
+    ]
+    ws.batch_update(payload, value_input_option="USER_ENTERED")
+    invalidate_cache("trips")
+    return True
+
+
+def update_trip_payment(trip_id, payment_date, payment_comment):
+    """v2.11.2: только дата и комментарий оплаты (P, Q)."""
+    ws = get_ws_cached("trips")
+    row_idx = _find_row_index_by_id("trips", trip_id)
+    if row_idx is None:
+        return False
+    payload = [
+        {"range": "P" + str(row_idx), "values": [[s(payment_date)]]},
+        {"range": "Q" + str(row_idx), "values": [[s(payment_comment)]]},
     ]
     ws.batch_update(payload, value_input_option="USER_ENTERED")
     invalidate_cache("trips")
@@ -871,7 +881,6 @@ def soft_delete_trip(trip_id):
     row_idx = _find_row_index_by_id("trips", trip_id)
     if row_idx is None:
         return False
-    # v2.11.1: N — это deleted_at (правильно!)
     ws.update_cell(row_idx, 14,
                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     invalidate_cache("trips")
@@ -1905,7 +1914,8 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
                        incoming_total_advance=0.0,
                        incoming_total_debt=0.0,
                        total_in_route=None,
-                       loading_from=""):
+                       loading_from="",
+                       payment_date="", payment_comment=""):
     if active_count == 0 and issued_count == 0 and not has_transfers and incoming_count == 0:
         bg, bd = "#fafafa", "#dddddd"
     elif total_debt > 0.01:
@@ -2015,6 +2025,20 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
             '</div>'
         )
 
+    # v2.11.2: строка «Дата оплаты» и «Комментарий» для безнала с НДС
+    payment_html = ""
+    if has_nds:
+        pd_disp = date_to_display_safe(payment_date) if s(payment_date).strip() else "—"
+        pc_disp = s(payment_comment).strip() if s(payment_comment).strip() else "—"
+        payment_html = (
+            '<div style="background:#e3f2fd; border-left:4px solid #1976d2; '
+            'padding:6px 10px; margin-top:6px; border-radius:4px; '
+            'font-size:13px; word-wrap:break-word;">'
+            '💳 <b>Дата оплаты:</b> ' + pd_disp
+            + ' &nbsp;·&nbsp; 💬 <b>Комментарий:</b> ' + pc_disp
+            + '</div>'
+        )
+
     html = (
         '<div style="background-color:' + bg +
         '; border:2px solid ' + bd +
@@ -2033,6 +2057,7 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
         '<div>' + stats + '</div>'
         '<div>' + inv_html + '</div>'
         '</div>'
+        + payment_html
         + incoming_stats_html
         + incoming_html +
         '</div>'
@@ -2305,22 +2330,22 @@ def can(action, role):
                        "export", "print_act", "manage_users", "view_log",
                        "archive", "complete_trip", "transfer_ship",
                        "cancel_transfer", "edit_invoice", "edit_trace",
-                       "manage_passwords"},
+                       "manage_passwords", "edit_payment"},
         "director":   {"create_trip", "edit_trip", "delete_trip",
                        "create_ship", "edit_ship", "delete_ship",
                        "export", "print_act", "manage_users", "view_log",
                        "archive", "complete_trip", "transfer_ship",
                        "cancel_transfer", "edit_invoice", "edit_trace",
-                       "manage_passwords"},
+                       "manage_passwords", "edit_payment"},
         "logist":     {"create_trip", "edit_trip", "create_ship", "edit_ship",
                        "export", "print_act", "archive", "complete_trip",
                        "transfer_ship", "cancel_transfer", "edit_invoice",
-                       "edit_trace"},
+                       "edit_trace", "edit_payment"},
         "dispatcher": {"create_trip", "edit_trip", "delete_trip",
                        "create_ship", "edit_ship", "delete_ship",
                        "export", "print_act", "archive", "complete_trip",
                        "transfer_ship", "cancel_transfer", "edit_invoice",
-                       "edit_trace"},
+                       "edit_trace", "edit_payment"},
     }
     return action in rights.get(role, set())
 
@@ -2735,6 +2760,8 @@ def main_page():
             dep = date_to_display_safe(t.get("date_departure", ""))
             ret = date_to_display_safe(t.get("date_return", ""))
             loading_from = s(t.get("loading_from", ""))
+            payment_date = s(t.get("payment_date", ""))
+            payment_comment = s(t.get("payment_comment", ""))
             trip_completed = check_completed(t.get("completed", "0"))
             trip_completed_at = date_to_display_safe(t.get("completed_at", ""))
             trip_inv_num = s(t.get("invoice_number", ""))
@@ -2765,8 +2792,7 @@ def main_page():
 
             has_transfers = outgoing_count > 0
 
-            has_nds = any(s(x.get("payer_type", "")).strip() == NDS_PAYER
-                          for x in cars)
+            has_nds = is_trip_beznal_nds(trip_id, cars)
 
             incoming_from_labels = []
             for x in cars:
@@ -2796,6 +2822,8 @@ def main_page():
                 incoming_total_debt=incoming_debt,
                 total_in_route=total_in_route,
                 loading_from=loading_from,
+                payment_date=payment_date,
+                payment_comment=payment_comment,
             )
 
             open_key = "open_details_" + s(trip_id)
@@ -2819,6 +2847,58 @@ def main_page():
             # РАСКРЫТОЕ СОДЕРЖИМОЕ РЕЙСА
             # ====================================================
 
+            # ---- v2.11.2: Редактор даты оплаты и комментария для завершённых безнал-НДС ----
+            if view_mode == "completed" and has_nds and can("edit_payment", role):
+                pay_key = "show_pay_form_" + s(trip_id)
+                if st.button("💳 Изменить дату оплаты и комментарий",
+                             key="btn_pay_form_" + s(trip_id)):
+                    st.session_state[pay_key] = not st.session_state.get(pay_key, False)
+                    st.rerun()
+
+                if st.session_state.get(pay_key):
+                    with st.form("pay_form_" + s(trip_id)):
+                        st.markdown("**Оплата рейса (безнал с НДС)**")
+                        c1, c2 = st.columns(2)
+                        pd_val = date_to_display_safe(payment_date) if s(payment_date).strip() else ""
+                        new_pd = c1.text_input(
+                            "Дата оплаты (ДД.ММ.ГГГГ)",
+                            value=pd_val,
+                            key="paydate_trip_" + s(trip_id)
+                        )
+                        new_pc = c2.text_input(
+                            "Комментарий (куда/кому ушли деньги)",
+                            value=payment_comment,
+                            key="paycomment_trip_" + s(trip_id)
+                        )
+                        save_pay = st.form_submit_button("💾 Сохранить оплату")
+                        clear_pay = st.form_submit_button("🗑 Очистить")
+                        cancel_pay = st.form_submit_button("Отмена")
+                    if cancel_pay:
+                        st.session_state.pop(pay_key, None)
+                        st.rerun()
+                    if clear_pay:
+                        update_trip_payment(trip_id, "", "")
+                        log_action(u["login"], role, "clear_trip_payment",
+                                   s(tractor) + " " + s(driver))
+                        st.session_state.pop(pay_key, None)
+                        st.success("Данные оплаты очищены")
+                        st.rerun()
+                    if save_pay:
+                        try:
+                            pd_fmt = parse_date_ui(new_pd) if s(new_pd).strip() else ""
+                        except ValueError as ex:
+                            st.error(str(ex))
+                        else:
+                            update_trip_payment(trip_id, pd_fmt, new_pc)
+                            log_action(u["login"], role, "edit_trip_payment",
+                                       s(tractor) + " " + s(driver)
+                                       + " | дата: " + s(pd_fmt)
+                                       + " | " + s(new_pc))
+                            st.session_state.pop(pay_key, None)
+                            st.success("Данные оплаты сохранены")
+                            st.rerun()
+
+            # ---- Оплата рейса + счёт в одну строку (активные/завершённые, безнал НДС) ----
             if has_nds and view_mode in ("active", "completed"):
                 col_pay, col_inv = st.columns([3, 2])
 
@@ -3067,7 +3147,9 @@ def main_page():
                         else:
                             update_trip(trip_id, e_tractor, e_driver, e_route,
                                         e_dep_fmt, e_ret_fmt,
-                                        loading_from=e_loading_from)
+                                        loading_from=e_loading_from,
+                                        payment_date=payment_date,
+                                        payment_comment=payment_comment)
                             log_action(u["login"], role, "edit_trip",
                                        s(e_tractor) + " " + s(e_driver) + " " + s(e_dep_fmt)
                                        + (" | погрузка от " + s(e_loading_from)
