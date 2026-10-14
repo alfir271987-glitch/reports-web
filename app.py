@@ -1,5 +1,5 @@
 # ============================================================
-# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.12.1
+# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.12.4
 # Streamlit + Google Sheets
 # ЧАСТЬ 1/2
 # ============================================================
@@ -25,14 +25,6 @@ SCOPES = [
 SHEET_SCHEMAS = {
     "users": ["login", "password_hash", "role", "full_name", "active",
               "failed_attempts", "locked_until"],
-    # ВАЖНО: порядок столбцов.
-    # A=id, B=tractor_number, C=driver, D=route, E=date_departure, F=date_return,
-    # G=created_by, H=created_at, I=archived, J=completed, K=completed_at,
-    # L=invoice_number, M=invoice_date, N=deleted_at, O=loading_from,
-    # P=payment_date, Q=payment_comment,
-    # R=pay1_amount, S=pay1_date, T=pay1_comment,
-    # U=pay2_amount, V=pay2_date, W=pay2_comment,
-    # X=pay3_amount, Y=pay3_date, Z=pay3_comment
     "trips": ["id", "tractor_number", "driver", "route",
               "date_departure", "date_return", "created_by", "created_at",
               "archived", "completed", "completed_at",
@@ -622,7 +614,6 @@ def _is_beznal_nds(x):
 
 
 def is_trip_beznal_nds(trip_id, shipments):
-    """Возвращает True, если в рейсе есть хотя бы одно авто с безналом НДС."""
     for x in shipments:
         if s(x.get("trip_id")) == s(trip_id) and _is_beznal_nds(x):
             return True
@@ -783,15 +774,10 @@ def resolve_source_trip_label_for_car(x, all_trips, transfer_history):
 
 
 # ============================================================
-# v2.12.0: РАЗДЕЛЕНИЕ СЧЁТА НА 3 ПЛАТЕЖА
+# РАЗДЕЛЕНИЕ СЧЁТА НА 3 ПЛАТЕЖА (v2.12.4)
 # ============================================================
 
 def extract_trip_payments(trip):
-    """
-    Возвращает список словарей платежей по рейсу:
-    [{"idx": 1, "amount": float, "date": str, "comment": str}, ...]
-    Только заполненные (amount > 0 или есть дата/комментарий).
-    """
     payments = []
     for i in range(1, MAX_PAY_SPLITS + 1):
         amt = to_float(trip.get("pay" + s(i) + "_amount"))
@@ -808,7 +794,6 @@ def extract_trip_payments(trip):
 
 
 def compute_trip_payments_total(trip):
-    """Сумма всех 3 платежей по рейсу."""
     total = 0.0
     for i in range(1, MAX_PAY_SPLITS + 1):
         total += to_float(trip.get("pay" + s(i) + "_amount"))
@@ -817,15 +802,14 @@ def compute_trip_payments_total(trip):
 
 def compute_trip_nds_debt(trip, shipments):
     """
-    Возвращает словарь:
-      {
-        "nds_debt":     общая задолженность по безналу-НДС в рейсе,
-        "nds_total":    общая сумма по безналу-НДС,
-        "paid_total":   сколько уже оплачено по разделам,
-        "remaining":    остаток (nds_debt - paid_total),
-        "parts_count":  количество заполненных частей,
-        "is_paid":      True, если суммарно покрыто,
-      }
+    v2.12.4: плашка «Разделение счёта».
+    Считаем:
+      - nds_total   : сумма всех безнал-НДС авто в рейсе (155 000)
+      - nds_debt    : задолженность по безнал-НДС авто (135 000)
+      - paid_from_sum: сколько оплачено от суммы рейса = nds_total - nds_debt (20 000)
+      - paid_total  : сумма разнесённых частей (pay1+pay2+pay3 = 25 000)
+      - to_split    : сколько ещё осталось разнести (nds_debt - paid_total = 110 000)
+      - is_paid     : True если полностью покрыто по авто
     """
     cars = [x for x in shipments if s(x.get("trip_id")) == s(trip.get("id"))]
     nds_total = 0.0
@@ -839,18 +823,23 @@ def compute_trip_nds_debt(trip, shipments):
             nds_debt += f["debt"]
 
     paid_total = compute_trip_payments_total(trip)
-    remaining = nds_debt - paid_total
-    if remaining < 0.01:
-        remaining = 0.0
+    to_split = nds_debt - paid_total
+    if to_split < 0.01:
+        to_split = 0.0
+
+    paid_from_sum = nds_total - nds_debt
+    if paid_from_sum < 0.01:
+        paid_from_sum = 0.0
 
     parts = extract_trip_payments(trip)
     is_paid = bool(nds_debt <= 0.01 or paid_total >= nds_debt - 0.01)
 
     return {
-        "nds_debt": money_value(nds_debt),
-        "nds_total": money_value(nds_total),
-        "paid_total": money_value(paid_total),
-        "remaining": money_value(remaining),
+        "nds_debt": money_value(nds_debt),                # 135 000 — долг по авто
+        "nds_total": money_value(nds_total),              # 155 000 — общая сумма
+        "paid_from_sum": money_value(paid_from_sum),      # 20 000 — оплачено от суммы
+        "paid_total": money_value(paid_total),            # 25 000 — разнесено по частям
+        "to_split": money_value(to_split),                # 110 000 — осталось разнести
         "parts_count": len(parts),
         "is_paid": is_paid,
         "parts": parts,
@@ -858,12 +847,6 @@ def compute_trip_nds_debt(trip, shipments):
 
 
 def update_trip_payments_split(trip_id, payments):
-    """
-    payments: список словарей
-        [{"amount": float, "date": "ДД.ММ.ГГГГ" или "", "comment": "..."}, ...]
-        длиной до MAX_PAY_SPLITS (3). Пустые слоты автоматически обнуляются.
-    Сохраняет в столбцы R..Z листа trips.
-    """
     ws = get_ws_cached("trips")
     row_idx = _find_row_index_by_id("trips", trip_id)
     if row_idx is None:
@@ -899,7 +882,7 @@ def clear_trip_payments_split(trip_id):
 
 
 # ============================================================
-# CRUD: РЕЙСЫ — v2.12.0
+# CRUD: РЕЙСЫ
 # ============================================================
 
 def create_trip(tractor, driver, route, dep, ret, created_by, loading_from=""):
@@ -930,8 +913,6 @@ def update_trip(trip_id, tractor, driver, route, dep, ret,
     row_idx = _find_row_index_by_id("trips", trip_id)
     if row_idx is None:
         return False
-    # O = loading_from, P = payment_date, Q = payment_comment
-    # N (deleted_at) НЕ трогаем!
     payload = [
         {"range": "B" + str(row_idx), "values": [[s(tractor)]]},
         {"range": "C" + str(row_idx), "values": [[s(driver)]]},
@@ -948,7 +929,6 @@ def update_trip(trip_id, tractor, driver, route, dep, ret,
 
 
 def update_trip_payment(trip_id, payment_date, payment_comment):
-    """v2.11.2: только дата и комментарий оплаты (P, Q)."""
     ws = get_ws_cached("trips")
     row_idx = _find_row_index_by_id("trips", trip_id)
     if row_idx is None:
@@ -2187,12 +2167,16 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
             + '</div>'
         )
 
+    # v2.12.4: плашка «Разделение счёта» — 
+    # «Оплачено от суммы» = сумма − задолженность, «по разбивке» = pay1+pay2+pay3.
     splits_html = ""
     if has_nds and payments_info:
         parts = payments_info.get("parts", [])
         paid_total = payments_info.get("paid_total", 0.0)
         nds_debt = payments_info.get("nds_debt", 0.0)
-        remaining = payments_info.get("remaining", 0.0)
+        nds_total = payments_info.get("nds_total", 0.0)
+        paid_from_sum = payments_info.get("paid_from_sum", 0.0)
+        to_split = payments_info.get("to_split", 0.0)
         parts_count = payments_info.get("parts_count", 0)
         is_paid = payments_info.get("is_paid", False)
 
@@ -2207,12 +2191,16 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
             '<span style="background:' + badge_color + '; color:#fff; '
             'padding:1px 8px; border-radius:10px; font-size:12px; '
             'font-weight:bold;">' + badge_text + '</span>'
-            ' &nbsp;·&nbsp; Оплачено: <b>' + fmt_money(paid_total) + ' ₽</b>'
-            ' из <b>' + fmt_money(nds_debt) + ' ₽</b>'
+            ' &nbsp;·&nbsp; <b>Оплачено от суммы:</b> '
+            '<b style="color:#2e7d32;">' + fmt_money(paid_from_sum) + ' ₽</b>'
+            ' из <b>' + fmt_money(nds_total) + ' ₽</b>'
+            ' &nbsp;·&nbsp; <b>Задолженность:</b> '
+            '<b style="color:#c62828;">' + fmt_money(nds_debt) + ' ₽</b>'
+            ' &nbsp;·&nbsp; По разбивке: <b>' + fmt_money(paid_total) + ' ₽</b>'
             ' &nbsp;·&nbsp; Частей: <b>' + s(parts_count) + '</b>'
-            ' &nbsp;·&nbsp; Остаток: <b style="color:'
-            + ("#2e7d32" if remaining <= 0.01 else "#c62828") + ';">'
-            + fmt_money(remaining) + ' ₽</b>'
+            ' &nbsp;·&nbsp; Осталось разнести: <b style="color:'
+            + ("#2e7d32" if to_split <= 0.01 else "#c62828") + ';">'
+            + fmt_money(to_split) + ' ₽</b>'
         )
         if parts:
             rows_html = "<br>"
@@ -2683,35 +2671,30 @@ def admin_panel():
 
 
 # ============================================================
-# v2.12.0: ФОРМА РАЗДЕЛЕНИЯ СЧЁТА НА 3 ПЛАТЕЖА
+# ФОРМА РАЗДЕЛЕНИЯ СЧЁТА НА 3 ПЛАТЕЖА
 # ============================================================
 
 def render_trip_split_form(trip_id, trip, nds_debt, nds_total,
                            user_login, role):
-    """
-    Форма разделения счёта на 3 платежа.
-    Показывает текущую задолженность по безнал-НДС, остаток и позволяет
-    задать до 3 частей (аванс/доплата/остаток).
-    """
     parts = extract_trip_payments(trip)
     paid_total = compute_trip_payments_total(trip)
-    remaining = nds_debt - paid_total
-    if remaining < 0.01:
-        remaining = 0.0
+    to_split = nds_debt - paid_total
+    if to_split < 0.01:
+        to_split = 0.0
 
     st.markdown("---")
     st.markdown("### 🧾 Разделение счёта на части")
 
-    badge_color = "#2e7d32" if remaining <= 0.01 else "#f57c00"
-    badge_text = "✅ Оплачен" if remaining <= 0.01 else "⏳ Частично оплачен"
+    badge_color = "#2e7d32" if to_split <= 0.01 else "#f57c00"
+    badge_text = "✅ Оплачен" if to_split <= 0.01 else "⏳ Частично оплачен"
     st.markdown(
         '<div style="background:#fff8e1; border-left:4px solid #ffb300; '
         'padding:8px 12px; border-radius:4px; font-size:14px;">'
         '<b>Задолженность (безнал с НДС):</b> ' + fmt_money(nds_debt) + ' ₽'
-        ' &nbsp;·&nbsp; <b>Оплачено:</b> ' + fmt_money(paid_total) + ' ₽'
-        ' &nbsp;·&nbsp; <b>Остаток:</b> <span style="color:'
-        + ("#2e7d32" if remaining <= 0.01 else "#c62828") + '; font-weight:bold;">'
-        + fmt_money(remaining) + ' ₽</span>'
+        ' &nbsp;·&nbsp; <b>Разнесено по частям:</b> ' + fmt_money(paid_total) + ' ₽'
+        ' &nbsp;·&nbsp; <b>Осталось разнести:</b> <span style="color:'
+        + ("#2e7d32" if to_split <= 0.01 else "#c62828") + '; font-weight:bold;">'
+        + fmt_money(to_split) + ' ₽</span>'
         ' &nbsp;·&nbsp; <span style="background:' + badge_color + '; color:#fff; '
         'padding:1px 8px; border-radius:10px; font-size:12px; font-weight:bold;">'
         + badge_text + '</span>'
@@ -2853,7 +2836,8 @@ def render_trip_split_form(trip_id, trip, nds_debt, nds_total,
         st.success("Платежи сохранены")
         st.rerun()# ============================================================
 # ЧАСТЬ 2/2: главная страница и точка входа
-# v2.12.1 — карточки авто разведены (белый фон, серая рамка, полоса слева)
+# v2.12.4 — «Остаток» = сумма − задолженность (оплачено от суммы)
+#           карточки авто полностью закрашены (красный/зелёный/серый)
 # ============================================================
 
 def main_page():
@@ -3263,7 +3247,7 @@ def main_page():
                             st.success("Данные оплаты сохранены")
                             st.rerun()
 
-            # ---- v2.12.0: РАЗДЕЛЕНИЕ СЧЁТА ----
+            # ---- Разделение счёта ----
             if has_nds and view_mode in ("active", "completed"):
                 split_key = "open_split_" + s(trip_id)
                 col_split1, col_split2 = st.columns([2, 3])
@@ -3671,41 +3655,41 @@ def main_page():
                         target_trip_label = resolve_target_trip_label(
                             tr_to, trips, transfer_history)
 
-                    # v2.12.1: определяем цвет ТОЛЬКО для полосы слева
+                    # v2.12.4: КАРТОЧКА ПОЛНОСТЬЮ ЗАКРАШЕНА (красный/зелёный/серый)
                     if is_trace:
-                        bd = "#bdbdbd"
+                        bg = "#eeeeee"; bd = "#bdbdbd"
                         status_text = "⚪ Перенесён"
                     elif not has_debt and is_issued_flag and auto_issued and not check_issued(issued_val):
-                        bd = "#4caf50"
+                        bg = "#c8e6c9"; bd = "#2e7d32"
                         status_text = "🟢 Выдан (аванс покрыл сумму)"
                     elif not has_debt and is_issued_flag:
-                        bd = "#4caf50"
+                        bg = "#c8e6c9"; bd = "#2e7d32"
                         status_text = "🟢 Выдан"
                     elif not has_debt and is_paid_flag:
-                        bd = "#4caf50"
+                        bg = "#c8e6c9"; bd = "#2e7d32"
                         status_text = "🟢 Оплачен"
                     elif not has_debt and auto_issued:
-                        bd = "#4caf50"
+                        bg = "#c8e6c9"; bd = "#2e7d32"
                         status_text = "🟢 Аванс закрыт"
                     elif not has_debt:
-                        bd = "#4caf50"
+                        bg = "#c8e6c9"; bd = "#2e7d32"
                         status_text = "🟢 Без долга"
                     elif has_debt and is_issued_flag:
-                        bd = "#f44336"
+                        bg = "#ffcdd2"; bd = "#c62828"
                         status_text = "🔴 Выдан с долгом"
                     else:
-                        bd = "#f44336"
+                        bg = "#ffcdd2"; bd = "#c62828"
                         status_text = "🔴 Долг"
 
-                    # v2.12.1: карточка — белый фон, тонкая серая рамка,
-                    # цветная полоса слева (bd), скругление, тень, отступ.
+                    # Карточка полностью закрашена (bg), толстая полоса слева (bd),
+                    # отступ 14px, тень — чёткое разделение между карточками.
                     st.markdown(
-                        '<div style="background:#ffffff; '
-                        'border:1px solid #e0e0e0; '
-                        'border-left:6px solid ' + bd + '; '
-                        'border-radius:6px; padding:10px 12px; '
-                        'margin-bottom:10px; '
-                        'box-shadow:0 1px 3px rgba(0,0,0,0.08); '
+                        '<div style="background-color:' + bg + '; '
+                        'border:2px solid ' + bd + '; '
+                        'border-left:10px solid ' + bd + '; '
+                        'border-radius:8px; padding:12px 14px; '
+                        'margin-bottom:14px; '
+                        'box-shadow:0 2px 4px rgba(0,0,0,0.12); '
                         'font-size:14px; word-wrap:break-word;">',
                         unsafe_allow_html=True)
 
