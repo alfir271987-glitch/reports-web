@@ -1,5 +1,5 @@
 # ============================================================
-# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.12.0
+# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.12.1
 # Streamlit + Google Sheets
 # ЧАСТЬ 1/2
 # ============================================================
@@ -372,7 +372,6 @@ def ensure_sheets_once():
 
         if name == "trips":
             _migrate_trips_n_to_o(ws)
-            # v2.12.0: убеждаемся, что столбцы R..Z названы правильно
             try:
                 current2 = ws.row_values(1)
                 required_pay = {
@@ -2175,7 +2174,6 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
             '</div>'
         )
 
-    # v2.12.0: строка «Дата оплаты» + сводка по разделённым платежам
     payment_html = ""
     if has_nds:
         pd_disp = date_to_display_safe(payment_date) if s(payment_date).strip() else "—"
@@ -2704,7 +2702,6 @@ def render_trip_split_form(trip_id, trip, nds_debt, nds_total,
     st.markdown("---")
     st.markdown("### 🧾 Разделение счёта на части")
 
-    # Сводная плашка
     badge_color = "#2e7d32" if remaining <= 0.01 else "#f57c00"
     badge_text = "✅ Оплачен" if remaining <= 0.01 else "⏳ Частично оплачен"
     st.markdown(
@@ -2722,7 +2719,6 @@ def render_trip_split_form(trip_id, trip, nds_debt, nds_total,
         unsafe_allow_html=True,
     )
 
-    # Список уже заполненных частей
     if parts:
         rows_html = ""
         for p in parts:
@@ -2741,7 +2737,6 @@ def render_trip_split_form(trip_id, trip, nds_debt, nds_total,
             unsafe_allow_html=True,
         )
 
-    # Форма редактирования
     form_key = "split_form_" + s(trip_id)
     with st.form(form_key):
         st.markdown("**Задать до 3 платежей** (пустые части игнорируются)")
@@ -2787,7 +2782,6 @@ def render_trip_split_form(trip_id, trip, nds_debt, nds_total,
                 "comment": cm_in,
             })
 
-        # Проверка
         total_new = 0.0
         for p in new_payments:
             total_new += money_value(p["amount"])
@@ -2824,7 +2818,6 @@ def render_trip_split_form(trip_id, trip, nds_debt, nds_total,
         st.rerun()
 
     if save_btn:
-        # Парсим и валидируем
         parsed = []
         for i, p in enumerate(new_payments):
             amt_raw = s(p.get("amount", "")).strip()
@@ -2860,7 +2853,7 @@ def render_trip_split_form(trip_id, trip, nds_debt, nds_total,
         st.success("Платежи сохранены")
         st.rerun()# ============================================================
 # ЧАСТЬ 2/2: главная страница и точка входа
-# v2.12.0 — с разделением счёта на 3 платежа
+# v2.12.1 — карточки авто разведены (белый фон, серая рамка, полоса слева)
 # ============================================================
 
 def main_page():
@@ -3165,7 +3158,6 @@ def main_page():
 
             has_nds = is_trip_beznal_nds(trip_id, cars)
 
-            # v2.12.0: сводка по разделённым платежам
             payments_info = compute_trip_nds_debt(t, cars) if has_nds else None
 
             incoming_from_labels = []
@@ -3178,7 +3170,6 @@ def main_page():
                 if lbl and lbl != "—" and lbl not in incoming_from_labels:
                     incoming_from_labels.append(lbl)
 
-            # ---- Шапка рейса + кнопка ▸/▾ ----
             header_html = render_trip_header(
                 trip_id, tractor, driver, route, dep, ret,
                 trip_completed, trip_completed_at,
@@ -3222,7 +3213,6 @@ def main_page():
             # РАСКРЫТОЕ СОДЕРЖИМОЕ РЕЙСА
             # ====================================================
 
-            # ---- v2.11.2: Редактор даты оплаты и комментария для завершённых безнал-НДС ----
             if view_mode == "completed" and has_nds and can("edit_payment", role):
                 pay_key = "show_pay_form_" + s(trip_id)
                 if st.button("💳 Изменить дату оплаты и комментарий",
@@ -3295,7 +3285,7 @@ def main_page():
                         u["login"], role,
                     )
 
-            # ---- Оплата рейса + счёт в одну строку (активные/завершённые, безнал НДС) ----
+            # ---- Оплата рейса + счёт ----
             if has_nds and view_mode in ("active", "completed"):
                 col_pay, col_inv = st.columns([3, 2])
 
@@ -3511,7 +3501,7 @@ def main_page():
                         st.success("Рейс завершён")
                         st.rerun()
 
-            # ---- Форма редактирования рейса (с полем «Погрузка от») ----
+            # ---- Форма редактирования рейса ----
             if st.session_state.get("open_edittrip_" + s(trip_id)):
                 with st.form("edit_trip_" + s(trip_id)):
                     st.markdown("**Редактировать рейс**")
@@ -3681,35 +3671,41 @@ def main_page():
                         target_trip_label = resolve_target_trip_label(
                             tr_to, trips, transfer_history)
 
+                    # v2.12.1: определяем цвет ТОЛЬКО для полосы слева
                     if is_trace:
-                        bg = "#eeeeee"; bd = "#bdbdbd"
+                        bd = "#bdbdbd"
                         status_text = "⚪ Перенесён"
                     elif not has_debt and is_issued_flag and auto_issued and not check_issued(issued_val):
-                        bg = "#c8e6c9"; bd = "#4caf50"
+                        bd = "#4caf50"
                         status_text = "🟢 Выдан (аванс покрыл сумму)"
                     elif not has_debt and is_issued_flag:
-                        bg = "#c8e6c9"; bd = "#4caf50"
+                        bd = "#4caf50"
                         status_text = "🟢 Выдан"
                     elif not has_debt and is_paid_flag:
-                        bg = "#c8e6c9"; bd = "#4caf50"
+                        bd = "#4caf50"
                         status_text = "🟢 Оплачен"
                     elif not has_debt and auto_issued:
-                        bg = "#c8e6c9"; bd = "#4caf50"
+                        bd = "#4caf50"
                         status_text = "🟢 Аванс закрыт"
                     elif not has_debt:
-                        bg = "#c8e6c9"; bd = "#4caf50"
+                        bd = "#4caf50"
                         status_text = "🟢 Без долга"
                     elif has_debt and is_issued_flag:
-                        bg = "#ffcdd2"; bd = "#f44336"
+                        bd = "#f44336"
                         status_text = "🔴 Выдан с долгом"
                     else:
-                        bg = "#ffcdd2"; bd = "#f44336"
+                        bd = "#f44336"
                         status_text = "🔴 Долг"
 
+                    # v2.12.1: карточка — белый фон, тонкая серая рамка,
+                    # цветная полоса слева (bd), скругление, тень, отступ.
                     st.markdown(
-                        '<div style="background-color:' + bg +
-                        '; border:1px solid ' + bd +
-                        '; border-radius:6px; padding:8px; margin-bottom:6px; '
+                        '<div style="background:#ffffff; '
+                        'border:1px solid #e0e0e0; '
+                        'border-left:6px solid ' + bd + '; '
+                        'border-radius:6px; padding:10px 12px; '
+                        'margin-bottom:10px; '
+                        'box-shadow:0 1px 3px rgba(0,0,0,0.08); '
                         'font-size:14px; word-wrap:break-word;">',
                         unsafe_allow_html=True)
 
