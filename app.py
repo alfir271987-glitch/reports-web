@@ -1,5 +1,5 @@
 # ============================================================
-# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.11.4
+# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.12.0
 # Streamlit + Google Sheets
 # ЧАСТЬ 1/2
 # ============================================================
@@ -25,6 +25,7 @@ SCOPES = [
 SHEET_SCHEMAS = {
     "users": ["login", "password_hash", "role", "full_name", "active",
               "failed_attempts", "locked_until"],
+    # ВАЖНО: порядок столбцов.
     # A=id, B=tractor_number, C=driver, D=route, E=date_departure, F=date_return,
     # G=created_by, H=created_at, I=archived, J=completed, K=completed_at,
     # L=invoice_number, M=invoice_date, N=deleted_at, O=loading_from,
@@ -68,6 +69,9 @@ MAX_CARS = 8
 CACHE_TTL = 300
 LOGIN_MAX_ATTEMPTS = 5
 LOGIN_LOCK_MINUTES = 15
+
+MAX_PAY_SPLITS = 3
+PAY_SPLIT_LABELS = ["аванс", "доплата", "остаток"]
 
 
 # ============================================================
@@ -368,6 +372,27 @@ def ensure_sheets_once():
 
         if name == "trips":
             _migrate_trips_n_to_o(ws)
+            # v2.12.0: убеждаемся, что столбцы R..Z названы правильно
+            try:
+                current2 = ws.row_values(1)
+                required_pay = {
+                    "R": "pay1_amount", "S": "pay1_date", "T": "pay1_comment",
+                    "U": "pay2_amount", "V": "pay2_date", "W": "pay2_comment",
+                    "X": "pay3_amount", "Y": "pay3_date", "Z": "pay3_comment",
+                }
+                for col_letter, header_name in required_pay.items():
+                    idx = 0
+                    for ch in col_letter:
+                        idx = idx * 26 + (ord(ch) - ord('A') + 1)
+                    idx0 = idx - 1
+                    val = current2[idx0] if idx0 < len(current2) else ""
+                    if s(val).strip() != header_name:
+                        try:
+                            ws.update_cell(1, idx, header_name)
+                        except Exception as e:
+                            _log_system_error("fix_v2120_col_" + col_letter, name, e)
+            except Exception as e:
+                _log_system_error("ensure_v2120_cols", name, e)
 
         if name == "shipments":
             try:
@@ -455,90 +480,6 @@ def next_trip_id():
 
 def next_shipment_id():
     return new_uuid()
-
-
-# ============================================================
-# РАЗДЕЛЕНИЕ СЧЁТА — расчёт частей оплаты
-# ============================================================
-
-def get_trip_payments(trip):
-    """
-    Возвращает список частей оплаты для рейса.
-    Каждая часть: {"n": 1, "amount": float, "date": str, "comment": str}
-    Пропускаются части с amount <= 0.01.
-    """
-    parts = []
-    # Основная оплата (P, Q) — считаем как часть №1, если она заполнена
-    pd = s(trip.get("payment_date", "")).strip()
-    pc = s(trip.get("payment_comment", "")).strip()
-    # Основной суммы отдельно нет — считаем, что она уже часть ниже
-
-    # Части 1..3
-    for i in (1, 2, 3):
-        amt = money_value(trip.get("pay" + str(i) + "_amount", 0))
-        dt = date_to_display_safe(trip.get("pay" + str(i) + "_date", ""))
-        cm = s(trip.get("pay" + str(i) + "_comment", "")).strip()
-        if amt > 0.01:
-            parts.append({"n": i, "amount": amt, "date": dt, "comment": cm})
-    return parts
-
-
-def compute_trip_payments_total(trip):
-    """Сумма всех частей оплаты по рейсу."""
-    total = 0.0
-    for p in get_trip_payments(trip):
-        total += to_float(p.get("amount"))
-    return money_value(total)
-
-
-def get_trip_payments_status(trip, amount_due):
-    """
-    Возвращает:
-      paid    — сколько уже оплачено,
-      left    — сколько осталось,
-      is_fully_paid — оплачено ли полностью,
-      parts_count — кол-во частей оплаты
-    """
-    paid = compute_trip_payments_total(trip)
-    left = amount_due - paid
-    if left < 0.01:
-        left = 0.0
-    is_fully_paid = (amount_due > 0.01 and paid >= amount_due - 0.01)
-    parts = get_trip_payments(trip)
-    return {
-        "paid": paid,
-        "left": left,
-        "is_fully_paid": is_fully_paid,
-        "parts_count": len(parts),
-        "parts": parts,
-    }
-
-
-def update_trip_payments_split(trip_id, pay1_amount, pay1_date, pay1_comment,
-                                pay2_amount, pay2_date, pay2_comment,
-                                pay3_amount, pay3_date, pay3_comment,
-                                payment_date="", payment_comment=""):
-    """Сохраняет все 3 части оплаты + основную дату/комментарий."""
-    ws = get_ws_cached("trips")
-    row_idx = _find_row_index_by_id("trips", trip_id)
-    if row_idx is None:
-        return False
-    payload = [
-        {"range": "P" + str(row_idx), "values": [[s(payment_date)]]},
-        {"range": "Q" + str(row_idx), "values": [[s(payment_comment)]]},
-        {"range": "R" + str(row_idx), "values": [[money_value(pay1_amount)]]},
-        {"range": "S" + str(row_idx), "values": [[s(pay1_date)]]},
-        {"range": "T" + str(row_idx), "values": [[s(pay1_comment)]]},
-        {"range": "U" + str(row_idx), "values": [[money_value(pay2_amount)]]},
-        {"range": "V" + str(row_idx), "values": [[s(pay2_date)]]},
-        {"range": "W" + str(row_idx), "values": [[s(pay2_comment)]]},
-        {"range": "X" + str(row_idx), "values": [[money_value(pay3_amount)]]},
-        {"range": "Y" + str(row_idx), "values": [[s(pay3_date)]]},
-        {"range": "Z" + str(row_idx), "values": [[s(pay3_comment)]]},
-    ]
-    ws.batch_update(payload, value_input_option="USER_ENTERED")
-    invalidate_cache("trips")
-    return True
 
 
 # ============================================================
@@ -682,6 +623,7 @@ def _is_beznal_nds(x):
 
 
 def is_trip_beznal_nds(trip_id, shipments):
+    """Возвращает True, если в рейсе есть хотя бы одно авто с безналом НДС."""
     for x in shipments:
         if s(x.get("trip_id")) == s(trip_id) and _is_beznal_nds(x):
             return True
@@ -842,7 +784,123 @@ def resolve_source_trip_label_for_car(x, all_trips, transfer_history):
 
 
 # ============================================================
-# CRUD: РЕЙСЫ
+# v2.12.0: РАЗДЕЛЕНИЕ СЧЁТА НА 3 ПЛАТЕЖА
+# ============================================================
+
+def extract_trip_payments(trip):
+    """
+    Возвращает список словарей платежей по рейсу:
+    [{"idx": 1, "amount": float, "date": str, "comment": str}, ...]
+    Только заполненные (amount > 0 или есть дата/комментарий).
+    """
+    payments = []
+    for i in range(1, MAX_PAY_SPLITS + 1):
+        amt = to_float(trip.get("pay" + s(i) + "_amount"))
+        dt = date_to_display_safe(trip.get("pay" + s(i) + "_date", ""))
+        cm = s(trip.get("pay" + s(i) + "_comment", "")).strip()
+        if amt > 0.01 or dt or cm:
+            payments.append({
+                "idx": i,
+                "amount": money_value(amt),
+                "date": dt,
+                "comment": cm,
+            })
+    return payments
+
+
+def compute_trip_payments_total(trip):
+    """Сумма всех 3 платежей по рейсу."""
+    total = 0.0
+    for i in range(1, MAX_PAY_SPLITS + 1):
+        total += to_float(trip.get("pay" + s(i) + "_amount"))
+    return money_value(total)
+
+
+def compute_trip_nds_debt(trip, shipments):
+    """
+    Возвращает словарь:
+      {
+        "nds_debt":     общая задолженность по безналу-НДС в рейсе,
+        "nds_total":    общая сумма по безналу-НДС,
+        "paid_total":   сколько уже оплачено по разделам,
+        "remaining":    остаток (nds_debt - paid_total),
+        "parts_count":  количество заполненных частей,
+        "is_paid":      True, если суммарно покрыто,
+      }
+    """
+    cars = [x for x in shipments if s(x.get("trip_id")) == s(trip.get("id"))]
+    nds_total = 0.0
+    nds_debt = 0.0
+    for x in cars:
+        if not _is_beznal_nds(x):
+            continue
+        f = calculate_financials(x)
+        nds_total += f["amount"]
+        if not check_paid(s(x.get("paid", "0"))):
+            nds_debt += f["debt"]
+
+    paid_total = compute_trip_payments_total(trip)
+    remaining = nds_debt - paid_total
+    if remaining < 0.01:
+        remaining = 0.0
+
+    parts = extract_trip_payments(trip)
+    is_paid = bool(nds_debt <= 0.01 or paid_total >= nds_debt - 0.01)
+
+    return {
+        "nds_debt": money_value(nds_debt),
+        "nds_total": money_value(nds_total),
+        "paid_total": money_value(paid_total),
+        "remaining": money_value(remaining),
+        "parts_count": len(parts),
+        "is_paid": is_paid,
+        "parts": parts,
+    }
+
+
+def update_trip_payments_split(trip_id, payments):
+    """
+    payments: список словарей
+        [{"amount": float, "date": "ДД.ММ.ГГГГ" или "", "comment": "..."}, ...]
+        длиной до MAX_PAY_SPLITS (3). Пустые слоты автоматически обнуляются.
+    Сохраняет в столбцы R..Z листа trips.
+    """
+    ws = get_ws_cached("trips")
+    row_idx = _find_row_index_by_id("trips", trip_id)
+    if row_idx is None:
+        return False
+
+    payload = []
+    col_map = [
+        ("R", "S", "T"),
+        ("U", "V", "W"),
+        ("X", "Y", "Z"),
+    ]
+    for i in range(MAX_PAY_SPLITS):
+        amt = 0.0
+        dt = ""
+        cm = ""
+        if i < len(payments):
+            p = payments[i] or {}
+            amt = money_value(p.get("amount"))
+            dt = date_to_display_safe(p.get("date", ""))
+            cm = s(p.get("comment", "")).strip()
+        c_amt, c_dt, c_cm = col_map[i]
+        payload.append({"range": c_amt + str(row_idx), "values": [[amt]]})
+        payload.append({"range": c_dt + str(row_idx), "values": [[dt]]})
+        payload.append({"range": c_cm + str(row_idx), "values": [[cm]]})
+
+    ws.batch_update(payload, value_input_option="USER_ENTERED")
+    invalidate_cache("trips")
+    return True
+
+
+def clear_trip_payments_split(trip_id):
+    return update_trip_payments_split(trip_id, [])
+
+
+# ============================================================
+# CRUD: РЕЙСЫ — v2.12.0
 # ============================================================
 
 def create_trip(tractor, driver, route, dep, ret, created_by, loading_from=""):
@@ -861,15 +919,9 @@ def create_trip(tractor, driver, route, dep, ret, created_by, loading_from=""):
         "loading_from": s(loading_from),
         "payment_date": "",
         "payment_comment": "",
-        "pay1_amount": "",
-        "pay1_date": "",
-        "pay1_comment": "",
-        "pay2_amount": "",
-        "pay2_date": "",
-        "pay2_comment": "",
-        "pay3_amount": "",
-        "pay3_date": "",
-        "pay3_comment": "",
+        "pay1_amount": "", "pay1_date": "", "pay1_comment": "",
+        "pay2_amount": "", "pay2_date": "", "pay2_comment": "",
+        "pay3_amount": "", "pay3_date": "", "pay3_comment": "",
     })
 
 
@@ -879,6 +931,8 @@ def update_trip(trip_id, tractor, driver, route, dep, ret,
     row_idx = _find_row_index_by_id("trips", trip_id)
     if row_idx is None:
         return False
+    # O = loading_from, P = payment_date, Q = payment_comment
+    # N (deleted_at) НЕ трогаем!
     payload = [
         {"range": "B" + str(row_idx), "values": [[s(tractor)]]},
         {"range": "C" + str(row_idx), "values": [[s(driver)]]},
@@ -886,6 +940,21 @@ def update_trip(trip_id, tractor, driver, route, dep, ret,
         {"range": "E" + str(row_idx), "values": [[s(dep)]]},
         {"range": "F" + str(row_idx), "values": [[s(ret)]]},
         {"range": "O" + str(row_idx), "values": [[s(loading_from)]]},
+        {"range": "P" + str(row_idx), "values": [[s(payment_date)]]},
+        {"range": "Q" + str(row_idx), "values": [[s(payment_comment)]]},
+    ]
+    ws.batch_update(payload, value_input_option="USER_ENTERED")
+    invalidate_cache("trips")
+    return True
+
+
+def update_trip_payment(trip_id, payment_date, payment_comment):
+    """v2.11.2: только дата и комментарий оплаты (P, Q)."""
+    ws = get_ws_cached("trips")
+    row_idx = _find_row_index_by_id("trips", trip_id)
+    if row_idx is None:
+        return False
+    payload = [
         {"range": "P" + str(row_idx), "values": [[s(payment_date)]]},
         {"range": "Q" + str(row_idx), "values": [[s(payment_comment)]]},
     ]
@@ -1996,7 +2065,7 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
                        total_in_route=None,
                        loading_from="",
                        payment_date="", payment_comment="",
-                       payments_parts=None):
+                       payments_info=None):
     if active_count == 0 and issued_count == 0 and not has_transfers and incoming_count == 0:
         bg, bd = "#fafafa", "#dddddd"
     elif total_debt > 0.01:
@@ -2106,45 +2175,61 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
             '</div>'
         )
 
-    # v2.11.4: плашка оплаты с разбивкой
+    # v2.12.0: строка «Дата оплаты» + сводка по разделённым платежам
     payment_html = ""
     if has_nds:
-        parts = payments_parts or []
-        total_paid = 0.0
-        parts_lines = []
-        for p in parts:
-            total_paid += to_float(p.get("amount"))
-            parts_lines.append(
-                "№" + s(p.get("n")) + ": " + fmt_money(p.get("amount")) + " ₽"
-                + (" от " + s(p.get("date")) if p.get("date") else "")
-                + (" · " + s(p.get("comment")) if p.get("comment") else "")
-            )
         pd_disp = date_to_display_safe(payment_date) if s(payment_date).strip() else "—"
         pc_disp = s(payment_comment).strip() if s(payment_comment).strip() else "—"
-
-        parts_html = ""
-        if parts_lines:
-            parts_html = (
-                "<br><b>Части оплаты ("
-                + s(len(parts_lines)) + " из 3):</b><br>"
-                + "<br>".join(parts_lines)
-            )
-
-        total_html = (
-            "<br><b>Итого оплачено: "
-            + fmt_money(total_paid) + " ₽</b>"
-        )
-
         payment_html = (
             '<div style="background:#e3f2fd; border-left:4px solid #1976d2; '
             'padding:6px 10px; margin-top:6px; border-radius:4px; '
             'font-size:13px; word-wrap:break-word;">'
             '💳 <b>Дата оплаты:</b> ' + pd_disp
             + ' &nbsp;·&nbsp; 💬 <b>Комментарий:</b> ' + pc_disp
-            + parts_html
-            + total_html
             + '</div>'
         )
+
+    splits_html = ""
+    if has_nds and payments_info:
+        parts = payments_info.get("parts", [])
+        paid_total = payments_info.get("paid_total", 0.0)
+        nds_debt = payments_info.get("nds_debt", 0.0)
+        remaining = payments_info.get("remaining", 0.0)
+        parts_count = payments_info.get("parts_count", 0)
+        is_paid = payments_info.get("is_paid", False)
+
+        badge_color = "#2e7d32" if is_paid else "#f57c00"
+        badge_text = ("✅ Оплачен" if is_paid
+                      else "⏳ Частично оплачен")
+        header = (
+            '<div style="background:#fff8e1; border-left:4px solid #ffb300; '
+            'padding:6px 10px; margin-top:6px; border-radius:4px; '
+            'font-size:13px; word-wrap:break-word;">'
+            '<b>🧾 Разделение счёта:</b> '
+            '<span style="background:' + badge_color + '; color:#fff; '
+            'padding:1px 8px; border-radius:10px; font-size:12px; '
+            'font-weight:bold;">' + badge_text + '</span>'
+            ' &nbsp;·&nbsp; Оплачено: <b>' + fmt_money(paid_total) + ' ₽</b>'
+            ' из <b>' + fmt_money(nds_debt) + ' ₽</b>'
+            ' &nbsp;·&nbsp; Частей: <b>' + s(parts_count) + '</b>'
+            ' &nbsp;·&nbsp; Остаток: <b style="color:'
+            + ("#2e7d32" if remaining <= 0.01 else "#c62828") + ';">'
+            + fmt_money(remaining) + ' ₽</b>'
+        )
+        if parts:
+            rows_html = "<br>"
+            for p in parts:
+                label = PAY_SPLIT_LABELS[p["idx"] - 1]
+                rows_html += (
+                    "&nbsp;&nbsp;• <b>" + s(p["idx"]) + ". " + label
+                    + ":</b> " + fmt_money(p["amount"]) + " ₽"
+                    + ("  · дата: " + s(p["date"]) if p["date"] else "")
+                    + ("  · " + s(p["comment"]) if p["comment"] else "")
+                    + "<br>"
+                )
+            header += rows_html
+        header += "</div>"
+        splits_html = header
 
     html = (
         '<div style="background-color:' + bg +
@@ -2165,6 +2250,7 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
         '<div>' + inv_html + '</div>'
         '</div>'
         + payment_html
+        + splits_html
         + incoming_stats_html
         + incoming_html +
         '</div>'
@@ -2437,22 +2523,22 @@ def can(action, role):
                        "export", "print_act", "manage_users", "view_log",
                        "archive", "complete_trip", "transfer_ship",
                        "cancel_transfer", "edit_invoice", "edit_trace",
-                       "manage_passwords", "edit_payment"},
+                       "manage_passwords", "edit_payment", "split_payment"},
         "director":   {"create_trip", "edit_trip", "delete_trip",
                        "create_ship", "edit_ship", "delete_ship",
                        "export", "print_act", "manage_users", "view_log",
                        "archive", "complete_trip", "transfer_ship",
                        "cancel_transfer", "edit_invoice", "edit_trace",
-                       "manage_passwords", "edit_payment"},
+                       "manage_passwords", "edit_payment", "split_payment"},
         "logist":     {"create_trip", "edit_trip", "create_ship", "edit_ship",
                        "export", "print_act", "archive", "complete_trip",
                        "transfer_ship", "cancel_transfer", "edit_invoice",
-                       "edit_trace", "edit_payment"},
+                       "edit_trace", "edit_payment", "split_payment"},
         "dispatcher": {"create_trip", "edit_trip", "delete_trip",
                        "create_ship", "edit_ship", "delete_ship",
                        "export", "print_act", "archive", "complete_trip",
                        "transfer_ship", "cancel_transfer", "edit_invoice",
-                       "edit_trace", "edit_payment"},
+                       "edit_trace", "edit_payment", "split_payment"},
     }
     return action in rights.get(role, set())
 
@@ -2595,8 +2681,186 @@ def admin_panel():
         if rows:
             st.dataframe(safe_df(rows), use_container_width=True)
         else:
-            st.info("Пока пусто")# ============================================================
+            st.info("Пока пусто")
+
+
+# ============================================================
+# v2.12.0: ФОРМА РАЗДЕЛЕНИЯ СЧЁТА НА 3 ПЛАТЕЖА
+# ============================================================
+
+def render_trip_split_form(trip_id, trip, nds_debt, nds_total,
+                           user_login, role):
+    """
+    Форма разделения счёта на 3 платежа.
+    Показывает текущую задолженность по безнал-НДС, остаток и позволяет
+    задать до 3 частей (аванс/доплата/остаток).
+    """
+    parts = extract_trip_payments(trip)
+    paid_total = compute_trip_payments_total(trip)
+    remaining = nds_debt - paid_total
+    if remaining < 0.01:
+        remaining = 0.0
+
+    st.markdown("---")
+    st.markdown("### 🧾 Разделение счёта на части")
+
+    # Сводная плашка
+    badge_color = "#2e7d32" if remaining <= 0.01 else "#f57c00"
+    badge_text = "✅ Оплачен" if remaining <= 0.01 else "⏳ Частично оплачен"
+    st.markdown(
+        '<div style="background:#fff8e1; border-left:4px solid #ffb300; '
+        'padding:8px 12px; border-radius:4px; font-size:14px;">'
+        '<b>Задолженность (безнал с НДС):</b> ' + fmt_money(nds_debt) + ' ₽'
+        ' &nbsp;·&nbsp; <b>Оплачено:</b> ' + fmt_money(paid_total) + ' ₽'
+        ' &nbsp;·&nbsp; <b>Остаток:</b> <span style="color:'
+        + ("#2e7d32" if remaining <= 0.01 else "#c62828") + '; font-weight:bold;">'
+        + fmt_money(remaining) + ' ₽</span>'
+        ' &nbsp;·&nbsp; <span style="background:' + badge_color + '; color:#fff; '
+        'padding:1px 8px; border-radius:10px; font-size:12px; font-weight:bold;">'
+        + badge_text + '</span>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    # Список уже заполненных частей
+    if parts:
+        rows_html = ""
+        for p in parts:
+            label = PAY_SPLIT_LABELS[p["idx"] - 1]
+            rows_html += (
+                "• <b>" + s(p["idx"]) + ". " + label + ":</b> "
+                + fmt_money(p["amount"]) + " ₽"
+                + ("  · дата: " + s(p["date"]) if p["date"] else "")
+                + ("  · " + s(p["comment"]) if p["comment"] else "")
+                + "<br>"
+            )
+        st.markdown(
+            '<div style="background:#f5f5f5; border:1px solid #cccccc; '
+            'border-radius:6px; padding:8px 12px; font-size:13px;">'
+            + rows_html + '</div>',
+            unsafe_allow_html=True,
+        )
+
+    # Форма редактирования
+    form_key = "split_form_" + s(trip_id)
+    with st.form(form_key):
+        st.markdown("**Задать до 3 платежей** (пустые части игнорируются)")
+        new_payments = []
+        for i in range(1, MAX_PAY_SPLITS + 1):
+            label = PAY_SPLIT_LABELS[i - 1]
+            cur_amt = ""
+            cur_date = ""
+            cur_comm = ""
+            for p in parts:
+                if p["idx"] == i:
+                    cur_amt = "{:.2f}".format(p["amount"]).replace(".", ",") if p["amount"] > 0 else ""
+                    cur_date = p["date"]
+                    cur_comm = p["comment"]
+                    break
+
+            st.markdown(
+                '<div style="background:#fafafa; border:1px dashed #cccccc; '
+                'border-radius:6px; padding:8px 10px; margin-bottom:6px;">'
+                '<b>Платёж №' + s(i) + ' — ' + label + '</b>'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+            c1, c2, c3 = st.columns([1, 1, 2])
+            amt_in = c1.text_input(
+                "Сумма ₽",
+                value=cur_amt,
+                key=form_key + "_amt_" + s(i),
+            )
+            dt_in = c2.text_input(
+                "Дата (ДД.ММ.ГГГГ)",
+                value=cur_date,
+                key=form_key + "_dt_" + s(i),
+            )
+            cm_in = c3.text_input(
+                "Комментарий",
+                value=cur_comm,
+                key=form_key + "_cm_" + s(i),
+            )
+            new_payments.append({
+                "amount": amt_in,
+                "date": dt_in,
+                "comment": cm_in,
+            })
+
+        # Проверка
+        total_new = 0.0
+        for p in new_payments:
+            total_new += money_value(p["amount"])
+        total_new = money_value(total_new)
+        if nds_debt > 0.01 and total_new > nds_debt + 0.01:
+            st.error(
+                "⚠️ Сумма платежей (" + fmt_money(total_new)
+                + " ₽) больше задолженности по безнал-НДС ("
+                + fmt_money(nds_debt) + " ₽). Уменьшите суммы."
+            )
+        elif total_new > 0.01:
+            st.info(
+                "Итого по частям: **" + fmt_money(total_new) + " ₽**"
+                + " из **" + fmt_money(nds_debt) + " ₽**"
+            )
+
+        col_save, col_clear, col_cancel = st.columns(3)
+        save_btn = col_save.form_submit_button("💾 Сохранить платежи",
+                                                use_container_width=True)
+        clear_btn = col_clear.form_submit_button("🗑 Очистить все",
+                                                  use_container_width=True)
+        cancel_btn = col_cancel.form_submit_button("Отмена",
+                                                    use_container_width=True)
+
+    if cancel_btn:
+        st.session_state.pop("open_split_" + s(trip_id), None)
+        st.rerun()
+
+    if clear_btn:
+        clear_trip_payments_split(trip_id)
+        log_action(user_login, role, "clear_trip_split",
+                   "trip " + s(trip_id))
+        st.success("Все части платежей очищены")
+        st.rerun()
+
+    if save_btn:
+        # Парсим и валидируем
+        parsed = []
+        for i, p in enumerate(new_payments):
+            amt_raw = s(p.get("amount", "")).strip()
+            dt_raw = s(p.get("date", "")).strip()
+            cm_raw = s(p.get("comment", "")).strip()
+            amt_val = money_value(amt_raw) if amt_raw else 0.0
+            if amt_val < 0:
+                st.error("Сумма платежа №" + s(i + 1) + " не может быть отрицательной")
+                st.stop()
+            try:
+                dt_fmt = parse_date_ui(dt_raw) if dt_raw else ""
+            except ValueError as ex:
+                st.error("Платёж №" + s(i + 1) + ": " + str(ex))
+                st.stop()
+            parsed.append({
+                "amount": amt_val,
+                "date": dt_fmt,
+                "comment": cm_raw,
+            })
+
+        total_parsed = money_value(sum(x["amount"] for x in parsed))
+        if nds_debt > 0.01 and total_parsed > nds_debt + 0.01:
+            st.error("Сумма платежей превышает задолженность по безнал-НДС. "
+                     "Уменьшите суммы.")
+            st.stop()
+
+        update_trip_payments_split(trip_id, parsed)
+        log_action(user_login, role, "update_trip_split",
+                   "trip " + s(trip_id)
+                   + " | итого: " + fmt_money(total_parsed) + " ₽"
+                   + " | частей: " + s(sum(1 for x in parsed if x["amount"] > 0.01)))
+        st.session_state.pop("open_split_" + s(trip_id), None)
+        st.success("Платежи сохранены")
+        st.rerun()# ============================================================
 # ЧАСТЬ 2/2: главная страница и точка входа
+# v2.12.0 — с разделением счёта на 3 платежа
 # ============================================================
 
 def main_page():
@@ -2901,9 +3165,8 @@ def main_page():
 
             has_nds = is_trip_beznal_nds(trip_id, cars)
 
-            # v2.11.4: части оплаты
-            payments_parts = get_trip_payments(t)
-            pay_status = get_trip_payments_status(t, total)
+            # v2.12.0: сводка по разделённым платежам
+            payments_info = compute_trip_nds_debt(t, cars) if has_nds else None
 
             incoming_from_labels = []
             for x in cars:
@@ -2935,7 +3198,7 @@ def main_page():
                 loading_from=loading_from,
                 payment_date=payment_date,
                 payment_comment=payment_comment,
-                payments_parts=payments_parts,
+                payments_info=payments_info,
             )
 
             open_key = "open_details_" + s(trip_id)
@@ -2959,163 +3222,80 @@ def main_page():
             # РАСКРЫТОЕ СОДЕРЖИМОЕ РЕЙСА
             # ====================================================
 
-            # ---- v2.11.4: Форма разделения счёта (безнал с НДС) ----
-            if has_nds and can("edit_payment", role):
+            # ---- v2.11.2: Редактор даты оплаты и комментария для завершённых безнал-НДС ----
+            if view_mode == "completed" and has_nds and can("edit_payment", role):
                 pay_key = "show_pay_form_" + s(trip_id)
-                if st.button("💳 Оплата: разделить счёт на 3 части",
+                if st.button("💳 Изменить дату оплаты и комментарий",
                              key="btn_pay_form_" + s(trip_id)):
                     st.session_state[pay_key] = not st.session_state.get(pay_key, False)
                     st.rerun()
 
                 if st.session_state.get(pay_key):
-                    st.markdown(
-                        '<div style="background:#e3f2fd; border-left:4px solid #1976d2; '
-                        'padding:8px 12px; border-radius:4px; margin-bottom:8px; '
-                        'font-size:13px;">'
-                        'Разделите оплату на части (до 3). Каждую часть можно '
-                        'назвать «аванс», «доплата», «остаток» — просто впишите '
-                        'в комментарий. Суммы автоматически сложатся.'
-                        '</div>',
-                        unsafe_allow_html=True,
-                    )
-
-                    # Инициализация значений из trip
-                    p1_amt = money_value(t.get("pay1_amount", 0))
-                    p1_dt = date_to_display_safe(t.get("pay1_date", ""))
-                    p1_cm = s(t.get("pay1_comment", ""))
-                    p2_amt = money_value(t.get("pay2_amount", 0))
-                    p2_dt = date_to_display_safe(t.get("pay2_date", ""))
-                    p2_cm = s(t.get("pay2_comment", ""))
-                    p3_amt = money_value(t.get("pay3_amount", 0))
-                    p3_dt = date_to_display_safe(t.get("pay3_date", ""))
-                    p3_cm = s(t.get("pay3_comment", ""))
-
-                    with st.form("pay_split_form_" + s(trip_id)):
-                        st.markdown("### 💵 Часть 1 (аванс)")
-                        c1, c2, c3 = st.columns([1, 1, 2])
-                        v_p1_amt = c1.text_input(
-                            "Сумма, ₽",
-                            value=("{:.2f}".format(p1_amt).replace(".", ",")
-                                   if p1_amt > 0.01 else ""),
-                            key="pay1_amt_" + s(trip_id)
+                    with st.form("pay_form_" + s(trip_id)):
+                        st.markdown("**Оплата рейса (безнал с НДС)**")
+                        c1, c2 = st.columns(2)
+                        pd_val = date_to_display_safe(payment_date) if s(payment_date).strip() else ""
+                        new_pd = c1.text_input(
+                            "Дата оплаты (ДД.ММ.ГГГГ)",
+                            value=pd_val,
+                            key="paydate_trip_" + s(trip_id)
                         )
-                        v_p1_dt = c2.text_input(
-                            "Дата (ДД.ММ.ГГГГ)",
-                            value=p1_dt,
-                            key="pay1_dt_" + s(trip_id)
+                        new_pc = c2.text_input(
+                            "Комментарий (куда/кому ушли деньги)",
+                            value=payment_comment,
+                            key="paycomment_trip_" + s(trip_id)
                         )
-                        v_p1_cm = c3.text_input(
-                            "Комментарий (кому/за что)",
-                            value=p1_cm,
-                            key="pay1_cm_" + s(trip_id)
-                        )
-
-                        st.markdown("### 💵 Часть 2 (доплата)")
-                        c4, c5, c6 = st.columns([1, 1, 2])
-                        v_p2_amt = c4.text_input(
-                            "Сумма, ₽",
-                            value=("{:.2f}".format(p2_amt).replace(".", ",")
-                                   if p2_amt > 0.01 else ""),
-                            key="pay2_amt_" + s(trip_id)
-                        )
-                        v_p2_dt = c5.text_input(
-                            "Дата (ДД.ММ.ГГГГ)",
-                            value=p2_dt,
-                            key="pay2_dt_" + s(trip_id)
-                        )
-                        v_p2_cm = c6.text_input(
-                            "Комментарий (кому/за что)",
-                            value=p2_cm,
-                            key="pay2_cm_" + s(trip_id)
-                        )
-
-                        st.markdown("### 💵 Часть 3 (остаток)")
-                        c7, c8, c9 = st.columns([1, 1, 2])
-                        v_p3_amt = c7.text_input(
-                            "Сумма, ₽",
-                            value=("{:.2f}".format(p3_amt).replace(".", ",")
-                                   if p3_amt > 0.01 else ""),
-                            key="pay3_amt_" + s(trip_id)
-                        )
-                        v_p3_dt = c8.text_input(
-                            "Дата (ДД.ММ.ГГГГ)",
-                            value=p3_dt,
-                            key="pay3_dt_" + s(trip_id)
-                        )
-                        v_p3_cm = c9.text_input(
-                            "Комментарий (кому/за что)",
-                            value=p3_cm,
-                            key="pay3_cm_" + s(trip_id)
-                        )
-
-                        # Превью итога
-                        try:
-                            sum_check = (money_value(v_p1_amt)
-                                         + money_value(v_p2_amt)
-                                         + money_value(v_p3_amt))
-                        except Exception:
-                            sum_check = 0.0
-
-                        if total > 0.01:
-                            left_after = total - sum_check
-                            if left_after < 0.01:
-                                left_after = 0.0
-                            st.info(
-                                "Итого оплат: **" + fmt_money(sum_check)
-                                + " ₽** из **" + fmt_money(total) + " ₽**"
-                                + ("  ·  ✅ оплачено полностью" if left_after <= 0.01
-                                   else "  ·  остаток: " + fmt_money(left_after) + " ₽")
-                            )
-
                         save_pay = st.form_submit_button("💾 Сохранить оплату")
-                        clear_pay = st.form_submit_button("🗑 Очистить всё")
+                        clear_pay = st.form_submit_button("🗑 Очистить")
                         cancel_pay = st.form_submit_button("Отмена")
-
                     if cancel_pay:
                         st.session_state.pop(pay_key, None)
                         st.rerun()
-
                     if clear_pay:
-                        update_trip_payments_split(
-                            trip_id,
-                            0, "", "", 0, "", "", 0, "", "",
-                            payment_date="", payment_comment=""
-                        )
-                        log_action(u["login"], role, "clear_trip_payments",
+                        update_trip_payment(trip_id, "", "")
+                        log_action(u["login"], role, "clear_trip_payment",
                                    s(tractor) + " " + s(driver))
                         st.session_state.pop(pay_key, None)
-                        st.success("Все части оплаты очищены")
+                        st.success("Данные оплаты очищены")
                         st.rerun()
-
                     if save_pay:
                         try:
-                            p1_amt_v = money_value(v_p1_amt)
-                            p2_amt_v = money_value(v_p2_amt)
-                            p3_amt_v = money_value(v_p3_amt)
-                            p1_dt_fmt = parse_date_ui(v_p1_dt) if s(v_p1_dt).strip() else ""
-                            p2_dt_fmt = parse_date_ui(v_p2_dt) if s(v_p2_dt).strip() else ""
-                            p3_dt_fmt = parse_date_ui(v_p3_dt) if s(v_p3_dt).strip() else ""
+                            pd_fmt = parse_date_ui(new_pd) if s(new_pd).strip() else ""
                         except ValueError as ex:
                             st.error(str(ex))
                         else:
-                            update_trip_payments_split(
-                                trip_id,
-                                p1_amt_v, p1_dt_fmt, v_p1_cm,
-                                p2_amt_v, p2_dt_fmt, v_p2_cm,
-                                p3_amt_v, p3_dt_fmt, v_p3_cm,
-                                payment_date=payment_date,
-                                payment_comment=payment_comment,
-                            )
-                            log_action(u["login"], role, "edit_trip_payments",
+                            update_trip_payment(trip_id, pd_fmt, new_pc)
+                            log_action(u["login"], role, "edit_trip_payment",
                                        s(tractor) + " " + s(driver)
-                                       + " | " + fmt_money(p1_amt_v)
-                                       + " + " + fmt_money(p2_amt_v)
-                                       + " + " + fmt_money(p3_amt_v))
+                                       + " | дата: " + s(pd_fmt)
+                                       + " | " + s(new_pc))
                             st.session_state.pop(pay_key, None)
-                            st.success("Оплата сохранена")
+                            st.success("Данные оплаты сохранены")
                             st.rerun()
 
-            # ---- Оплатить весь рейс + счёт в одну строку ----
+            # ---- v2.12.0: РАЗДЕЛЕНИЕ СЧЁТА ----
+            if has_nds and view_mode in ("active", "completed"):
+                split_key = "open_split_" + s(trip_id)
+                col_split1, col_split2 = st.columns([2, 3])
+                with col_split1:
+                    if can("split_payment", role):
+                        parts_count = payments_info.get("parts_count", 0) if payments_info else 0
+                        label = ("🧾 Разделить счёт ✏ (частей: " + s(parts_count) + ")"
+                                 if parts_count > 0 else "🧾 Разделить счёт")
+                        if st.button(label, key="btn_split_" + s(trip_id),
+                                     use_container_width=True):
+                            st.session_state[split_key] = not st.session_state.get(split_key, False)
+                            st.rerun()
+
+                if st.session_state.get(split_key):
+                    nds_debt_val = payments_info.get("nds_debt", 0.0) if payments_info else 0.0
+                    nds_total_val = payments_info.get("nds_total", 0.0) if payments_info else 0.0
+                    render_trip_split_form(
+                        trip_id, t, nds_debt_val, nds_total_val,
+                        u["login"], role,
+                    )
+
+            # ---- Оплата рейса + счёт в одну строку (активные/завершённые, безнал НДС) ----
             if has_nds and view_mode in ("active", "completed"):
                 col_pay, col_inv = st.columns([3, 2])
 
@@ -3331,7 +3511,7 @@ def main_page():
                         st.success("Рейс завершён")
                         st.rerun()
 
-            # ---- Форма редактирования рейса ----
+            # ---- Форма редактирования рейса (с полем «Погрузка от») ----
             if st.session_state.get("open_edittrip_" + s(trip_id)):
                 with st.form("edit_trip_" + s(trip_id)):
                     st.markdown("**Редактировать рейс**")
@@ -4016,30 +4196,6 @@ def main_page():
                 if total_nds > 0:
                     st.markdown("**НДС 22%:** " + fmt_money(total_nds))
 
-                # v2.11.4: подытог по частям оплаты
-                if payments_parts:
-                    st.markdown(
-                        '<div style="background:#e3f2fd; border-left:4px solid #1976d2; '
-                        'padding:8px 12px; border-radius:4px; margin-top:8px; '
-                        'font-size:13px;">'
-                        '<b>💳 Оплаты по частям:</b><br>'
-                        + "<br>".join([
-                            "№" + s(p.get("n")) + ": " + fmt_money(p.get("amount")) + " ₽"
-                            + (" от " + s(p.get("date")) if p.get("date") else "")
-                            + (" · " + s(p.get("comment")) if p.get("comment") else "")
-                            for p in payments_parts
-                        ])
-                        + '<br><b>Итого оплачено: '
-                        + fmt_money(pay_status["paid"]) + " ₽ из "
-                        + fmt_money(total) + " ₽</b>"
-                        + ("  ·  ✅ оплачено полностью"
-                           if pay_status["is_fully_paid"]
-                           else "  ·  остаток: "
-                                + fmt_money(pay_status["left"]) + " ₽")
-                        + '</div>',
-                        unsafe_allow_html=True,
-                    )
-
                 for x in sorted(cars, key=lambda z: int(to_float(z.get("position")))):
                     if st.session_state.get("edit_ship_" + s(x["id"])):
                         st.markdown("**Редактировать авто (позиция " + s(x.get("position")) + ")**")
@@ -4048,4 +4204,139 @@ def main_page():
                         if fedit["cancel"]:
                             st.session_state.pop("edit_ship_" + s(x["id"]), None)
                             st.rerun()
-                        if fedit["save
+                        if fedit["save"]:
+                            if not fedit["client"] and not fedit["customer"]:
+                                st.error("Заполните хотя бы одно: ФИО клиента или Заказчик")
+                            else:
+                                try:
+                                    e_dp = parse_date_ui(fedit["date_pay"])
+                                    e_dpa = parse_date_ui(fedit["advance_date"])
+                                    e_dpa2 = parse_date_ui(fedit["advance_date_2"])
+                                except ValueError as ex:
+                                    st.error(str(ex))
+                                else:
+                                    amt_val = money_value(fedit["amount"])
+                                    adv1_val = money_value(fedit["advance"])
+                                    adv2_val = money_value(fedit["advance_2"])
+                                    adv1_val, adv2_val, trimmed = _normalize_advances(
+                                        amt_val, adv1_val, adv2_val)
+                                    if trimmed:
+                                        st.warning(
+                                            "Авансы приведены к сумме перевозки: "
+                                            "Аванс № 1 = " + fmt_money(adv1_val)
+                                            + " ₽, Аванс № 2 = " + fmt_money(adv2_val) + " ₽"
+                                        )
+                                    if fedit["payer_type"] == NDS_PAYER:
+                                        nds_val = amt_val * NDS_RATE / (1 + NDS_RATE)
+                                        no_nds_val = amt_val - nds_val
+                                    else:
+                                        nds_val = 0.0
+                                        no_nds_val = amt_val
+                                    update_shipment(
+                                        x["id"], fedit["position"], fedit["car_model"],
+                                        fedit["client"], amt_val, e_dp, fedit["paid_to"],
+                                        fedit["delivery_city"], fedit["vin"][:17],
+                                        adv1_val, e_dpa, fedit["payer_type"],
+                                        fedit["customer"], fedit["contract_number"],
+                                        nds_val, no_nds_val,
+                                        advance_2=adv2_val,
+                                        advance_date_2=e_dpa2,
+                                        paid_to_2=fedit["paid_to_2"],
+                                    )
+                                    log_action(u["login"], role, "edit_ship",
+                                               "рейс " + s(trip_id) + ", поз " + s(fedit["position"]))
+                                    st.session_state.pop("edit_ship_" + s(x["id"]), None)
+                                    st.success("Изменения сохранены")
+                                    st.rerun()
+
+                if view_mode == "active" and can("create_ship", role) and total_in_route < MAX_CARS:
+                    free_pos_btn = next_free_position(cars) or 1
+                    if st.button("Добавить еще авто (позиция " + s(free_pos_btn) + ")",
+                                 key="btn_more_addcar_" + s(trip_id),
+                                 use_container_width=True):
+                        st.session_state["open_addcar_" + s(trip_id)] = True
+                        st.rerun()
+            else:
+                st.info("В этом рейсе ещё нет авто.")
+
+            st.markdown("---")
+
+    # ============================================================
+    # ИТОГИ
+    # ============================================================
+    st.markdown("---")
+
+    totals_data = compute_grand_totals(trips, shipments)
+
+    spacer, totals = st.columns([1, 2])
+    with totals:
+        debt_nal = totals_data["debt_nal"]
+        debt_beznal = totals_data["debt_beznal"]
+        nds_beznal = totals_data["nds_beznal"]
+
+        st.markdown(
+            '<div style="background:#f5f5f5; border:1px solid #cccccc; '
+            'border-radius:8px; padding:14px 18px; font-size:14px;">'
+
+            '<div style="font-size:18px; font-weight:bold; margin-bottom:8px;">'
+            'Итого</div>'
+
+            '<div style="display:flex; justify-content:space-between; margin:4px 0; flex-wrap:wrap;">'
+            '<span>Активных рейсов:</span><b>'
+            + s(totals_data["active_trips"]) + '</b></div>'
+
+            '<div style="display:flex; justify-content:space-between; margin:4px 0; flex-wrap:wrap;">'
+            '<span>Авто:</span><b>'
+            + s(totals_data["active_cars"]) + '</b></div>'
+
+            '<div style="display:flex; justify-content:space-between; margin:4px 0; flex-wrap:wrap;">'
+            '<span>Общая оплата:</span><b>'
+            + fmt_money(totals_data["total_advance"]) + ' ₽</b></div>'
+
+            '<div style="display:flex; justify-content:space-between; margin:4px 0; '
+            'border-top:1px solid #cccccc; padding-top:6px; flex-wrap:wrap;">'
+            '<span><b>Задолженность нал / эквайринг</b> (активные):</span>'
+            '<b style="color:' + ("#c62828" if debt_nal > 0.01 else "#2e7d32") + ';">'
+            + fmt_money(debt_nal) + ' ₽</b></div>'
+
+            '<div style="display:flex; justify-content:space-between; margin:4px 0; flex-wrap:wrap;">'
+            '<span><b>Задолженность безнал (с НДС)</b> '
+            '(активные + завершённые неоплаченные):</span>'
+            '<b style="color:' + ("#c62828" if debt_beznal > 0.01 else "#2e7d32") + ';">'
+            + fmt_money(debt_beznal) + ' ₽</b></div>'
+
+            '<div style="display:flex; justify-content:space-between; margin:4px 0; flex-wrap:wrap;">'
+            '<span><b>НДС 22%</b> (по безналу):</span>'
+            '<b style="color:' + ("#c62828" if nds_beznal > 0.01 else "#2e7d32") + ';">'
+            + fmt_money(nds_beznal) + ' ₽</b></div>'
+
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+
+# ============================================================
+# ТОЧКА ВХОДА
+# ============================================================
+
+def main():
+    st.set_page_config(page_title="Учёт рейсов", page_icon="🚛", layout="wide")
+
+    if not st.session_state.get("sheets_ready"):
+        try:
+            ensure_sheets_once()
+            st.session_state["sheets_ready"] = True
+        except Exception as e:
+            st.error("Ошибка подключения к Google Sheets: "
+                     + type(e).__name__ + ": " + s(e))
+            st.stop()
+
+    ensure_first_admin()
+    if "user" not in st.session_state:
+        login_page()
+    else:
+        main_page()
+
+
+if __name__ == "__main__":
+    main()
