@@ -1,5 +1,5 @@
 # ============================================================
-# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.12.4
+# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.12.5
 # Streamlit + Google Sheets
 # ЧАСТЬ 1/2
 # ============================================================
@@ -25,6 +25,13 @@ SCOPES = [
 SHEET_SCHEMAS = {
     "users": ["login", "password_hash", "role", "full_name", "active",
               "failed_attempts", "locked_until"],
+    # A=id, B=tractor_number, C=driver, D=route, E=date_departure, F=date_return,
+    # G=created_by, H=created_at, I=archived, J=completed, K=completed_at,
+    # L=invoice_number, M=invoice_date, N=deleted_at, O=loading_from,
+    # P=payment_date, Q=payment_comment,
+    # R=pay1_amount, S=pay1_date, T=pay1_comment,
+    # U=pay2_amount, V=pay2_date, W=pay2_comment,
+    # X=pay3_amount, Y=pay3_date, Z=pay3_comment
     "trips": ["id", "tractor_number", "driver", "route",
               "date_departure", "date_return", "created_by", "created_at",
               "archived", "completed", "completed_at",
@@ -774,7 +781,7 @@ def resolve_source_trip_label_for_car(x, all_trips, transfer_history):
 
 
 # ============================================================
-# РАЗДЕЛЕНИЕ СЧЁТА НА 3 ПЛАТЕЖА (v2.12.4)
+# РАЗДЕЛЕНИЕ СЧЁТА НА 3 ПЛАТЕЖА (v2.12.5)
 # ============================================================
 
 def extract_trip_payments(trip):
@@ -802,14 +809,12 @@ def compute_trip_payments_total(trip):
 
 def compute_trip_nds_debt(trip, shipments):
     """
-    v2.12.4: плашка «Разделение счёта».
-    Считаем:
-      - nds_total   : сумма всех безнал-НДС авто в рейсе (155 000)
-      - nds_debt    : задолженность по безнал-НДС авто (135 000)
-      - paid_from_sum: сколько оплачено от суммы рейса = nds_total - nds_debt (20 000)
-      - paid_total  : сумма разнесённых частей (pay1+pay2+pay3 = 25 000)
-      - to_split    : сколько ещё осталось разнести (nds_debt - paid_total = 110 000)
-      - is_paid     : True если полностью покрыто по авто
+    v2.12.5: без поля to_split.
+      - nds_total     : сумма всех безнал-НДС авто в рейсе (155 000)
+      - nds_debt      : задолженность по безнал-НДС авто (135 000)
+      - paid_from_sum : оплачено от суммы рейса = nds_total - nds_debt (20 000)
+      - paid_total    : сумма разнесённых частей (pay1+pay2+pay3)
+      - is_paid       : True если полностью покрыто
     """
     cars = [x for x in shipments if s(x.get("trip_id")) == s(trip.get("id"))]
     nds_total = 0.0
@@ -823,9 +828,6 @@ def compute_trip_nds_debt(trip, shipments):
             nds_debt += f["debt"]
 
     paid_total = compute_trip_payments_total(trip)
-    to_split = nds_debt - paid_total
-    if to_split < 0.01:
-        to_split = 0.0
 
     paid_from_sum = nds_total - nds_debt
     if paid_from_sum < 0.01:
@@ -835,11 +837,10 @@ def compute_trip_nds_debt(trip, shipments):
     is_paid = bool(nds_debt <= 0.01 or paid_total >= nds_debt - 0.01)
 
     return {
-        "nds_debt": money_value(nds_debt),                # 135 000 — долг по авто
-        "nds_total": money_value(nds_total),              # 155 000 — общая сумма
-        "paid_from_sum": money_value(paid_from_sum),      # 20 000 — оплачено от суммы
-        "paid_total": money_value(paid_total),            # 25 000 — разнесено по частям
-        "to_split": money_value(to_split),                # 110 000 — осталось разнести
+        "nds_debt": money_value(nds_debt),
+        "nds_total": money_value(nds_total),
+        "paid_from_sum": money_value(paid_from_sum),
+        "paid_total": money_value(paid_total),
         "parts_count": len(parts),
         "is_paid": is_paid,
         "parts": parts,
@@ -2027,7 +2028,7 @@ def render_shipment_form(form_key, c=None, submit_label="Сохранить ав
 
 
 # ============================================================
-# ШАПКА РЕЙСА
+# ШАПКА РЕЙСА (v2.12.5)
 # ============================================================
 
 def render_trip_header(trip_id, tractor, driver, route, dep, ret,
@@ -2167,8 +2168,7 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
             + '</div>'
         )
 
-    # v2.12.4: плашка «Разделение счёта» — 
-    # «Оплачено от суммы» = сумма − задолженность, «по разбивке» = pay1+pay2+pay3.
+    # v2.12.5: плашка «Разделение счёта» — БЕЗ «Осталось разнести».
     splits_html = ""
     if has_nds and payments_info:
         parts = payments_info.get("parts", [])
@@ -2176,7 +2176,6 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
         nds_debt = payments_info.get("nds_debt", 0.0)
         nds_total = payments_info.get("nds_total", 0.0)
         paid_from_sum = payments_info.get("paid_from_sum", 0.0)
-        to_split = payments_info.get("to_split", 0.0)
         parts_count = payments_info.get("parts_count", 0)
         is_paid = payments_info.get("is_paid", False)
 
@@ -2198,9 +2197,6 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
             '<b style="color:#c62828;">' + fmt_money(nds_debt) + ' ₽</b>'
             ' &nbsp;·&nbsp; По разбивке: <b>' + fmt_money(paid_total) + ' ₽</b>'
             ' &nbsp;·&nbsp; Частей: <b>' + s(parts_count) + '</b>'
-            ' &nbsp;·&nbsp; Осталось разнести: <b style="color:'
-            + ("#2e7d32" if to_split <= 0.01 else "#c62828") + ';">'
-            + fmt_money(to_split) + ' ₽</b>'
         )
         if parts:
             rows_html = "<br>"
@@ -2836,8 +2832,7 @@ def render_trip_split_form(trip_id, trip, nds_debt, nds_total,
         st.success("Платежи сохранены")
         st.rerun()# ============================================================
 # ЧАСТЬ 2/2: главная страница и точка входа
-# v2.12.4 — «Остаток» = сумма − задолженность (оплачено от суммы)
-#           карточки авто полностью закрашены (красный/зелёный/серый)
+# v2.12.4 — карточки авто полностью закрашены
 # ============================================================
 
 def main_page():
@@ -3655,7 +3650,7 @@ def main_page():
                         target_trip_label = resolve_target_trip_label(
                             tr_to, trips, transfer_history)
 
-                    # v2.12.4: КАРТОЧКА ПОЛНОСТЬЮ ЗАКРАШЕНА (красный/зелёный/серый)
+                    # Карточка полностью закрашена
                     if is_trace:
                         bg = "#eeeeee"; bd = "#bdbdbd"
                         status_text = "⚪ Перенесён"
@@ -3681,8 +3676,6 @@ def main_page():
                         bg = "#ffcdd2"; bd = "#c62828"
                         status_text = "🔴 Долг"
 
-                    # Карточка полностью закрашена (bg), толстая полоса слева (bd),
-                    # отступ 14px, тень — чёткое разделение между карточками.
                     st.markdown(
                         '<div style="background-color:' + bg + '; '
                         'border:2px solid ' + bd + '; '
