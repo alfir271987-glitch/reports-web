@@ -1,4 +1,2845 @@
 # ============================================================
+# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.12.6
+# Streamlit + Google Sheets
+# ЧАСТЬ 1/2
+# ============================================================
+
+import streamlit as st
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+from datetime import datetime, timedelta
+import hashlib
+import hmac
+import uuid
+import os
+import re
+
+SHEET_ID = "1MHslz3VRowoOLtS_AAQ5h-tFm-fIXBN8noqtyQpmKLw"
+CRED_FILE = "gifted-mountain-508410-s3-96f38b5a0f63.json"
+
+SCOPES = [
+    "https://spreadsheets.google.com/feeds",
+    "https://www.googleapis.com/auth/drive",
+]
+
+SHEET_SCHEMAS = {
+    "users": ["login", "password_hash", "role", "full_name", "active",
+              "failed_attempts", "locked_until"],
+    # A=id, B=tractor_number, C=driver, D=route, E=date_departure, F=date_return,
+    # G=created_by, H=created_at, I=archived, J=completed, K=completed_at,
+    # L=invoice_number, M=invoice_date, N=deleted_at, O=loading_from,
+    # P=payment_date, Q=payment_comment,
+    # R=pay1_amount, S=pay1_date, T=pay1_comment,
+    # U=pay2_amount, V=pay2_date, W=pay2_comment,
+    # X=pay3_amount, Y=pay3_date, Z=pay3_comment
+    "trips": ["id", "tractor_number", "driver", "route",
+              "date_departure", "date_return", "created_by", "created_at",
+              "archived", "completed", "completed_at",
+              "invoice_number", "invoice_date", "deleted_at",
+              "loading_from",
+              "payment_date", "payment_comment",
+              "pay1_amount", "pay1_date", "pay1_comment",
+              "pay2_amount", "pay2_date", "pay2_comment",
+              "pay3_amount", "pay3_date", "pay3_comment"],
+    "shipments": ["id", "trip_id", "position", "car_model", "client",
+                  "amount", "date_pay", "paid_to",
+                  "delivery_city", "vin",
+                  "advance", "advance_date",
+                  "payer_type", "customer", "contract_number",
+                  "nds_amount", "amount_no_nds",
+                  "created_by", "created_at", "issued", "issued_ever",
+                  "paid", "archived", "paid_amount",
+                  "invoice_number", "invoice_date",
+                  "transferred_to_trip", "transferred_at",
+                  "transferred_from_trip",
+                  "advance_2", "advance_date_2", "paid_to_2"],
+    "transfer_history": ["id", "ts", "shipment_id", "from_trip", "to_trip",
+                         "from_position", "to_position", "user_login", "note",
+                         "cancelled"],
+    "audit_log": ["id", "ts", "login", "role", "action", "details"],
+    "act_log": ["id", "ts", "login", "trip_id", "shipment_id", "client"],
+}
+
+ROLES = ["admin", "director", "logist", "dispatcher"]
+PAYER_TYPES = ["нал", "эквайринг", "безнал с НДС 22%"]
+NDS_RATE = 0.22
+NDS_PAYER = "безнал с НДС 22%"
+MAX_CARS = 8
+CACHE_TTL = 300
+LOGIN_MAX_ATTEMPTS = 5
+LOGIN_LOCK_MINUTES = 15
+
+MAX_PAY_SPLITS = 3
+PAY_SPLIT_LABELS = ["аванс", "доплата", "остаток"]
+
+
+# ============================================================
+# УТИЛИТЫ
+# ============================================================
+
+def s(x):
+    if x is None:
+        return ""
+    return str(x)
+
+
+def to_float(x):
+    if x is None:
+        return 0.0
+    if isinstance(x, (int, float)):
+        return float(x)
+    try:
+        t = str(x).strip()
+    except Exception:
+        return 0.0
+    if not t:
+        return 0.0
+    t = t.replace(" ", "").replace("\u00a0", "").replace("\u202f", "")
+    if "." in t and "," in t:
+        t = t.replace(".", "").replace(",", ".")
+    else:
+        t = t.replace(",", ".")
+    try:
+        return float(t)
+    except ValueError:
+        return 0.0
+
+
+def money_value(x):
+    return round(to_float(x), 2)
+
+
+def fmt_money(x):
+    v = to_float(x)
+    ss = "{:,.2f}".format(v)
+    ss = ss.replace(",", " ")
+    ss = ss.replace(".", ",")
+    return ss
+
+
+def parse_date_ui(x):
+    if x is None:
+        return ""
+    t = str(x).strip()
+    if not t:
+        return ""
+    for fmt in ("%d.%m.%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(t, fmt).strftime("%d.%m.%Y")
+        except ValueError:
+            continue
+    raise ValueError("Неверный формат даты: «" + t + "». Введите ДД.ММ.ГГГГ (например 12.05.2026)")
+
+
+def date_to_display_safe(x):
+    if x is None:
+        return ""
+    t = str(x).strip()
+    if not t:
+        return ""
+    for fmt in ("%d.%m.%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(t, fmt).strftime("%d.%m.%Y")
+        except ValueError:
+            continue
+    return t
+
+
+def date_sort_key(x):
+    if x is None:
+        return datetime.min.date()
+    t = str(x).strip()
+    if not t:
+        return datetime.min.date()
+    for fmt in ("%d.%m.%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(t, fmt).date()
+        except ValueError:
+            continue
+    return datetime.min.date()
+
+
+def looks_like_datetime(v):
+    t = s(v).strip()
+    if not t:
+        return False
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d.%m.%Y", "%d.%m.%Y %H:%M:%S"):
+        try:
+            datetime.strptime(t, fmt)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def new_uuid(prefix=""):
+    return (prefix + str(uuid.uuid4())[:8]).upper()
+
+
+def is_active(u):
+    return s(u.get("active")).strip().lower() in ("1", "1.0", "true")
+
+
+def is_archived(v):
+    return s(v).strip().lower() in ("1", "1.0", "true")
+
+
+def check_paid(v):
+    return s(v).strip().lower() in ("1", "1.0", "true", "да", "yes")
+
+
+def check_issued(v):
+    return s(v).strip().lower() in ("1", "1.0", "true", "да", "yes")
+
+
+def check_completed(v):
+    return s(v).strip().lower() in ("1", "1.0", "true", "да", "yes")
+
+
+def is_deleted(v):
+    t = s(v).strip()
+    if not t:
+        return False
+    if looks_like_datetime(t):
+        return True
+    return False
+
+
+def safe_df(rows):
+    if not rows:
+        return rows
+    return [{k: ("" if v is None else str(v)) for k, v in r.items()} for r in rows]
+
+
+# ============================================================
+# ПАРОЛИ
+# ============================================================
+
+try:
+    import bcrypt
+    HAS_BCRYPT = True
+except ImportError:
+    HAS_BCRYPT = False
+
+
+def hash_password(p):
+    if HAS_BCRYPT:
+        return bcrypt.hashpw(p.encode("utf-8"), bcrypt.gensalt(rounds=10)).decode("utf-8")
+    return hashlib.sha256(p.encode("utf-8")).hexdigest()
+
+
+def verify_password(p, stored_hash):
+    if not stored_hash:
+        return False
+    stored_hash = s(stored_hash)
+    if stored_hash.startswith(("$2a$", "$2b$", "$2y$")):
+        if not HAS_BCRYPT:
+            return False
+        try:
+            return bcrypt.checkpw(p.encode("utf-8"), stored_hash.encode("utf-8"))
+        except Exception:
+            return False
+    old_hash = hashlib.sha256(p.encode("utf-8")).hexdigest()
+    return hmac.compare_digest(old_hash, stored_hash)
+
+
+def needs_password_upgrade(stored_hash):
+    if not stored_hash:
+        return False
+    return not s(stored_hash).startswith(("$2a$", "$2b$", "$2y$"))
+
+
+def check_lockout(u):
+    locked_until = s(u.get("locked_until", "")).strip()
+    if not locked_until:
+        return None
+    try:
+        dt = datetime.strptime(locked_until, "%Y-%m-%d %H:%M:%S")
+        if dt > datetime.now():
+            return dt
+    except Exception:
+        pass
+    return None
+
+
+# ============================================================
+# GOOGLE SHEETS
+# ============================================================
+
+@st.cache_resource
+def get_book():
+    if os.path.exists(CRED_FILE):
+        creds = ServiceAccountCredentials.from_json_keyfile_name(CRED_FILE, SCOPES)
+    else:
+        creds_dict = dict(st.secrets["gcp_service_account"])
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, SCOPES)
+    client = gspread.authorize(creds)
+    return client.open_by_key(SHEET_ID)
+
+
+@st.cache_resource
+def get_ws_cached(name):
+    return get_book().worksheet(name)
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def read_all_cached(name):
+    ws = get_ws_cached(name)
+    return ws.get_all_records()
+
+
+def read_all(name, fresh=False):
+    if fresh:
+        read_all_cached.clear(name)
+    return read_all_cached(name)
+
+
+def invalidate_cache(name=None):
+    if name:
+        read_all_cached.clear(name)
+    else:
+        read_all_cached.clear()
+    try:
+        _id_to_row_index.clear()
+    except Exception:
+        pass
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _id_to_row_index(name):
+    rows = read_all_cached(name)
+    result = {}
+    for idx, r in enumerate(rows):
+        rid = s(r.get("id"))
+        if rid:
+            result[rid] = idx + 2
+    return result
+
+
+def _find_row_index_by_id(name, row_id):
+    return _id_to_row_index(name).get(s(row_id))
+
+
+def _migrate_trips_n_to_o(ws):
+    try:
+        all_vals = ws.get_all_values()
+        if len(all_vals) < 2:
+            return
+        updates = []
+        for i, row in enumerate(all_vals[1:], start=2):
+            n_val = s(row[13]).strip() if len(row) > 13 else ""
+            o_val = s(row[14]).strip() if len(row) > 14 else ""
+            if n_val and not looks_like_datetime(n_val) and not o_val:
+                updates.append({"range": "O" + str(i), "values": [[n_val]]})
+                updates.append({"range": "N" + str(i), "values": [[""]]})
+        if updates:
+            ws.batch_update(updates, value_input_option="USER_ENTERED")
+    except Exception as e:
+        _log_system_error("migrate_trips_n_to_o", "trips", e)
+
+
+def ensure_sheets_once():
+    book = get_book()
+    existing = {ws.title for ws in book.worksheets()}
+    for name, headers in SHEET_SCHEMAS.items():
+        if name not in existing:
+            ws = book.add_worksheet(title=name, rows=1000, cols=len(headers))
+            ws.append_row(headers)
+            continue
+
+        ws = book.worksheet(name)
+        try:
+            if ws.col_count < len(headers):
+                ws.add_cols(len(headers) - ws.col_count)
+        except Exception as e:
+            _log_system_error("ensure_cols", name, e)
+
+        try:
+            current = ws.row_values(1)
+        except Exception as e:
+            _log_system_error("row_values", name, e)
+            current = []
+
+        missing = [h for h in headers if h not in current]
+        if missing:
+            start_col = len(current) + 1
+            for idx, h in enumerate(missing):
+                try:
+                    ws.update_cell(1, start_col + idx, h)
+                except Exception as e:
+                    _log_system_error("update_cell_header", name, e)
+
+        if name == "trips":
+            _migrate_trips_n_to_o(ws)
+            try:
+                current2 = ws.row_values(1)
+                required_pay = {
+                    "R": "pay1_amount", "S": "pay1_date", "T": "pay1_comment",
+                    "U": "pay2_amount", "V": "pay2_date", "W": "pay2_comment",
+                    "X": "pay3_amount", "Y": "pay3_date", "Z": "pay3_comment",
+                }
+                for col_letter, header_name in required_pay.items():
+                    idx = 0
+                    for ch in col_letter:
+                        idx = idx * 26 + (ord(ch) - ord('A') + 1)
+                    idx0 = idx - 1
+                    val = current2[idx0] if idx0 < len(current2) else ""
+                    if s(val).strip() != header_name:
+                        try:
+                            ws.update_cell(1, idx, header_name)
+                        except Exception as e:
+                            _log_system_error("fix_v2120_col_" + col_letter, name, e)
+            except Exception as e:
+                _log_system_error("ensure_v2120_cols", name, e)
+
+        if name == "shipments":
+            try:
+                current2 = ws.row_values(1)
+                required_at = {
+                    "AD": "advance_2",
+                    "AE": "advance_date_2",
+                    "AF": "paid_to_2",
+                }
+                for col_letter, header_name in required_at.items():
+                    idx = 0
+                    for ch in col_letter:
+                        idx = idx * 26 + (ord(ch) - ord('A') + 1)
+                    idx0 = idx - 1
+                    val = current2[idx0] if idx0 < len(current2) else ""
+                    if s(val).strip() != header_name:
+                        try:
+                            ws.update_cell(1, idx, header_name)
+                        except Exception as e:
+                            _log_system_error("fix_v2107_col_" + col_letter, name, e)
+            except Exception as e:
+                _log_system_error("ensure_v2107_cols", name, e)
+    return True
+
+
+def append_row(name, row_dict):
+    ws = get_ws_cached(name)
+    headers = SHEET_SCHEMAS[name]
+    try:
+        if ws.col_count < len(headers):
+            ws.add_cols(len(headers) - ws.col_count)
+    except Exception as e:
+        _log_system_error("append_cols", name, e)
+    row = [row_dict.get(h, "") for h in headers]
+    ws.append_row(row)
+    invalidate_cache(name)
+
+
+def log_action(login, role, action, details=""):
+    try:
+        ws = get_ws_cached("audit_log")
+        row = [
+            new_uuid(),
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            s(login), s(role), s(action), s(details),
+        ]
+        ws.append_row(row)
+        invalidate_cache("audit_log")
+    except Exception as e:
+        print("AUDIT ERROR:", e)
+
+
+def _log_system_error(where, name, exc):
+    try:
+        log_action("SYSTEM", "system", "sheets_error",
+                   where + " | " + s(name) + " | " + type(exc).__name__ + ": " + s(exc))
+    except Exception:
+        print("SHEETS ERROR:", where, name, exc)
+
+
+def get_trips(fresh=False):
+    return read_all("trips", fresh=fresh)
+
+
+def get_shipments(fresh=False):
+    return read_all("shipments", fresh=fresh)
+
+
+def get_transfer_history(fresh=False):
+    return read_all("transfer_history", fresh=fresh)
+
+
+def next_trip_id():
+    rows = read_all_cached("trips")
+    max_id = 0
+    for r in rows:
+        try:
+            v = int(to_float(r.get("id")))
+            if v > max_id:
+                max_id = v
+        except Exception:
+            pass
+    return max_id + 1
+
+
+def next_shipment_id():
+    return new_uuid()
+
+
+# ============================================================
+# ФИНАНСЫ И СТАТУСЫ
+# ============================================================
+
+def _adv1(x):
+    return to_float(x.get("advance"))
+
+
+def _adv2(x):
+    return to_float(x.get("advance_2"))
+
+
+def _total_advance(x):
+    return _adv1(x) + _adv2(x)
+
+
+def is_advance_covers(x):
+    amount = to_float(x.get("amount"))
+    if amount <= 0.01:
+        return False
+    total_adv = _total_advance(x)
+    return total_adv >= amount - 0.01
+
+
+def is_effectively_issued(x):
+    if check_issued(s(x.get("issued", "0"))):
+        return True
+    if is_advance_covers(x):
+        return True
+    return False
+
+
+def calculate_financials(row):
+    amount = to_float(row.get("amount"))
+    adv1 = to_float(row.get("advance"))
+    adv2 = to_float(row.get("advance_2"))
+    advance = adv1 + adv2
+    if amount > 0.01 and advance > amount:
+        advance = amount
+    paid_amount = to_float(row.get("paid_amount"))
+    paid_flag = check_paid(row.get("paid", "0"))
+    payer_type = s(row.get("payer_type"))
+
+    debt = amount - advance
+    if debt < 0.01 or paid_flag:
+        debt = 0.0
+
+    if payer_type == NDS_PAYER:
+        nds = amount * NDS_RATE / (1 + NDS_RATE)
+        amount_no_nds = amount - nds
+    else:
+        nds = 0.0
+        amount_no_nds = amount
+
+    # v2.12.6: paid_value — сколько фактически оплачено по авто
+    # = amount - debt. При paid=1 debt=0 → paid_value = amount.
+    paid_value = amount - debt
+    if paid_value < 0:
+        paid_value = 0.0
+
+    if debt <= 0.01:
+        status_text = "🟡 Оплачен"
+    else:
+        status_text = "🔴 Долг"
+
+    return {
+        "amount": amount,
+        "advance": advance,
+        "advance_1": adv1,
+        "advance_2": adv2,
+        "paid_amount": paid_amount,
+        "paid_value": paid_value,
+        "debt": debt,
+        "nds": nds,
+        "amount_no_nds": amount_no_nds,
+        "status_text": status_text,
+    }
+
+
+def is_car_active_on_avtovoz(x):
+    if is_effectively_issued(x):
+        return False
+    if s(x.get("transferred_to_trip", "")):
+        return False
+    return True
+
+
+def count_active_cars(cars):
+    return sum(1 for x in cars if is_car_active_on_avtovoz(x))
+
+
+def count_issued_cars(cars):
+    return sum(1 for x in cars if is_effectively_issued(x))
+
+
+def is_trace_row(x):
+    return (bool(s(x.get("transferred_to_trip", "")))
+            and s(x.get("car_model", "")).startswith("Перенесён:"))
+
+
+def is_transferred_car(x):
+    if is_trace_row(x):
+        return False
+    ac = s(x.get("transferred_from_trip", "")).strip()
+    aa = s(x.get("transferred_to_trip", "")).strip()
+    return bool(ac or aa)
+
+
+def count_outgoing_transfers(cars):
+    return sum(1 for x in cars if is_trace_row(x))
+
+
+def count_incoming_transfers(cars):
+    return sum(1 for x in cars if is_transferred_car(x))
+
+
+def count_incoming_on_route(cars):
+    return sum(
+        1 for x in cars
+        if is_transferred_car(x)
+        and not is_effectively_issued(x)
+    )
+
+
+def sum_incoming_transfers(cars):
+    total_amount = 0.0
+    total_advance = 0.0
+    total_debt = 0.0
+    for x in cars:
+        if not is_transferred_car(x):
+            continue
+        f = calculate_financials(x)
+        total_amount += f["amount"]
+        total_advance += f["advance"]
+        total_debt += f["debt"]
+    return total_amount, total_advance, total_debt
+
+
+def _is_nal_or_acquiring(x):
+    pt = s(x.get("payer_type", "")).strip()
+    return pt in ("нал", "эквайринг")
+
+
+def _is_beznal_nds(x):
+    return s(x.get("payer_type", "")).strip() == NDS_PAYER
+
+
+def is_trip_beznal_nds(trip_id, shipments):
+    for x in shipments:
+        if s(x.get("trip_id")) == s(trip_id) and _is_beznal_nds(x):
+            return True
+    return False
+
+
+def compute_grand_totals(trips, shipments):
+    """
+    v2.12.6: ИСПРАВЛЕНО.
+    «Общая оплата» = сумма ФАКТИЧЕСКИ оплаченного по всем авто
+    в активных рейсах = Σ (amount - debt).
+    Учитывает флаг paid=1, авансы 1 и 2, доплаты (paid_amount).
+    Не пропускает «выданные» авто — они тоже входят в оплату.
+    """
+    active_trip_ids = {s(t.get("id")) for t in trips
+                       if not is_archived(t.get("archived", "0"))
+                       and not is_deleted(t.get("deleted_at", ""))
+                       and not check_completed(t.get("completed", "0"))}
+
+    completed_trip_ids = {s(t.get("id")) for t in trips
+                          if check_completed(t.get("completed", "0"))
+                          and not is_archived(t.get("archived", "0"))
+                          and not is_deleted(t.get("deleted_at", ""))}
+
+    active_cars = [x for x in shipments
+                   if s(x.get("trip_id")) in active_trip_ids]
+
+    total_amount = 0.0
+    total_paid = 0.0
+    active_cars_count = 0
+    for x in active_cars:
+        # Считаем ВСЕ авто активных рейсов, включая выданные —
+        # чтобы «Общая оплата» отражала реально закрытые суммы.
+        f = calculate_financials(x)
+        total_amount += f["amount"]
+        total_paid += f["paid_value"]
+        # Активных авто — тех, что ещё «в работе» на автовозе
+        if not is_effectively_issued(x):
+            active_cars_count += 1
+
+    # Задолженность нал/эквайринг — только по неоплаченным
+    debt_nal = 0.0
+    for x in active_cars:
+        if not _is_nal_or_acquiring(x):
+            continue
+        if is_effectively_issued(x):
+            continue
+        if check_paid(s(x.get("paid", "0"))):
+            continue
+        f = calculate_financials(x)
+        if f["debt"] > 0.01:
+            debt_nal += f["debt"]
+
+    beznal_trip_ids = active_trip_ids | completed_trip_ids
+    debt_beznal = 0.0
+    nds_beznal = 0.0
+    for x in shipments:
+        if s(x.get("trip_id")) not in beznal_trip_ids:
+            continue
+        if not _is_beznal_nds(x):
+            continue
+        if check_paid(s(x.get("paid", "0"))):
+            continue
+        f = calculate_financials(x)
+        if f["debt"] > 0.01:
+            debt_beznal += f["debt"]
+            nds_beznal += f["nds"]
+
+    return {
+        "active_trips": len(active_trip_ids),
+        "active_cars": active_cars_count,
+        "total_amount": total_amount,
+        "total_paid": total_paid,       # ← новое: «Общая оплата»
+        "total_advance": total_paid,    # ← алиас для совместимости
+        "debt_nal": debt_nal,
+        "debt_beznal": debt_beznal,
+        "nds_beznal": nds_beznal,
+    }
+
+
+def next_free_position(cars):
+    occupied = set()
+    for x in cars:
+        if not is_car_active_on_avtovoz(x):
+            continue
+        try:
+            occupied.add(int(to_float(x.get("position"))))
+        except Exception:
+            pass
+    for p in range(1, MAX_CARS + 1):
+        if p not in occupied:
+            return p
+    return None
+
+
+def describe_trip(trip):
+    if not trip:
+        return ""
+    parts = []
+    if s(trip.get("tractor_number", "")):
+        parts.append(s(trip.get("tractor_number", "")))
+    if s(trip.get("driver", "")):
+        parts.append(s(trip.get("driver", "")))
+    if s(trip.get("loading_from", "")):
+        parts.append("погрузка от " + s(trip.get("loading_from", "")))
+    if s(trip.get("route", "")):
+        parts.append(s(trip.get("route", "")))
+    dep = date_to_display_safe(trip.get("date_departure", ""))
+    if dep:
+        parts.append("выезд " + dep)
+    return " — ".join(parts)
+
+
+def find_trip_by_id(all_trips, trip_id):
+    tid = s(trip_id).strip()
+    if not tid:
+        return None
+    for t in all_trips:
+        if s(t.get("id")) == tid:
+            return t
+    return None
+
+
+def resolve_target_trip_label(target_id, all_trips, transfer_history=None):
+    tid = s(target_id).strip()
+    if not tid:
+        return "—"
+    trip = find_trip_by_id(all_trips, tid)
+    if trip:
+        label = describe_trip(trip)
+        if check_completed(trip.get("completed", "0")):
+            label += " ✅"
+        if is_archived(trip.get("archived", "0")):
+            label += " 📦"
+        if is_deleted(trip.get("deleted_at", "")):
+            label += " 🗑"
+        return label
+    if transfer_history:
+        for h in transfer_history:
+            if s(h.get("to_trip")) == tid:
+                ts = s(h.get("ts", ""))
+                if ts:
+                    return "рейс #" + tid + " (перенос " + ts[:10] + ")"
+                break
+    return "рейс #" + tid
+
+
+def find_target_trip_for_parent(parent_ship_id, all_shipments):
+    pid = s(parent_ship_id).strip()
+    if not pid:
+        return ""
+    for c in all_shipments:
+        if s(c.get("id")) == pid:
+            return s(c.get("trip_id", ""))
+    return ""
+
+
+def resolve_source_trip_label_for_car(x, all_trips, transfer_history):
+    ac = s(x.get("transferred_from_trip", "")).strip()
+    if ac:
+        return resolve_target_trip_label(ac, all_trips, transfer_history)
+    sid = s(x.get("id"))
+    for h in transfer_history:
+        if s(h.get("shipment_id")) == sid and s(h.get("cancelled", "")) != "1":
+            from_trip = s(h.get("from_trip", "")).strip()
+            if from_trip:
+                return resolve_target_trip_label(from_trip, all_trips, transfer_history)
+    return "—"
+
+
+# ============================================================
+# РАЗДЕЛЕНИЕ СЧЁТА НА 3 ПЛАТЕЖА
+# ============================================================
+
+def extract_trip_payments(trip):
+    payments = []
+    for i in range(1, MAX_PAY_SPLITS + 1):
+        amt = to_float(trip.get("pay" + s(i) + "_amount"))
+        dt = date_to_display_safe(trip.get("pay" + s(i) + "_date", ""))
+        cm = s(trip.get("pay" + s(i) + "_comment", "")).strip()
+        if amt > 0.01 or dt or cm:
+            payments.append({
+                "idx": i,
+                "amount": money_value(amt),
+                "date": dt,
+                "comment": cm,
+            })
+    return payments
+
+
+def compute_trip_payments_total(trip):
+    total = 0.0
+    for i in range(1, MAX_PAY_SPLITS + 1):
+        total += to_float(trip.get("pay" + s(i) + "_amount"))
+    return money_value(total)
+
+
+def compute_trip_nds_debt(trip, shipments):
+    cars = [x for x in shipments if s(x.get("trip_id")) == s(trip.get("id"))]
+    nds_total = 0.0
+    nds_debt = 0.0
+    for x in cars:
+        if not _is_beznal_nds(x):
+            continue
+        f = calculate_financials(x)
+        nds_total += f["amount"]
+        if not check_paid(s(x.get("paid", "0"))):
+            nds_debt += f["debt"]
+
+    paid_total = compute_trip_payments_total(trip)
+
+    paid_from_sum = nds_total - nds_debt
+    if paid_from_sum < 0.01:
+        paid_from_sum = 0.0
+
+    parts = extract_trip_payments(trip)
+    is_paid = bool(nds_debt <= 0.01 or paid_total >= nds_debt - 0.01)
+
+    return {
+        "nds_debt": money_value(nds_debt),
+        "nds_total": money_value(nds_total),
+        "paid_from_sum": money_value(paid_from_sum),
+        "paid_total": money_value(paid_total),
+        "parts_count": len(parts),
+        "is_paid": is_paid,
+        "parts": parts,
+    }
+
+
+def update_trip_payments_split(trip_id, payments):
+    ws = get_ws_cached("trips")
+    row_idx = _find_row_index_by_id("trips", trip_id)
+    if row_idx is None:
+        return False
+
+    payload = []
+    col_map = [
+        ("R", "S", "T"),
+        ("U", "V", "W"),
+        ("X", "Y", "Z"),
+    ]
+    for i in range(MAX_PAY_SPLITS):
+        amt = 0.0
+        dt = ""
+        cm = ""
+        if i < len(payments):
+            p = payments[i] or {}
+            amt = money_value(p.get("amount"))
+            dt = date_to_display_safe(p.get("date", ""))
+            cm = s(p.get("comment", "")).strip()
+        c_amt, c_dt, c_cm = col_map[i]
+        payload.append({"range": c_amt + str(row_idx), "values": [[amt]]})
+        payload.append({"range": c_dt + str(row_idx), "values": [[dt]]})
+        payload.append({"range": c_cm + str(row_idx), "values": [[cm]]})
+
+    ws.batch_update(payload, value_input_option="USER_ENTERED")
+    invalidate_cache("trips")
+    return True
+
+
+def clear_trip_payments_split(trip_id):
+    return update_trip_payments_split(trip_id, [])
+
+
+# ============================================================
+# CRUD: РЕЙСЫ
+# ============================================================
+
+def create_trip(tractor, driver, route, dep, ret, created_by, loading_from=""):
+    append_row("trips", {
+        "id": next_trip_id(),
+        "tractor_number": s(tractor), "driver": s(driver), "route": s(route),
+        "date_departure": s(dep), "date_return": s(ret),
+        "created_by": s(created_by),
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "archived": "0",
+        "completed": "0",
+        "completed_at": "",
+        "invoice_number": "",
+        "invoice_date": "",
+        "deleted_at": "",
+        "loading_from": s(loading_from),
+        "payment_date": "",
+        "payment_comment": "",
+        "pay1_amount": "", "pay1_date": "", "pay1_comment": "",
+        "pay2_amount": "", "pay2_date": "", "pay2_comment": "",
+        "pay3_amount": "", "pay3_date": "", "pay3_comment": "",
+    })
+
+
+def update_trip(trip_id, tractor, driver, route, dep, ret,
+                loading_from="", payment_date="", payment_comment=""):
+    ws = get_ws_cached("trips")
+    row_idx = _find_row_index_by_id("trips", trip_id)
+    if row_idx is None:
+        return False
+    payload = [
+        {"range": "B" + str(row_idx), "values": [[s(tractor)]]},
+        {"range": "C" + str(row_idx), "values": [[s(driver)]]},
+        {"range": "D" + str(row_idx), "values": [[s(route)]]},
+        {"range": "E" + str(row_idx), "values": [[s(dep)]]},
+        {"range": "F" + str(row_idx), "values": [[s(ret)]]},
+        {"range": "O" + str(row_idx), "values": [[s(loading_from)]]},
+        {"range": "P" + str(row_idx), "values": [[s(payment_date)]]},
+        {"range": "Q" + str(row_idx), "values": [[s(payment_comment)]]},
+    ]
+    ws.batch_update(payload, value_input_option="USER_ENTERED")
+    invalidate_cache("trips")
+    return True
+
+
+def update_trip_payment(trip_id, payment_date, payment_comment):
+    ws = get_ws_cached("trips")
+    row_idx = _find_row_index_by_id("trips", trip_id)
+    if row_idx is None:
+        return False
+    payload = [
+        {"range": "P" + str(row_idx), "values": [[s(payment_date)]]},
+        {"range": "Q" + str(row_idx), "values": [[s(payment_comment)]]},
+    ]
+    ws.batch_update(payload, value_input_option="USER_ENTERED")
+    invalidate_cache("trips")
+    return True
+
+
+def update_trip_invoice(trip_id, invoice_number, invoice_date):
+    ws = get_ws_cached("trips")
+    row_idx = _find_row_index_by_id("trips", trip_id)
+    if row_idx is None:
+        return False
+    payload = [
+        {"range": "L" + str(row_idx), "values": [[s(invoice_number)]]},
+        {"range": "M" + str(row_idx), "values": [[s(invoice_date)]]},
+    ]
+    ws.batch_update(payload, value_input_option="USER_ENTERED")
+    invalidate_cache("trips")
+    return True
+
+
+def archive_trip(trip_id):
+    ws = get_ws_cached("trips")
+    row_idx = _find_row_index_by_id("trips", trip_id)
+    if row_idx is None:
+        return False
+    ws.update_cell(row_idx, 9, "1")
+    invalidate_cache("trips")
+    return True
+
+
+def unarchive_trip(trip_id):
+    ws = get_ws_cached("trips")
+    row_idx = _find_row_index_by_id("trips", trip_id)
+    if row_idx is None:
+        return False
+    ws.update_cell(row_idx, 9, "0")
+    invalidate_cache("trips")
+    return True
+
+
+def complete_trip(trip_id, completed_at):
+    ws = get_ws_cached("trips")
+    row_idx = _find_row_index_by_id("trips", trip_id)
+    if row_idx is None:
+        return False
+    payload = [
+        {"range": "J" + str(row_idx), "values": [["1"]]},
+        {"range": "K" + str(row_idx), "values": [[s(completed_at)]]},
+    ]
+    ws.batch_update(payload, value_input_option="USER_ENTERED")
+    invalidate_cache("trips")
+    return True
+
+
+def uncomplete_trip(trip_id):
+    ws = get_ws_cached("trips")
+    row_idx = _find_row_index_by_id("trips", trip_id)
+    if row_idx is None:
+        return False
+    payload = [
+        {"range": "J" + str(row_idx), "values": [["0"]]},
+        {"range": "K" + str(row_idx), "values": [[""]]},
+    ]
+    ws.batch_update(payload, value_input_option="USER_ENTERED")
+    invalidate_cache("trips")
+    return True
+
+
+def soft_delete_trip(trip_id):
+    ws = get_ws_cached("trips")
+    row_idx = _find_row_index_by_id("trips", trip_id)
+    if row_idx is None:
+        return False
+    ws.update_cell(row_idx, 14,
+                   datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    invalidate_cache("trips")
+    return True
+
+
+def delete_trip(trip_id):
+    ws = get_ws_cached("trips")
+    row_idx = _find_row_index_by_id("trips", trip_id)
+    if row_idx is not None:
+        ws.delete_rows(row_idx)
+        invalidate_cache("trips")
+    ws2 = get_ws_cached("shipments")
+    to_del = [i for i, row in enumerate(ws2.get_all_values()[1:], start=2)
+              if s(row[1]) == s(trip_id)]
+    for i in reversed(to_del):
+        try:
+            ws2.delete_rows(i)
+        except Exception:
+            pass
+    invalidate_cache("shipments")
+
+
+# ============================================================
+# CRUD: АВТОМОБИЛИ
+# ============================================================
+
+def _normalize_advances(amount, adv1, adv2):
+    amount = money_value(amount)
+    adv1 = money_value(adv1)
+    adv2 = money_value(adv2)
+    was_trimmed = False
+
+    if amount <= 0.01:
+        if adv1 > 0 or adv2 > 0:
+            return 0.0, 0.0, True
+        return adv1, adv2, False
+
+    total = adv1 + adv2
+    if total <= amount + 0.01:
+        return adv1, adv2, False
+
+    if adv2 >= (total - amount) - 0.01:
+        adv2 = max(0.0, adv2 - (total - amount))
+    else:
+        adv2 = 0.0
+        adv1 = max(0.0, amount)
+
+    total = adv1 + adv2
+    if total > amount:
+        adv1 = max(0.0, amount - adv2)
+        total = adv1 + adv2
+        if total > amount:
+            adv1 = amount
+            adv2 = 0.0
+    was_trimmed = True
+    return money_value(adv1), money_value(adv2), was_trimmed
+
+
+def create_shipment(trip_id, position, car_model, client, amount,
+                    date_pay, paid_to, delivery_city, vin,
+                    advance, advance_date,
+                    payer_type, customer, contract_number,
+                    nds_amount, amount_no_nds, created_by,
+                    advance_2=0, advance_date_2="", paid_to_2=""):
+    adv1_norm, adv2_norm, _ = _normalize_advances(amount, advance, advance_2)
+
+    append_row("shipments", {
+        "id": next_shipment_id(),
+        "trip_id": trip_id,
+        "position": position,
+        "car_model": s(car_model),
+        "client": s(client),
+        "amount": money_value(amount),
+        "date_pay": s(date_pay),
+        "paid_to": s(paid_to),
+        "delivery_city": s(delivery_city),
+        "vin": s(vin),
+        "advance": adv1_norm,
+        "advance_date": s(advance_date),
+        "payer_type": s(payer_type),
+        "customer": s(customer),
+        "contract_number": s(contract_number),
+        "nds_amount": money_value(nds_amount),
+        "amount_no_nds": money_value(amount_no_nds),
+        "created_by": s(created_by),
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "issued": "0",
+        "issued_ever": "0",
+        "paid": "0",
+        "archived": "0",
+        "paid_amount": 0,
+        "invoice_number": "",
+        "invoice_date": "",
+        "transferred_to_trip": "",
+        "transferred_at": "",
+        "transferred_from_trip": "",
+        "advance_2": adv2_norm,
+        "advance_date_2": s(advance_date_2),
+        "paid_to_2": s(paid_to_2),
+    })
+
+
+def update_shipment(shipment_id, position, car_model, client, amount,
+                    date_pay, paid_to, delivery_city, vin, advance, advance_date,
+                    payer_type, customer, contract_number,
+                    nds_amount, amount_no_nds,
+                    advance_2=0, advance_date_2="", paid_to_2=""):
+    ws = get_ws_cached("shipments")
+    row_idx = _find_row_index_by_id("shipments", shipment_id)
+    if row_idx is None:
+        return False
+
+    adv1_norm, adv2_norm, _ = _normalize_advances(amount, advance, advance_2)
+
+    try:
+        amount_val = money_value(amount)
+        adv_total = adv1_norm + adv2_norm
+        auto_issued = (amount_val > 0.01 and adv_total >= amount_val - 0.01)
+    except Exception:
+        auto_issued = False
+
+    current_issued_val = "0"
+    try:
+        current_rows = read_all_cached("shipments")
+        for r in current_rows:
+            if s(r.get("id")) == s(shipment_id):
+                current_issued_val = s(r.get("issued", "0")).strip() or "0"
+                break
+    except Exception:
+        pass
+
+    new_issued_val = current_issued_val
+    if auto_issued:
+        new_issued_val = "1"
+    elif current_issued_val == "1" and not auto_issued:
+        new_issued_val = "1"
+
+    payload = [
+        {"range": "C" + str(row_idx), "values": [[position]]},
+        {"range": "D" + str(row_idx), "values": [[s(car_model)]]},
+        {"range": "E" + str(row_idx), "values": [[s(client)]]},
+        {"range": "F" + str(row_idx), "values": [[money_value(amount)]]},
+        {"range": "G" + str(row_idx), "values": [[s(date_pay)]]},
+        {"range": "H" + str(row_idx), "values": [[s(paid_to)]]},
+        {"range": "I" + str(row_idx), "values": [[s(delivery_city)]]},
+        {"range": "J" + str(row_idx), "values": [[s(vin)]]},
+        {"range": "K" + str(row_idx), "values": [[adv1_norm]]},
+        {"range": "L" + str(row_idx), "values": [[s(advance_date)]]},
+        {"range": "M" + str(row_idx), "values": [[s(payer_type)]]},
+        {"range": "N" + str(row_idx), "values": [[s(customer)]]},
+        {"range": "O" + str(row_idx), "values": [[s(contract_number)]]},
+        {"range": "P" + str(row_idx), "values": [[money_value(nds_amount)]]},
+        {"range": "Q" + str(row_idx), "values": [[money_value(amount_no_nds)]]},
+        {"range": "T" + str(row_idx), "values": [[new_issued_val]]},
+        {"range": "AD" + str(row_idx), "values": [[adv2_norm]]},
+        {"range": "AE" + str(row_idx), "values": [[s(advance_date_2)]]},
+        {"range": "AF" + str(row_idx), "values": [[s(paid_to_2)]]},
+    ]
+    ws.batch_update(payload, value_input_option="USER_ENTERED")
+    invalidate_cache("shipments")
+    return True
+
+
+def toggle_issued(shipment_id, current_value, current_ever):
+    ws = get_ws_cached("shipments")
+    row_idx = _find_row_index_by_id("shipments", shipment_id)
+    if row_idx is None:
+        return current_value
+    was_issued = s(current_value) == "1"
+    if not was_issued:
+        ws.update_cell(row_idx, 20, "1")
+        ws.update_cell(row_idx, 21, "1")
+    else:
+        ws.update_cell(row_idx, 20, "0")
+        ws.update_cell(row_idx, 22, "0")
+    invalidate_cache("shipments")
+    return "0" if was_issued else "1"
+
+
+def toggle_paid(shipment_id, current_paid, current_amount, current_advance):
+    ws = get_ws_cached("shipments")
+    row_idx = _find_row_index_by_id("shipments", shipment_id)
+    if row_idx is None:
+        return current_paid
+    was_paid = s(current_paid) == "1"
+    amount_val = money_value(current_amount)
+    advance_val = money_value(current_advance)
+    if amount_val > 0.01 and advance_val > amount_val:
+        advance_val = amount_val
+
+    if not was_paid:
+        payload = [
+            {"range": "X" + str(row_idx), "values": [[advance_val]]},
+            {"range": "K" + str(row_idx), "values": [[amount_val]]},
+            {"range": "V" + str(row_idx), "values": [["1"]]},
+        ]
+        ws.batch_update(payload, value_input_option="USER_ENTERED")
+    else:
+        payload = [
+            {"range": "K" + str(row_idx), "values": [[advance_val]]},
+            {"range": "X" + str(row_idx), "values": [[0]]},
+            {"range": "V" + str(row_idx), "values": [["0"]]},
+        ]
+        ws.batch_update(payload, value_input_option="USER_ENTERED")
+    invalidate_cache("shipments")
+    return "1" if not was_paid else "0"
+
+
+def delete_shipment(shipment_id):
+    ws = get_ws_cached("shipments")
+    row_idx = _find_row_index_by_id("shipments", shipment_id)
+    if row_idx is None:
+        return
+    ws.delete_rows(row_idx)
+    invalidate_cache("shipments")
+
+
+# ============================================================
+# ОПЛАТА РЕЙСА (безнал с НДС)
+# ============================================================
+
+def pay_entire_trip_nds(trip_id, user_login, role):
+    shipments = read_all("shipments", fresh=True)
+    cars = [x for x in shipments
+            if s(x.get("trip_id")) == s(trip_id)
+            and s(x.get("payer_type", "")).strip() == NDS_PAYER]
+
+    paid_count = 0
+    skipped_count = 0
+    closed_sum = 0.0
+    ws = get_ws_cached("shipments")
+
+    for x in cars:
+        sid = s(x.get("id"))
+        row_idx = _find_row_index_by_id("shipments", sid)
+        if row_idx is None:
+            skipped_count += 1
+            continue
+
+        was_paid = check_paid(x.get("paid", "0"))
+        amount_val = money_value(x.get("amount"))
+        advance_val = money_value(_total_advance(x))
+        if amount_val > 0.01 and advance_val > amount_val:
+            advance_val = amount_val
+        debt_val = amount_val - advance_val
+        if debt_val < 0:
+            debt_val = 0.0
+
+        if was_paid and debt_val <= 0.01:
+            skipped_count += 1
+            continue
+
+        payload = [
+            {"range": "X" + str(row_idx), "values": [[advance_val]]},
+            {"range": "K" + str(row_idx), "values": [[amount_val]]},
+            {"range": "V" + str(row_idx), "values": [["1"]]},
+        ]
+        ws.batch_update(payload, value_input_option="USER_ENTERED")
+        paid_count += 1
+        closed_sum += debt_val
+
+    if paid_count > 0:
+        invalidate_cache("shipments")
+        log_action(user_login, role, "pay_entire_trip_nds",
+                   "trip " + s(trip_id) + " | оплачено " + s(paid_count)
+                   + " авто | закрыто " + fmt_money(closed_sum) + " ₽")
+
+    return paid_count, skipped_count, closed_sum
+
+
+def unpay_entire_trip_nds(trip_id, user_login, role):
+    shipments = read_all("shipments", fresh=True)
+    cars = [x for x in shipments
+            if s(x.get("trip_id")) == s(trip_id)
+            and s(x.get("payer_type", "")).strip() == NDS_PAYER]
+
+    unpay_count = 0
+    ws = get_ws_cached("shipments")
+
+    for x in cars:
+        sid = s(x.get("id"))
+        row_idx = _find_row_index_by_id("shipments", sid)
+        if row_idx is None:
+            continue
+
+        was_paid = check_paid(x.get("paid", "0"))
+        if not was_paid:
+            continue
+
+        old_adv = money_value(x.get("paid_amount"))
+        payload = [
+            {"range": "K" + str(row_idx), "values": [[old_adv]]},
+            {"range": "X" + str(row_idx), "values": [[0]]},
+            {"range": "V" + str(row_idx), "values": [["0"]]},
+        ]
+        ws.batch_update(payload, value_input_option="USER_ENTERED")
+        unpay_count += 1
+
+    if unpay_count > 0:
+        invalidate_cache("shipments")
+        log_action(user_login, role, "unpay_entire_trip_nds",
+                   "trip " + s(trip_id) + " | снято с " + s(unpay_count) + " авто")
+
+    return unpay_count
+
+
+# ============================================================
+# ПЕРЕНОСЫ
+# ============================================================
+
+def log_transfer(shipment_id, from_trip, to_trip,
+                 from_position, to_position, user_login, note="",
+                 cancelled=""):
+    append_row("transfer_history", {
+        "id": new_uuid(),
+        "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "shipment_id": s(shipment_id),
+        "from_trip": s(from_trip),
+        "to_trip": s(to_trip),
+        "from_position": s(from_position),
+        "to_position": s(to_position),
+        "user_login": s(user_login),
+        "note": s(note),
+        "cancelled": s(cancelled),
+    })
+
+
+def transfer_shipment_to_trip(shipment_id, target_trip_id, new_position,
+                              user_login):
+    ws = get_ws_cached("shipments")
+    row_idx = _find_row_index_by_id("shipments", shipment_id)
+    if row_idx is None:
+        return False
+
+    rows = read_all_cached("shipments")
+    src = None
+    for r in rows:
+        if s(r.get("id")) == s(shipment_id):
+            src = r
+            break
+    if src is None:
+        return False
+
+    source_trip_id = s(src.get("trip_id", ""))
+    source_position = s(src.get("position", ""))
+
+    payload = [
+        {"range": "B" + str(row_idx), "values": [[s(target_trip_id)]]},
+        {"range": "C" + str(row_idx), "values": [[new_position]]},
+        {"range": "AA" + str(row_idx), "values": [[s(target_trip_id)]]},
+        {"range": "AB" + str(row_idx), "values": [[datetime.now().strftime("%d.%m.%Y")]]},
+        {"range": "AC" + str(row_idx), "values": [[source_trip_id]]},
+    ]
+    ws.batch_update(payload, value_input_option="USER_ENTERED")
+
+    trace = {
+        "id": next_shipment_id(),
+        "trip_id": source_trip_id,
+        "position": source_position,
+        "car_model": "Перенесён: " + s(src.get("car_model", "")),
+        "client": "",
+        "amount": 0,
+        "date_pay": "",
+        "paid_to": "",
+        "delivery_city": s(src.get("delivery_city", "")),
+        "vin": s(src.get("vin", "")),
+        "advance": 0,
+        "advance_date": "",
+        "payer_type": "",
+        "customer": "",
+        "contract_number": "",
+        "nds_amount": 0,
+        "amount_no_nds": 0,
+        "created_by": s(user_login),
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "issued": "0",
+        "issued_ever": "0",
+        "paid": "1",
+        "archived": "0",
+        "paid_amount": 0,
+        "invoice_number": "",
+        "invoice_date": "",
+        "transferred_to_trip": s(shipment_id),
+        "transferred_at": datetime.now().strftime("%d.%m.%Y"),
+        "transferred_from_trip": s(shipment_id),
+        "advance_2": 0,
+        "advance_date_2": "",
+        "paid_to_2": "",
+    }
+    append_row("shipments", trace)
+
+    log_transfer(shipment_id, source_trip_id, target_trip_id,
+                 source_position, new_position, user_login,
+                 note="Перенос авто")
+
+    invalidate_cache("shipments")
+    return True
+
+
+def reassign_transfer_for_car(car_id, new_target_trip_id, new_position,
+                              user_login, role):
+    ws = get_ws_cached("shipments")
+    car_row = _find_row_index_by_id("shipments", car_id)
+    if car_row is None:
+        return False, "Авто не найдено"
+
+    rows = read_all_cached("shipments")
+    src = None
+    for r in rows:
+        if s(r.get("id")) == s(car_id):
+            src = r
+            break
+    if src is None:
+        return False, "Авто не найдено"
+
+    old_target = s(src.get("transferred_to_trip", "")).strip()
+    if not old_target:
+        return False, "У этого авто нет переноса — нечего переназначать"
+
+    old_position = s(src.get("position", ""))
+    old_trip_id = s(src.get("trip_id", ""))
+    source_trip_id = s(src.get("transferred_from_trip", "")).strip() or old_trip_id
+
+    payload = [
+        {"range": "B" + str(car_row), "values": [[s(new_target_trip_id)]]},
+        {"range": "C" + str(car_row), "values": [[new_position]]},
+        {"range": "AA" + str(car_row), "values": [[s(new_target_trip_id)]]},
+        {"range": "AB" + str(car_row), "values": [[datetime.now().strftime("%d.%m.%Y")]]},
+        {"range": "AC" + str(car_row), "values": [[source_trip_id]]},
+    ]
+    ws.batch_update(payload, value_input_option="USER_ENTERED")
+
+    try:
+        all_vals = ws.get_all_values()
+        for i, row in enumerate(all_vals[1:], start=2):
+            if len(row) < 32:
+                row = row + [""] * (32 - len(row))
+            car_model = s(row[3])
+            aa_val = s(row[26]) if len(row) > 26 else ""
+            ac_val = s(row[28]) if len(row) > 28 else ""
+            if car_model.startswith("Перенесён:") and (
+                    ac_val == s(car_id) or aa_val == s(car_id)):
+                ws.batch_update([
+                    {"range": "B" + str(i), "values": [[source_trip_id]]},
+                    {"range": "AA" + str(i), "values": [[s(car_id)]]},
+                    {"range": "AB" + str(i), "values": [[datetime.now().strftime("%d.%m.%Y")]]},
+                    {"range": "AC" + str(i), "values": [[s(car_id)]]},
+                ], value_input_option="USER_ENTERED")
+    except Exception as e:
+        _log_system_error("reassign_update_trace", car_id, e)
+
+    log_transfer(car_id, source_trip_id, new_target_trip_id,
+                 old_position, new_position, user_login,
+                 note="Переназначение переноса вручную")
+
+    invalidate_cache("shipments")
+    return True, ""
+
+
+def update_trace_shipment(trace_id, new_car_model, new_vin, new_delivery_city,
+                          new_position=None):
+    ws = get_ws_cached("shipments")
+    row_idx = _find_row_index_by_id("shipments", trace_id)
+    if row_idx is None:
+        return False
+    payload = [
+        {"range": "D" + str(row_idx), "values": [[s(new_car_model)]]},
+        {"range": "J" + str(row_idx), "values": [[s(new_vin)]]},
+        {"range": "I" + str(row_idx), "values": [[s(new_delivery_city)]]},
+    ]
+    if new_position is not None:
+        payload.append({"range": "C" + str(row_idx),
+                        "values": [[int(new_position)]]})
+    ws.batch_update(payload, value_input_option="USER_ENTERED")
+    invalidate_cache("shipments")
+    return True
+
+
+def delete_trace_shipment(trace_id):
+    ws = get_ws_cached("shipments")
+    row_idx = _find_row_index_by_id("shipments", trace_id)
+    if row_idx is None:
+        return False
+    ws.delete_rows(row_idx)
+    invalidate_cache("shipments")
+    return True
+
+
+def find_parent_for_trace(trace_row, all_shipments):
+    parent_id = s(trace_row.get("transferred_from_trip", "")).strip()
+    if parent_id:
+        for c in all_shipments:
+            if s(c.get("id")) == parent_id:
+                return parent_id
+    trace_vin = s(trace_row.get("vin", "")).strip()
+    trace_car = s(trace_row.get("car_model", "")).replace(
+        "Перенесён: ", "").strip()
+    tr_from = s(trace_row.get("trip_id", "")).strip()
+    for c in all_shipments:
+        if s(c.get("id")) == s(trace_row.get("id")):
+            continue
+        if s(c.get("car_model", "")).startswith("Перенесён:"):
+            continue
+        if s(c.get("transferred_to_trip", "")):
+            continue
+        c_vin = s(c.get("vin", "")).strip()
+        c_car = s(c.get("car_model", "")).strip()
+        if trace_vin and c_vin and trace_vin == c_vin:
+            return s(c.get("id"))
+        if trace_car and c_car and trace_car == c_car \
+                and s(c.get("trip_id")) == tr_from:
+            return s(c.get("id"))
+    return ""
+
+
+def cancel_transfer(shipment_id, user_login, role, new_position=None):
+    ws = get_ws_cached("shipments")
+    row_idx = _find_row_index_by_id("shipments", shipment_id)
+    if row_idx is None:
+        return False, "Авто не найдено"
+
+    rows = read_all_cached("shipments")
+    src = None
+    for r in rows:
+        if s(r.get("id")) == s(shipment_id):
+            src = r
+            break
+    if src is None:
+        return False, "Авто не найдено"
+
+    source_trip_id = s(src.get("transferred_from_trip", "")).strip()
+    if not source_trip_id:
+        return False, "Нет данных о переносе — отменить нечего"
+
+    current_trip_id = s(src.get("trip_id", ""))
+    current_position = s(src.get("position", ""))
+
+    if new_position is None:
+        siblings = [x for x in rows
+                    if s(x.get("trip_id")) == source_trip_id
+                    and s(x.get("id")) != s(shipment_id)
+                    and not s(x.get("transferred_to_trip", ""))]
+        new_position = next_free_position(siblings) or 1
+
+    payload = [
+        {"range": "B" + str(row_idx), "values": [[source_trip_id]]},
+        {"range": "C" + str(row_idx), "values": [[new_position]]},
+        {"range": "AA" + str(row_idx), "values": [[""]]},
+        {"range": "AB" + str(row_idx), "values": [[datetime.now().strftime("%d.%m.%Y")]]},
+        {"range": "AC" + str(row_idx), "values": [[""]]},
+    ]
+    ws.batch_update(payload, value_input_option="USER_ENTERED")
+
+    try:
+        ws2 = get_ws_cached("shipments")
+        all_vals = ws2.get_all_values()
+        to_del = []
+        for i, row in enumerate(all_vals[1:], start=2):
+            if len(row) < 32:
+                row = row + [""] * (32 - len(row))
+            car_model = s(row[3]) if len(row) > 3 else ""
+            ac_val = s(row[28]) if len(row) > 28 else ""
+            aa_val = s(row[26]) if len(row) > 26 else ""
+            if car_model.startswith("Перенесён:") and (
+                    ac_val == s(shipment_id) or aa_val == s(shipment_id)):
+                to_del.append(i)
+        for i in reversed(to_del):
+            try:
+                ws2.delete_rows(i)
+            except Exception:
+                pass
+    except Exception as e:
+        _log_system_error("cancel_transfer_del_trace", shipment_id, e)
+
+    log_transfer(shipment_id,
+                 current_trip_id, source_trip_id,
+                 current_position, new_position,
+                 user_login,
+                 note="Отмена переноса",
+                 cancelled="1")
+
+    invalidate_cache("shipments")
+    return True, ""
+
+
+def get_shipment_history(shipment_id):
+    rows = read_all_cached("transfer_history")
+    result = [r for r in rows if s(r.get("shipment_id")) == s(shipment_id)]
+    result.sort(key=lambda r: s(r.get("ts")), reverse=True)
+    return result
+
+
+# ============================================================
+# АКТЫ
+# ============================================================
+
+def render_act_html(trip, shipment):
+    route = s(trip.get("route", "")) if trip else ""
+    loading_from = s(trip.get("loading_from", "")) if trip else ""
+    car_model = s(shipment.get("car_model", ""))
+    client = s(shipment.get("client", ""))
+    customer = s(shipment.get("customer", ""))
+    vin = s(shipment.get("vin", "")).strip()[:17]
+    receiver = client if client else customer
+
+    LINE_LONG = "_" * 30
+    LINE_SHORT = "_" * 12
+
+    p = []
+    p.append("<!DOCTYPE html>")
+    p.append('<html xmlns:o="urn:schemas-microsoft-com:office:office" '
+             'xmlns:w="urn:schemas-microsoft-com:office:word" '
+             'xmlns="http://www.w3.org/TR/REC-html40">')
+    p.append("<head>")
+    p.append('<meta charset="utf-8">')
+    p.append("<title>Акт приема-передачи</title>")
+    p.append("<style>")
+    p.append("@page { size: A4; margin: 1.5cm; }")
+    p.append('body { font-family: "Times New Roman", Times, serif; font-size: 14pt; line-height: 1.5; }')
+    p.append("h1 { text-align: center; font-size: 16pt; text-transform: uppercase; margin-bottom: 20px; }")
+    p.append("p { margin: 8px 0; white-space: nowrap; }")
+    p.append('.mono { font-family: "Courier New", monospace; font-size: 14pt; }')
+    p.append(".small { font-size: 12pt; }")
+    p.append("</style>")
+    p.append("</head>")
+    p.append("<body>")
+    p.append("<h1>Акт приема-передачи транспортного средства</h1>")
+    p.append("<p><b>Перевозчик:</b> ИП Сагитдинов Максим Наильевич, тел. 8-987-131-00-62</p>")
+    p.append("<p><b>Заказчик / Получатель:</b> " + receiver + "</p>")
+    p.append("<p><b>Марка автомобиля:</b> " + car_model + "</p>")
+    p.append("<p><b>VIN:</b> " + (vin if vin else "_" * 20) + "</p>")
+    p.append("<p><b>Маршрут:</b> " + route + "</p>")
+    if loading_from:
+        p.append("<p><b>Погрузка от:</b> " + loading_from + "</p>")
+    p.append("<p>&nbsp;</p>")
+    p.append('<p><b>Груз сдал:</b> <span class="mono">' + LINE_LONG +
+             "</span> / Сагитдинов М.Н. /</p>")
+    p.append('<p><b>Груз принял:</b> <span class="mono">' + LINE_LONG +
+             "</span> / " + receiver + " /</p>")
+    p.append("<p>&nbsp;</p>")
+    p.append('<p><b>Дата вручения груза:</b> <span class="mono">' + LINE_SHORT +
+             '</span> &nbsp;&nbsp; <b>Время:</b> <span class="mono">' + LINE_SHORT + "</span></p>")
+    p.append('<p class="small" style="margin-top: 25px;">'
+             'При подписании акта приема-передачи на момент вручения груза '
+             'Стороны каких-либо претензий друг к другу не имеют.</p>')
+    p.append("</body>")
+    p.append("</html>")
+    return "".join(p)
+
+
+def render_act_text(trip, shipment):
+    route = s(trip.get("route", "")) if trip else ""
+    loading_from = s(trip.get("loading_from", "")) if trip else ""
+    car_model = s(shipment.get("car_model", ""))
+    client = s(shipment.get("client", ""))
+    customer = s(shipment.get("customer", ""))
+    vin = s(shipment.get("vin", "")).strip()[:17]
+    receiver = client if client else customer
+
+    LINE_LONG = "_" * 30
+    LINE_SHORT = "_" * 12
+
+    lines = [
+        "АКТ ПРИЕМА-ПЕРЕДАЧИ ТРАНСПОРТНОГО СРЕДСТВА", "",
+        "Перевозчик: ИП Сагитдинов Максим Наильевич, тел. 8-987-131-00-62",
+        "Заказчик / Получатель: " + receiver,
+        "Марка автомобиля: " + car_model,
+        "VIN: " + (vin if vin else "_" * 20),
+        "Маршрут: " + route,
+    ]
+    if loading_from:
+        lines.append("Погрузка от: " + loading_from)
+    lines += [
+        "", "",
+        "Груз сдал: " + LINE_LONG + " / Сагитдинов М.Н. /",
+        "Груз принят: " + LINE_LONG + " / " + receiver + " /", "", "",
+        "Дата вручения груза: " + LINE_SHORT + "   Время: " + LINE_SHORT,
+        "",
+        "При подписании акта приема-передачи на момент вручения груза Стороны каких-либо претензий друг другу не имеют.",
+    ]
+    return "\n".join(lines)
+
+
+def log_act_print(login, trip_id, shipment_id, client):
+    ws = get_ws_cached("act_log")
+    row = [
+        new_uuid(),
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        s(login), s(trip_id), s(shipment_id), s(client),
+    ]
+    ws.append_row(row)
+    invalidate_cache("act_log")
+
+
+def show_act(trip, shipment):
+    u = st.session_state["user"]
+    log_act_print(u["login"], trip.get("id") if trip else "",
+                  shipment.get("id"), shipment.get("client"))
+    st.info("Нажмите **Ctrl+P** для печати или скачайте акт кнопкой ниже.")
+    safe_car = s(shipment.get("car_model", "")).replace("/", "-").replace("\\", "-")
+    safe_client = s(shipment.get("client", "")).replace("/", "-").replace("\\", "-")
+    base_name = "Акт_" + safe_car + "_" + safe_client
+    col1, col2 = st.columns(2)
+    with col1:
+        st.download_button("Скачать акт (.doc)",
+            data=render_act_html(trip, shipment).encode("utf-8"),
+            file_name=base_name + ".doc", mime="application/msword",
+            key="dl_doc_" + s(shipment.get("id")))
+    with col2:
+        st.download_button("Скачать акт (.txt)",
+            data=render_act_text(trip, shipment).encode("utf-8-sig"),
+            file_name=base_name + ".txt", mime="text/plain",
+            key="dl_txt_" + s(shipment.get("id")))
+    st.components.v1.html(render_act_html(trip, shipment), height=850, scrolling=True)
+
+
+# ============================================================
+# ПЕЧАТЬ СПИСКА
+# ============================================================
+
+def render_print_list_doc(rows, title="СПИСОК ПЕРЕВОЗИМЫХ АВТОМОБИЛЕЙ"):
+    groups = []
+    cur_key = None
+    cur_group = None
+    for r in rows:
+        key = (s(r.get("tractor")), s(r.get("driver")),
+               s(r.get("loading_from")),
+               s(r.get("route")), s(r.get("dep")))
+        if key != cur_key:
+            if cur_group:
+                groups.append(cur_group)
+            cur_key = key
+            cur_group = {
+                "tractor": s(r.get("tractor")),
+                "driver": s(r.get("driver")),
+                "loading_from": s(r.get("loading_from")),
+                "route": s(r.get("route")),
+                "dep": s(r.get("dep")),
+                "cars": [],
+            }
+        cur_group["cars"].append(r)
+    if cur_group:
+        groups.append(cur_group)
+
+    p = []
+    p.append("<!DOCTYPE html>")
+    p.append('<html xmlns:o="urn:schemas-microsoft-com:office:office" '
+             'xmlns:w="urn:schemas-microsoft-com:office:word" '
+             'xmlns="http://www.w3.org/TR/REC-html40">')
+    p.append("<head>")
+    p.append('<meta charset="utf-8">')
+    p.append("<title>" + title + "</title>")
+    p.append("<style>")
+    p.append("@page { size: A4 landscape; margin: 0.6cm 0.7cm 0.6cm 0.7cm; }")
+    p.append("html, body { margin: 0; padding: 0; }")
+    p.append('body { font-family: "Times New Roman", Times, serif; '
+             'font-size: 11pt; line-height: 1.2; color: #000; }')
+    p.append("h1 { text-align: center; font-size: 14pt; "
+             "text-transform: uppercase; margin: 0 0 8px 0; "
+             "font-weight: bold; }")
+
+    p.append(".trip-block { page-break-after: always; }")
+    p.append(".trip-block:last-child { page-break-after: auto; }")
+
+    p.append(".header-trip { "
+             "background: #f0f0f0; border: 1px solid #333; "
+             "padding: 4px 8px; margin-bottom: 4px; "
+             "font-size: 11pt; line-height: 1.25; }")
+    p.append(".header-trip b { font-weight: bold; }")
+
+    p.append("table { width: 100%; border-collapse: collapse; "
+             "table-layout: fixed; }")
+    p.append("th, td { border: 1px solid #333; "
+             "padding: 3px 5px; vertical-align: top; "
+             "font-size: 11pt; line-height: 1.2; "
+             "overflow: hidden; }")
+    p.append("th { background: #e0e0e0; font-weight: bold; "
+             "text-align: left; padding: 3px 5px; }")
+
+    p.append("col.c-num    { width: 4%; }")
+    p.append("col.c-model  { width: 21%; }")
+    p.append("col.c-vin    { width: 17%; }")
+    p.append("col.c-fio    { width: 16%; }")
+    p.append("col.c-city   { width: 13%; }")
+    p.append("col.c-debt   { width: 12%; }")
+    p.append("col.c-note   { width: 17%; }")
+
+    p.append(".num { text-align: center; }")
+    p.append(".debt { text-align: right; font-weight: bold; "
+             "white-space: nowrap; }")
+    p.append(".vin { font-family: 'Courier New', monospace; "
+             "font-size: 9.5pt; word-break: break-all; }")
+    p.append(".note { font-size: 10pt; color: #222; }")
+    p.append("tr.trace td { background: #f5f5f5; font-style: italic; }")
+    p.append("tr.total td { background: #f0f0f0; font-weight: bold; "
+             "border-top: 1.5px solid #333; }")
+    p.append("</style></head><body>")
+    p.append("<h1>" + title + "</h1>")
+
+    for g in groups:
+        p.append('<div class="trip-block">')
+
+        p.append('<div class="header-trip">')
+        p.append('<b>Дата выезда:</b> ' + s(g["dep"]))
+        p.append(' &nbsp;·&nbsp; <b>Тягач:</b> ' + s(g["tractor"]))
+        p.append(' &nbsp;·&nbsp; <b>Водитель:</b> ' + s(g["driver"]))
+        if s(g.get("loading_from", "")):
+            p.append(' &nbsp;·&nbsp; <b>Погрузка от:</b> ' + s(g["loading_from"]))
+        if s(g["route"]):
+            p.append(' &nbsp;·&nbsp; <b>Маршрут:</b> ' + s(g["route"]))
+        p.append("</div>")
+
+        p.append("<table>")
+        p.append("<colgroup>")
+        p.append('<col class="c-num">')
+        p.append('<col class="c-model">')
+        p.append('<col class="c-vin">')
+        p.append('<col class="c-fio">')
+        p.append('<col class="c-city">')
+        p.append('<col class="c-debt">')
+        p.append('<col class="c-note">')
+        p.append("</colgroup>")
+
+        p.append("<thead><tr>")
+        p.append('<th class="num">№</th>')
+        p.append("<th>Марка / модель</th>")
+        p.append('<th class="vin">VIN</th>')
+        p.append("<th>ФИО</th>")
+        p.append("<th>Город доставки</th>")
+        p.append('<th class="debt">Задолж., ₽</th>')
+        p.append("<th>Примечание</th>")
+        p.append("</tr></thead><tbody>")
+
+        total_debt = 0.0
+        for i, r in enumerate(g["cars"], start=1):
+            fio = s(r.get("client", "")) or s(r.get("customer", ""))
+            debt = to_float(r.get("debt"))
+            total_debt += debt
+            note = s(r.get("note", ""))
+            row_class = ' class="trace"' if note else ""
+            p.append("<tr" + row_class + ">")
+            p.append('<td class="num">' + s(i) + "</td>")
+            p.append("<td>" + s(r.get("car_model", "")) + "</td>")
+            p.append('<td class="vin">' + (s(r.get("vin", ""))[:17] or "—")
+                     + "</td>")
+            p.append("<td>" + fio + "</td>")
+            p.append("<td>" + s(r.get("delivery_city", "")) + "</td>")
+            p.append('<td class="debt">' + fmt_money(debt) + "</td>")
+            p.append('<td class="note">' + note + "</td>")
+            p.append("</tr>")
+
+        p.append('<tr class="total">')
+        p.append('<td colspan="5" style="text-align:right;">Итого по рейсу:</td>')
+        p.append('<td class="debt">' + fmt_money(total_debt) + "</td>")
+        p.append("<td></td>")
+        p.append("</tr>")
+
+        p.append("</tbody></table>")
+        p.append("</div>")
+
+    p.append("</body></html>")
+    return "".join(p)
+
+
+def show_print_list(rows):
+    st.info("Скачайте файл — он откроется в Word или LibreOffice. "
+            "Для PDF: откройте файл и выберите «Сохранить как PDF». "
+            "Каждый рейс печатается на отдельном альбомном листе A4.")
+    doc_html = render_print_list_doc(rows)
+    st.download_button(
+        "📥 Скачать список (.doc)",
+        data=doc_html.encode("utf-8"),
+        file_name="Список_авто.doc",
+        mime="application/msword",
+        key="dl_print_doc_" + str(len(rows)),
+    )
+    st.components.v1.html(doc_html, height=1000, scrolling=True)
+
+
+# ============================================================
+# ФОРМА АВТО
+# ============================================================
+
+def render_shipment_form(form_key, c=None, submit_label="Сохранить авто",
+                         default_position=None):
+    defaults = {
+        "position": default_position if default_position else 1,
+        "car_model": "", "client": "", "vin": "",
+        "delivery_city": "", "amount": "", "date_pay": "", "paid_to": "",
+        "advance": "", "advance_date": "", "payer_type": "нал",
+        "customer": "", "contract_number": "",
+        "advance_2": "", "advance_date_2": "", "paid_to_2": "",
+    }
+    if c:
+        try:
+            defaults["position"] = int(to_float(c.get("position")) or 1)
+        except Exception:
+            defaults["position"] = 1
+        defaults["car_model"] = s(c.get("car_model", ""))
+        defaults["client"] = s(c.get("client", ""))
+        defaults["vin"] = s(c.get("vin", ""))[:17]
+        defaults["delivery_city"] = s(c.get("delivery_city", ""))
+        ar = c.get("amount", "")
+        defaults["amount"] = "" if ar in ("", None) else "{:.2f}".format(to_float(ar)).replace(".", ",")
+        defaults["date_pay"] = date_to_display_safe(c.get("date_pay", ""))
+        defaults["paid_to"] = s(c.get("paid_to", ""))
+        av = c.get("advance", "")
+        defaults["advance"] = "" if av in ("", None) else "{:.2f}".format(to_float(av)).replace(".", ",")
+        defaults["advance_date"] = date_to_display_safe(c.get("advance_date", ""))
+        defaults["payer_type"] = s(c.get("payer_type", "нал")) or "нал"
+        defaults["customer"] = s(c.get("customer", ""))
+        defaults["contract_number"] = s(c.get("contract_number", ""))
+        av2 = c.get("advance_2", "")
+        defaults["advance_2"] = "" if av2 in ("", None) else "{:.2f}".format(to_float(av2)).replace(".", ",")
+        defaults["advance_date_2"] = date_to_display_safe(c.get("advance_date_2", ""))
+        defaults["paid_to_2"] = s(c.get("paid_to_2", ""))
+
+    try:
+        payer_index = PAYER_TYPES.index(defaults["payer_type"])
+    except ValueError:
+        payer_index = 0
+
+    with st.form(form_key, clear_on_submit=False):
+        st.markdown("**Данные автомобиля**")
+
+        col1, col2 = st.columns(2)
+        position = col1.number_input("Позиция (1–8)", min_value=1, max_value=MAX_CARS,
+                                     step=1, value=defaults["position"],
+                                     key=form_key + "_pos")
+        car_model = col2.text_input("Марка / модель авто", value=defaults["car_model"],
+                                     key=form_key + "_car")
+
+        col3, col4 = st.columns(2)
+        client = col3.text_input("ФИО клиента", value=defaults["client"],
+                                  key=form_key + "_client")
+        customer = col4.text_input("Заказчик (если нет ФИО клиента)",
+                                    value=defaults["customer"], key=form_key + "_customer")
+
+        col5, col6 = st.columns(2)
+        vin = col5.text_input("VIN (до 17 символов)", value=defaults["vin"],
+                              key=form_key + "_vin")
+        delivery_city = col6.text_input("Город доставки",
+                                         value=defaults["delivery_city"],
+                                         key=form_key + "_city")
+
+        col7, col8 = st.columns(2)
+        amount = col7.text_input("Сумма за перевозку (пример: 18333,33)",
+                                  value=defaults["amount"], key=form_key + "_amount")
+        payer_type = col8.selectbox("Способ оплаты", PAYER_TYPES, index=payer_index,
+                                     key=form_key + "_payer")
+
+        col9, col10 = st.columns(2)
+        date_pay = col9.text_input("Дата оплаты (ДД.ММ.ГГГГ)",
+                                    value=defaults["date_pay"], key=form_key + "_dpay")
+        contract_number = col10.text_input("№ договора",
+                                             value=defaults["contract_number"],
+                                             key=form_key + "_contract")
+
+        st.markdown("---")
+        st.markdown("### 💰 Аванс № 1")
+        colA1, colA2 = st.columns(2)
+        advance = colA1.text_input("Сумма аванса № 1", value=defaults["advance"],
+                                    key=form_key + "_adv")
+        advance_date = colA2.text_input("Дата аванса № 1 (ДД.ММ.ГГГГ)",
+                                         value=defaults["advance_date"],
+                                         key=form_key + "_advd")
+        paid_to = st.text_input("Кому передан аванс № 1 (комментарий)",
+                                 value=defaults["paid_to"], key=form_key + "_paidto")
+
+        st.markdown("### 💰 Аванс № 2")
+        colB1, colB2 = st.columns(2)
+        advance_2 = colB1.text_input("Сумма аванса № 2", value=defaults["advance_2"],
+                                      key=form_key + "_adv2")
+        advance_date_2 = colB2.text_input("Дата аванса № 2 (ДД.ММ.ГГГГ)",
+                                           value=defaults["advance_date_2"],
+                                           key=form_key + "_advd2")
+        paid_to_2 = st.text_input("Кому передан аванс № 2 (комментарий)",
+                                   value=defaults["paid_to_2"], key=form_key + "_paidto2")
+
+        try:
+            amount_val_check = money_value(amount)
+            adv1_val = money_value(advance)
+            adv2_val = money_value(advance_2)
+            total_adv_val = adv1_val + adv2_val
+        except Exception:
+            amount_val_check = 0.0
+            adv1_val = 0.0
+            adv2_val = 0.0
+            total_adv_val = 0.0
+
+        if amount_val_check > 0.01 and total_adv_val > amount_val_check + 0.01:
+            st.error("⚠️ Общая сумма авансов (" + fmt_money(total_adv_val)
+                     + " ₽) больше суммы перевозки (" + fmt_money(amount_val_check)
+                     + " ₽). При сохранении авансы будут автоматически "
+                     "уменьшены до суммы перевозки.")
+        elif amount_val_check > 0.01:
+            st.info("Общий аванс (1 + 2): **" + fmt_money(total_adv_val)
+                    + " ₽** из **" + fmt_money(amount_val_check) + " ₽**")
+
+        save = st.form_submit_button(submit_label)
+        cancel = st.form_submit_button("Отмена")
+
+    return {
+        "position": position, "car_model": s(car_model), "client": s(client),
+        "vin": s(vin), "delivery_city": s(delivery_city),
+        "amount": amount, "date_pay": s(date_pay), "paid_to": s(paid_to),
+        "advance": advance, "advance_date": s(advance_date),
+        "payer_type": s(payer_type), "customer": s(customer),
+        "contract_number": s(contract_number),
+        "advance_2": advance_2,
+        "advance_date_2": s(advance_date_2),
+        "paid_to_2": s(paid_to_2),
+        "save": save, "cancel": cancel,
+    }
+
+
+# ============================================================
+# ШАПКА РЕЙСА
+# ============================================================
+
+def render_trip_header(trip_id, tractor, driver, route, dep, ret,
+                       trip_completed, trip_completed_at,
+                       active_count, issued_count,
+                       total, total_advance, total_debt, total_nds,
+                       has_nds=False,
+                       trip_invoice_number="", trip_invoice_date="",
+                       has_transfers=False, transfers_count=0,
+                       incoming_count=0, incoming_from_labels=None,
+                       incoming_total_amount=0.0,
+                       incoming_total_advance=0.0,
+                       incoming_total_debt=0.0,
+                       total_in_route=None,
+                       loading_from="",
+                       payment_date="", payment_comment="",
+                       payments_info=None):
+    if active_count == 0 and issued_count == 0 and not has_transfers and incoming_count == 0:
+        bg, bd = "#fafafa", "#dddddd"
+    elif total_debt > 0.01:
+        bg, bd = "#ffcdd2", "#e53935"
+    else:
+        bg, bd = "#c8e6c9", "#43a047"
+
+    title_parts = [s(tractor), s(driver)]
+    if s(loading_from):
+        title_parts.append("погрузка от " + s(loading_from))
+    title_parts.append(s(route))
+    title_parts.append("выезд " + s(dep))
+    title = " — ".join([p for p in title_parts if p])
+    if ret:
+        title += " — возврат " + s(ret)
+
+    if total_in_route is None:
+        total_in_route = active_count + incoming_count
+
+    stats = "авто: " + s(total_in_route) + "/" + s(MAX_CARS)
+    if issued_count > 0:
+        stats += "  |  выдано: " + s(issued_count)
+    if transfers_count > 0:
+        stats += "  |  перенесено из рейса: " + s(transfers_count)
+    if incoming_count > 0:
+        stats += "  |  перенесено в рейс: " + s(incoming_count)
+    stats += ("  |  сумма: " + fmt_money(total)
+              + "  |  аванс: " + fmt_money(total_advance)
+              + "  |  задолженность: " + fmt_money(total_debt))
+    if total_nds > 0:
+        stats += "  |  НДС: " + fmt_money(total_nds)
+
+    incoming_stats = ""
+    if incoming_count > 0:
+        incoming_stats = (
+            "из них перенесено в рейс: " + s(incoming_count) + " авто"
+            + "  |  сумма по ним: " + fmt_money(incoming_total_amount)
+            + "  |  аванс: " + fmt_money(incoming_total_advance)
+            + "  |  задолженность: " + fmt_money(incoming_total_debt)
+        )
+
+    inv_html = ""
+    if has_nds:
+        inv_num = s(trip_invoice_number).strip()
+        inv_date = s(trip_invoice_date).strip()
+        if inv_num or inv_date:
+            inv_html = ('<span style="background:#1976d2; color:#fff; '
+                        'padding:2px 10px; border-radius:12px; font-size:12px; '
+                        'font-weight:bold; white-space:nowrap; margin-left:6px;">'
+                        '📄 Счёт № ' + (inv_num or "—")
+                        + (' от ' + date_to_display_safe(inv_date) if inv_date else '')
+                        + '</span>')
+        else:
+            inv_html = ('<span style="background:#c62828; color:#fff; '
+                        'padding:2px 10px; border-radius:12px; font-size:12px; '
+                        'font-weight:bold; white-space:nowrap; margin-left:6px;">'
+                        '📄 Счёт: не выставлен</span>')
+
+    badges = ""
+    if transfers_count > 0:
+        badges += ('<span style="background:#b71c1c; color:#fff; '
+                   'padding:2px 10px; border-radius:12px; font-size:12px; '
+                   'font-weight:bold; white-space:nowrap; margin-left:6px;">'
+                   '↗ перенесено: ' + s(transfers_count) + '</span>')
+    if incoming_count > 0:
+        badges += ('<span style="background:#4a148c; color:#fff; '
+                   'padding:2px 10px; border-radius:12px; font-size:12px; '
+                   'font-weight:bold; white-space:nowrap; margin-left:6px;">'
+                   '↘ перенесено в рейс: ' + s(incoming_count) + '</span>')
+
+    completed_html = ""
+    if trip_completed:
+        badge_text = "✅ Рейс завершён" + (
+            ": " + s(trip_completed_at) if trip_completed_at else "")
+        completed_html = (
+            '<span style="background:#2e7d32; color:#fff; '
+            'padding:2px 10px; border-radius:12px; font-size:12px; '
+            'font-weight:bold; white-space:nowrap; margin-left:6px;">'
+            + badge_text + '</span>')
+
+    incoming_stats_html = ""
+    if incoming_stats:
+        incoming_stats_html = (
+            '<div style="margin-top:4px; color:#4a148c; font-weight:bold; '
+            'font-size:13px; word-wrap:break-word;">'
+            '↘ ' + incoming_stats +
+            '</div>'
+        )
+
+    incoming_html = ""
+    if incoming_count > 0 and incoming_from_labels:
+        labels_text = " · ".join(incoming_from_labels)
+        incoming_html = (
+            '<div style="background:#ede7f6; border-left:4px solid #5e35b1; '
+            'padding:6px 10px; margin-top:6px; border-radius:4px; '
+            'font-size:13px; word-wrap:break-word;">'
+            '↘ <b>Авто перенесены из рейса:</b> ' + labels_text +
+            '</div>'
+        )
+
+    loading_html = ""
+    if s(loading_from):
+        loading_html = (
+            '<div style="margin-top:4px; font-size:13px; '
+            'color:#0d47a1; font-weight:bold; word-wrap:break-word;">'
+            '📦 Погрузка от: ' + s(loading_from) +
+            '</div>'
+        )
+
+    payment_html = ""
+    if has_nds:
+        pd_disp = date_to_display_safe(payment_date) if s(payment_date).strip() else "—"
+        pc_disp = s(payment_comment).strip() if s(payment_comment).strip() else "—"
+        payment_html = (
+            '<div style="background:#e3f2fd; border-left:4px solid #1976d2; '
+            'padding:6px 10px; margin-top:6px; border-radius:4px; '
+            'font-size:13px; word-wrap:break-word;">'
+            '💳 <b>Дата оплаты:</b> ' + pd_disp
+            + ' &nbsp;·&nbsp; 💬 <b>Комментарий:</b> ' + pc_disp
+            + '</div>'
+        )
+
+    splits_html = ""
+    if has_nds and payments_info:
+        parts = payments_info.get("parts", [])
+        paid_total = payments_info.get("paid_total", 0.0)
+        nds_debt = payments_info.get("nds_debt", 0.0)
+        nds_total = payments_info.get("nds_total", 0.0)
+        paid_from_sum = payments_info.get("paid_from_sum", 0.0)
+        parts_count = payments_info.get("parts_count", 0)
+        is_paid = payments_info.get("is_paid", False)
+
+        badge_color = "#2e7d32" if is_paid else "#f57c00"
+        badge_text = ("✅ Оплачен" if is_paid
+                      else "⏳ Частично оплачен")
+        header = (
+            '<div style="background:#fff8e1; border-left:4px solid #ffb300; '
+            'padding:6px 10px; margin-top:6px; border-radius:4px; '
+            'font-size:13px; word-wrap:break-word;">'
+            '<b>🧾 Разделение счёта:</b> '
+            '<span style="background:' + badge_color + '; color:#fff; '
+            'padding:1px 8px; border-radius:10px; font-size:12px; '
+            'font-weight:bold;">' + badge_text + '</span>'
+            ' &nbsp;·&nbsp; <b>Оплачено от суммы:</b> '
+            '<b style="color:#2e7d32;">' + fmt_money(paid_from_sum) + ' ₽</b>'
+            ' из <b>' + fmt_money(nds_total) + ' ₽</b>'
+            ' &nbsp;·&nbsp; <b>Задолженность:</b> '
+            '<b style="color:#c62828;">' + fmt_money(nds_debt) + ' ₽</b>'
+            ' &nbsp;·&nbsp; По разбивке: <b>' + fmt_money(paid_total) + ' ₽</b>'
+            ' &nbsp;·&nbsp; Частей: <b>' + s(parts_count) + '</b>'
+        )
+        if parts:
+            rows_html = "<br>"
+            for p in parts:
+                label = PAY_SPLIT_LABELS[p["idx"] - 1]
+                rows_html += (
+                    "&nbsp;&nbsp;• <b>" + s(p["idx"]) + ". " + label
+                    + ":</b> " + fmt_money(p["amount"]) + " ₽"
+                    + ("  · дата: " + s(p["date"]) if p["date"] else "")
+                    + ("  · " + s(p["comment"]) if p["comment"] else "")
+                    + "<br>"
+                )
+            header += rows_html
+        header += "</div>"
+        splits_html = header
+
+    html = (
+        '<div style="background-color:' + bg +
+        '; border:2px solid ' + bd +
+        '; border-radius:8px; padding:10px 14px; margin-bottom:6px; '
+        'font-size:14px; word-wrap:break-word;">'
+        '<div style="display:flex; justify-content:space-between; '
+        'align-items:center; gap:10px; flex-wrap:wrap;">'
+        '<div style="font-weight:bold; flex:1; min-width:200px;">'
+        + title +
+        '</div>'
+        '<div>' + badges + completed_html + '</div>'
+        '</div>'
+        + loading_html +
+        '<div style="color:#333; margin-top:4px; display:flex; '
+        'align-items:center; flex-wrap:wrap;">'
+        '<div>' + stats + '</div>'
+        '<div>' + inv_html + '</div>'
+        '</div>'
+        + payment_html
+        + splits_html
+        + incoming_stats_html
+        + incoming_html +
+        '</div>'
+    )
+    return html
+
+
+# ============================================================
+# БЛОК ОПЛАТЫ РЕЙСА
+# ============================================================
+
+def render_trip_payment_button(trip_id, cars, role, user_login,
+                               trip_label="", container=None):
+    if container is None:
+        container = st
+
+    nds_cars = [x for x in cars
+                if s(x.get("payer_type", "")).strip() == NDS_PAYER]
+    if not nds_cars:
+        return
+
+    unpaid_debt = 0.0
+    unpaid_count = 0
+    paid_count = 0
+    for x in nds_cars:
+        f = calculate_financials(x)
+        if check_paid(x.get("paid", "0")):
+            paid_count += 1
+        elif f["debt"] > 0.01:
+            unpaid_debt += f["debt"]
+            unpaid_count += 1
+
+    key_confirm_pay = "confirm_pay_trip_nds_" + s(trip_id)
+    key_confirm_unpay = "confirm_unpay_trip_nds_" + s(trip_id)
+
+    if unpaid_count > 0:
+        if not st.session_state.get(key_confirm_pay):
+            if container.button(
+                "💵 Оплатить весь рейс (безнал с НДС) — "
+                + fmt_money(unpaid_debt) + " ₽ / " + s(unpaid_count) + " авто",
+                key="btn_pay_trip_nds_" + s(trip_id),
+                use_container_width=True,
+            ):
+                st.session_state[key_confirm_pay] = True
+                st.rerun()
+        else:
+            container.warning(
+                "Оплатить **" + s(unpaid_count) + "** авто на сумму **"
+                + fmt_money(unpaid_debt) + " ₽**? Долг будет обнулён — "
+                "аванс поднимется до полной суммы."
+            )
+            c1, c2 = container.columns(2)
+            if c1.button("✅ Подтвердить оплату",
+                         key="ok_" + key_confirm_pay,
+                         use_container_width=True):
+                paid, skipped, closed = pay_entire_trip_nds(
+                    trip_id, user_login, role
+                )
+                st.session_state.pop(key_confirm_pay, None)
+                if paid > 0:
+                    st.success(
+                        "Оплачено авто: " + s(paid)
+                        + " · долг закрыт на " + fmt_money(closed) + " ₽"
+                    )
+                else:
+                    st.info("Нечего оплачивать.")
+                st.rerun()
+            if c2.button("Отмена",
+                         key="cancel_" + key_confirm_pay,
+                         use_container_width=True):
+                st.session_state.pop(key_confirm_pay, None)
+                st.rerun()
+
+    if paid_count > 0 and unpaid_count == 0:
+        if not st.session_state.get(key_confirm_unpay):
+            if container.button(
+                "↩ Снять оплату с рейса (безнал с НДС)",
+                key="btn_unpay_trip_nds_" + s(trip_id),
+                use_container_width=True,
+            ):
+                st.session_state[key_confirm_unpay] = True
+                st.rerun()
+        else:
+            container.warning(
+                "Снять оплату с **" + s(paid_count) + "** авто? "
+                "Аванс вернётся к исходному значению, долг появится снова."
+            )
+            c1, c2 = container.columns(2)
+            if c1.button("✅ Подтвердить снятие",
+                         key="ok_" + key_confirm_unpay,
+                         use_container_width=True):
+                cnt = unpay_entire_trip_nds(trip_id, user_login, role)
+                st.session_state.pop(key_confirm_unpay, None)
+                if cnt > 0:
+                    st.success("Оплата снята с " + s(cnt) + " авто, долг возвращён.")
+                else:
+                    st.info("Нечего снимать.")
+                st.rerun()
+            if c2.button("Отмена",
+                         key="cancel_" + key_confirm_unpay,
+                         use_container_width=True):
+                st.session_state.pop(key_confirm_unpay, None)
+                st.rerun()
+
+
+# ============================================================
+# УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ
+# ============================================================
+
+def _update_user_lockout(login, attempts, locked_until):
+    ws = get_ws_cached("users")
+    for i, row in enumerate(ws.get_all_values()[1:], start=2):
+        if row[0] == login:
+            payload = [
+                {"range": "F" + str(i), "values": [[str(attempts)]]},
+                {"range": "G" + str(i), "values": [[locked_until]]},
+            ]
+            ws.batch_update(payload, value_input_option="USER_ENTERED")
+            break
+    invalidate_cache("users")
+
+
+def _upgrade_password_hash(login, new_hash):
+    ws = get_ws_cached("users")
+    for i, row in enumerate(ws.get_all_values()[1:], start=2):
+        if row[0] == login:
+            ws.update_cell(i, 2, new_hash)
+            break
+    invalidate_cache("users")
+
+
+def admin_set_password(login, new_password):
+    if not login or not new_password:
+        return False, "Логин и пароль обязательны"
+    if len(new_password) < 8:
+        return False, "Пароль минимум 8 символов"
+    ws = get_ws_cached("users")
+    all_rows = ws.get_all_values()
+    row_idx = None
+    for i, row in enumerate(all_rows[1:], start=2):
+        if s(row[0]).strip() == s(login).strip():
+            row_idx = i
+            break
+    if row_idx is None:
+        return False, "Пользователь не найден"
+    new_hash = hash_password(new_password)
+    ws.update_cell(row_idx, 2, new_hash)
+    ws.update_cell(row_idx, 6, "0")
+    ws.update_cell(row_idx, 7, "")
+    invalidate_cache("users")
+    return True, ""
+
+
+def admin_unlock_user(login):
+    ws = get_ws_cached("users")
+    all_rows = ws.get_all_values()
+    for i, row in enumerate(all_rows[1:], start=2):
+        if s(row[0]).strip() == s(login).strip():
+            ws.update_cell(i, 6, "0")
+            ws.update_cell(i, 7, "")
+            invalidate_cache("users")
+            return True
+    return False
+
+
+# ============================================================
+# АВТОРИЗАЦИЯ
+# ============================================================
+
+def login_page():
+    st.title("Учёт рейсов — вход")
+    with st.form("login"):
+        login = st.text_input("Логин")
+        pwd = st.text_input("Пароль", type="password")
+        ok = st.form_submit_button("Войти")
+
+    if ok:
+        users = read_all("users", fresh=True)
+        u = next((x for x in users if s(x.get("login")) == login), None)
+        if not u:
+            st.error("Пользователь не найден")
+            log_action(login, "-", "login_fail", "не найден")
+            return
+
+        locked = check_lockout(u)
+        if locked:
+            st.error("Учётная запись заблокирована до "
+                     + locked.strftime("%H:%M:%S"))
+            log_action(login, u.get("role", "-"), "login_fail", "заблокирован")
+            return
+
+        if not is_active(u):
+            st.error("Учётная запись отключена")
+            log_action(login, u.get("role", "-"), "login_fail", "отключён")
+            return
+
+        if not verify_password(pwd, u.get("password_hash")):
+            attempts = int(to_float(u.get("failed_attempts")) or 0) + 1
+            lock_until = ""
+            if attempts >= LOGIN_MAX_ATTEMPTS:
+                lock_until = (datetime.now() + timedelta(minutes=LOGIN_LOCK_MINUTES)
+                              ).strftime("%Y-%m-%d %H:%M:%S")
+                st.error("Слишком много попыток. Блок на "
+                         + s(LOGIN_LOCK_MINUTES) + " минут.")
+            else:
+                st.error("Неверный пароль")
+            _update_user_lockout(login, attempts, lock_until)
+            log_action(login, u.get("role", "-"), "login_fail",
+                       "неверный пароль (попытка " + s(attempts) + ")")
+            return
+
+        if to_float(u.get("failed_attempts")) > 0 or s(u.get("locked_until")):
+            _update_user_lockout(login, 0, "")
+
+        if HAS_BCRYPT and needs_password_upgrade(u.get("password_hash")):
+            try:
+                _upgrade_password_hash(login, hash_password(pwd))
+                log_action(login, u.get("role", "-"), "password_upgraded",
+                           "SHA-256 → bcrypt")
+            except Exception as e:
+                _log_system_error("password_upgrade", login, e)
+
+        st.session_state["user"] = {
+            "login": u["login"], "role": u["role"], "full_name": u["full_name"],
+        }
+        log_action(u["login"], u["role"], "login_ok")
+        st.rerun()
+
+
+def logout():
+    u = st.session_state.get("user")
+    if u:
+        log_action(u["login"], u["role"], "logout")
+    st.session_state.pop("user", None)
+    st.rerun()
+
+
+def ensure_first_admin():
+    users = read_all("users", fresh=True)
+    if not users:
+        st.warning("Первый запуск: создайте аккаунт администратора")
+        with st.form("create_admin"):
+            login = st.text_input("Логин администратора", value="admin")
+            pwd = st.text_input("Пароль (минимум 8 символов)", type="password")
+            pwd2 = st.text_input("Повторите пароль", type="password")
+            name = st.text_input("ФИО администратора")
+            ok = st.form_submit_button("Создать админа")
+        if ok:
+            if not login or not pwd or not name:
+                st.error("Заполните все поля")
+            elif pwd != pwd2:
+                st.error("Пароли не совпадают")
+            elif len(pwd) < 8:
+                st.error("Пароль минимум 8 символов")
+            else:
+                append_row("users", {
+                    "login": login, "password_hash": hash_password(pwd),
+                    "role": "admin", "full_name": name, "active": "1",
+                    "failed_attempts": "0", "locked_until": "",
+                })
+                st.success("Админ " + login + " создан. Войдите.")
+                st.rerun()
+        st.stop()
+
+
+def can(action, role):
+    """
+    v2.12.6: dispatcher теперь имеет те же права, что director.
+    """
+    DIRECTOR_RIGHTS = {
+        "create_trip", "edit_trip", "delete_trip",
+        "create_ship", "edit_ship", "delete_ship",
+        "export", "print_act", "manage_users", "view_log",
+        "archive", "complete_trip", "transfer_ship",
+        "cancel_transfer", "edit_invoice", "edit_trace",
+        "manage_passwords", "edit_payment", "split_payment",
+    }
+    LOGIST_RIGHTS = {
+        "create_trip", "edit_trip", "create_ship", "edit_ship",
+        "export", "print_act", "archive", "complete_trip",
+        "transfer_ship", "cancel_transfer", "edit_invoice",
+        "edit_trace", "edit_payment", "split_payment",
+    }
+    rights = {
+        "admin":      DIRECTOR_RIGHTS,
+        "director":   DIRECTOR_RIGHTS,
+        "dispatcher": DIRECTOR_RIGHTS,   # ← как у director
+        "logist":     LOGIST_RIGHTS,
+    }
+    return action in rights.get(role, set())
+
+
+# ============================================================
+# АДМИН-ПАНЕЛЬ
+# ============================================================
+
+def admin_panel():
+    admin_role = st.session_state["user"]["role"]
+    admin_login = st.session_state["user"]["login"]
+
+    st.header("Админ-панель")
+    tab1, tab2, tab3 = st.tabs(
+        ["Пользователи", "Журнал действий", "Журнал печати актов"])
+
+    with tab1:
+        st.subheader("Пользователи")
+        users = read_all("users", fresh=True)
+
+        for u in users:
+            login_u = s(u.get("login"))
+            role_u = s(u.get("role"))
+            name_u = s(u.get("full_name"))
+            active_u = is_active(u)
+            attempts = int(to_float(u.get("failed_attempts")) or 0)
+            locked_until = s(u.get("locked_until", "")).strip()
+            is_locked = bool(locked_until)
+
+            st.markdown(
+                "---\n"
+                "**" + login_u + "** · роль: `" + role_u + "` · " + name_u
+                + ("  \n🟢 активен" if active_u else "  \n🔴 отключён")
+                + ("  \n🔒 **заблокирован** до " + locked_until if is_locked else "")
+                + ("  \n⚠️ неудачных попыток: " + s(attempts) if attempts > 0 else "")
+            )
+
+            c1, c2, c3, c4 = st.columns(4)
+
+            if c1.button("🔑 Сменить пароль",
+                         key="btn_pwd_" + login_u,
+                         use_container_width=True):
+                st.session_state["show_pwd_form_" + login_u] = True
+                st.rerun()
+
+            if is_locked or attempts > 0:
+                if c2.button("🔓 Разблокировать",
+                             key="btn_unlock_" + login_u,
+                             use_container_width=True):
+                    if admin_unlock_user(login_u):
+                        log_action(admin_login, admin_role, "unlock_user", login_u)
+                        st.success("Блокировка снята: " + login_u)
+                        st.rerun()
+
+            if c3.button("Отключить" if active_u else "Включить",
+                         key="toggle_user_" + login_u,
+                         use_container_width=True):
+                ws = get_ws_cached("users")
+                all_rows = ws.get_all_values()
+                for i, row in enumerate(all_rows[1:], start=2):
+                    if s(row[0]).strip() == login_u:
+                        new_val = "0" if active_u else "1"
+                        ws.update_cell(i, 5, new_val)
+                        invalidate_cache("users")
+                        log_action(admin_login, admin_role, "toggle_user",
+                                   login_u + " -> " + new_val)
+                        st.rerun()
+
+            if st.session_state.get("show_pwd_form_" + login_u):
+                with st.form("pwd_form_" + login_u):
+                    st.markdown("**Смена пароля для `" + login_u + "`**")
+                    new_pwd = st.text_input("Новый пароль (минимум 8 символов)",
+                                            type="password",
+                                            key="new_pwd_" + login_u)
+                    new_pwd2 = st.text_input("Повторите пароль",
+                                             type="password",
+                                             key="new_pwd2_" + login_u)
+                    col_a, col_b = st.columns(2)
+                    ok = col_a.form_submit_button("💾 Сохранить пароль")
+                    cancel = col_b.form_submit_button("Отмена")
+                if cancel:
+                    st.session_state.pop("show_pwd_form_" + login_u, None)
+                    st.rerun()
+                if ok:
+                    if not new_pwd or not new_pwd2:
+                        st.error("Заполните оба поля")
+                    elif new_pwd != new_pwd2:
+                        st.error("Пароли не совпадают")
+                    elif len(new_pwd) < 8:
+                        st.error("Пароль минимум 8 символов")
+                    else:
+                        success, err = admin_set_password(login_u, new_pwd)
+                        if success:
+                            log_action(admin_login, admin_role, "admin_set_password",
+                                       "пользователь: " + login_u)
+                            st.session_state.pop("show_pwd_form_" + login_u, None)
+                            st.success("Пароль для " + login_u + " обновлён. "
+                                       "Блокировка снята, счётчик попыток сброшен.")
+                            st.rerun()
+                        else:
+                            st.error("Не удалось: " + s(err))
+
+        st.markdown("---")
+        st.subheader("Добавить пользователя")
+        with st.form("add_user"):
+            new_login = st.text_input("Логин")
+            new_pwd = st.text_input("Пароль", type="password")
+            new_role = st.selectbox("Роль", ROLES)
+            new_name = st.text_input("ФИО")
+            ok = st.form_submit_button("Создать")
+        if ok:
+            if not new_login or not new_pwd or not new_name:
+                st.error("Заполните все поля")
+            elif len(new_pwd) < 8:
+                st.error("Пароль минимум 8 символов")
+            elif any(s(x.get("login")) == new_login for x in users):
+                st.error("Такой логин уже есть")
+            else:
+                append_row("users", {
+                    "login": new_login, "password_hash": hash_password(new_pwd),
+                    "role": new_role, "full_name": new_name, "active": "1",
+                    "failed_attempts": "0", "locked_until": "",
+                })
+                log_action(admin_login, admin_role,
+                           "create_user", new_login + " / " + new_role)
+                st.success("Пользователь " + new_login + " создан")
+                st.rerun()
+
+    with tab2:
+        st.subheader("Журнал действий")
+        rows = list(reversed(read_all("audit_log")))[:200]
+        if rows:
+            st.dataframe(safe_df(rows), use_container_width=True)
+        else:
+            st.info("Пока пусто")
+
+    with tab3:
+        st.subheader("Журнал печати актов")
+        rows = list(reversed(read_all("act_log")))[:200]
+        if rows:
+            st.dataframe(safe_df(rows), use_container_width=True)
+        else:
+            st.info("Пока пусто")
+
+
+# ============================================================
+# ФОРМА РАЗДЕЛЕНИЯ СЧЁТА НА 3 ПЛАТЕЖА
+# ============================================================
+
+def render_trip_split_form(trip_id, trip, nds_debt, nds_total,
+                           user_login, role):
+    parts = extract_trip_payments(trip)
+    paid_total = compute_trip_payments_total(trip)
+    to_split = nds_debt - paid_total
+    if to_split < 0.01:
+        to_split = 0.0
+
+    st.markdown("---")
+    st.markdown("### 🧾 Разделение счёта на части")
+
+    badge_color = "#2e7d32" if to_split <= 0.01 else "#f57c00"
+    badge_text = "✅ Оплачен" if to_split <= 0.01 else "⏳ Частично оплачен"
+    st.markdown(
+        '<div style="background:#fff8e1; border-left:4px solid #ffb300; '
+        'padding:8px 12px; border-radius:4px; font-size:14px;">'
+        '<b>Задолженность (безнал с НДС):</b> ' + fmt_money(nds_debt) + ' ₽'
+        ' &nbsp;·&nbsp; <b>Разнесено по частям:</b> ' + fmt_money(paid_total) + ' ₽'
+        ' &nbsp;·&nbsp; <b>Осталось разнести:</b> <span style="color:'
+        + ("#2e7d32" if to_split <= 0.01 else "#c62828") + '; font-weight:bold;">'
+        + fmt_money(to_split) + ' ₽</span>'
+        ' &nbsp;·&nbsp; <span style="background:' + badge_color + '; color:#fff; '
+        'padding:1px 8px; border-radius:10px; font-size:12px; font-weight:bold;">'
+        + badge_text + '</span>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    if parts:
+        rows_html = ""
+        for p in parts:
+            label = PAY_SPLIT_LABELS[p["idx"] - 1]
+            rows_html += (
+                "• <b>" + s(p["idx"]) + ". " + label + ":</b> "
+                + fmt_money(p["amount"]) + " ₽"
+                + ("  · дата: " + s(p["date"]) if p["date"] else "")
+                + ("  · " + s(p["comment"]) if p["comment"] else "")
+                + "<br>"
+            )
+        st.markdown(
+            '<div style="background:#f5f5f5; border:1px solid #cccccc; '
+            'border-radius:6px; padding:8px 12px; font-size:13px;">'
+            + rows_html + '</div>',
+            unsafe_allow_html=True,
+        )
+
+    form_key = "split_form_" + s(trip_id)
+    with st.form(form_key):
+        st.markdown("**Задать до 3 платежей** (пустые части игнорируются)")
+        new_payments = []
+        for i in range(1, MAX_PAY_SPLITS + 1):
+            label = PAY_SPLIT_LABELS[i - 1]
+            cur_amt = ""
+            cur_date = ""
+            cur_comm = ""
+            for p in parts:
+                if p["idx"] == i:
+                    cur_amt = "{:.2f}".format(p["amount"]).replace(".", ",") if p["amount"] > 0 else ""
+                    cur_date = p["date"]
+                    cur_comm = p["comment"]
+                    break
+
+            st.markdown(
+                '<div style="background:#fafafa; border:1px dashed #cccccc; '
+                'border-radius:6px; padding:8px 10px; margin-bottom:6px;">'
+                '<b>Платёж №' + s(i) + ' — ' + label + '</b>'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+            c1, c2, c3 = st.columns([1, 1, 2])
+            amt_in = c1.text_input(
+                "Сумма ₽",
+                value=cur_amt,
+                key=form_key + "_amt_" + s(i),
+            )
+            dt_in = c2.text_input(
+                "Дата (ДД.ММ.ГГГГ)",
+                value=cur_date,
+                key=form_key + "_dt_" + s(i),
+            )
+            cm_in = c3.text_input(
+                "Комментарий",
+                value=cur_comm,
+                key=form_key + "_cm_" + s(i),
+            )
+            new_payments.append({
+                "amount": amt_in,
+                "date": dt_in,
+                "comment": cm_in,
+            })
+
+        total_new = 0.0
+        for p in new_payments:
+            total_new += money_value(p["amount"])
+        total_new = money_value(total_new)
+        if nds_debt > 0.01 and total_new > nds_debt + 0.01:
+            st.error(
+                "⚠️ Сумма платежей (" + fmt_money(total_new)
+                + " ₽) больше задолженности по безнал-НДС ("
+                + fmt_money(nds_debt) + " ₽). Уменьшите суммы."
+            )
+        elif total_new > 0.01:
+            st.info(
+                "Итого по частям: **" + fmt_money(total_new) + " ₽**"
+                + " из **" + fmt_money(nds_debt) + " ₽**"
+            )
+
+        col_save, col_clear, col_cancel = st.columns(3)
+        save_btn = col_save.form_submit_button("💾 Сохранить платежи",
+                                                use_container_width=True)
+        clear_btn = col_clear.form_submit_button("🗑 Очистить все",
+                                                  use_container_width=True)
+        cancel_btn = col_cancel.form_submit_button("Отмена",
+                                                    use_container_width=True)
+
+    if cancel_btn:
+        st.session_state.pop("open_split_" + s(trip_id), None)
+        st.rerun()
+
+    if clear_btn:
+        clear_trip_payments_split(trip_id)
+        log_action(user_login, role, "clear_trip_split",
+                   "trip " + s(trip_id))
+        st.success("Все части платежей очищены")
+        st.rerun()
+
+    if save_btn:
+        parsed = []
+        for i, p in enumerate(new_payments):
+            amt_raw = s(p.get("amount", "")).strip()
+            dt_raw = s(p.get("date", "")).strip()
+            cm_raw = s(p.get("comment", "")).strip()
+            amt_val = money_value(amt_raw) if amt_raw else 0.0
+            if amt_val < 0:
+                st.error("Сумма платежа №" + s(i + 1) + " не может быть отрицательной")
+                st.stop()
+            try:
+                dt_fmt = parse_date_ui(dt_raw) if dt_raw else ""
+            except ValueError as ex:
+                st.error("Платёж №" + s(i + 1) + ": " + str(ex))
+                st.stop()
+            parsed.append({
+                "amount": amt_val,
+                "date": dt_fmt,
+                "comment": cm_raw,
+            })
+
+        total_parsed = money_value(sum(x["amount"] for x in parsed))
+        if nds_debt > 0.01 and total_parsed > nds_debt + 0.01:
+            st.error("Сумма платежей превышает задолженность по безнал-НДС. "
+                     "Уменьшите суммы.")
+            st.stop()
+
+        update_trip_payments_split(trip_id, parsed)
+        log_action(user_login, role, "update_trip_split",
+                   "trip " + s(trip_id)
+                   + " | итого: " + fmt_money(total_parsed) + " ₽"
+                   + " | частей: " + s(sum(1 for x in parsed if x["amount"] > 0.01)))
+        st.session_state.pop("open_split_" + s(trip_id), None)
+        st.success("Платежи сохранены")
+        st.rerun()# ============================================================
 # ЧАСТЬ 2/2: главная страница и точка входа
 # v2.12.6 — «Общая оплата» = сумма реально оплаченного
 # ============================================================
