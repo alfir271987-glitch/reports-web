@@ -3162,7 +3162,9 @@ def main_page():
                 payment_date=payment_date,
                 payment_comment=payment_comment,
                 payments_info=payments_info,
-            )            open_key = "open_details_" + s(trip_id)
+            )
+
+            open_key = "open_details_" + s(trip_id)
             is_open = st.session_state.get(open_key, False)
 
             col_hdr, col_btn = st.columns([12, 1])
@@ -3974,7 +3976,7 @@ def main_page():
                                 st.rerun()
 
                     elif view_mode == "completed" and not is_trace:
-                        # v2.12.7: добавлена кнопка «✏ Изменить» (4 колонки)
+                        # v2.12.7: 4 колонки + кнопка «Изменить»
                         bc1, bc2 = st.columns(2)
                         paid_label = "❌ Снять оплату" if is_paid_flag else "✅ Оплачен"
                         if bc1.button(paid_label,
