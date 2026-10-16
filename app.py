@@ -1,5 +1,5 @@
 # ============================================================
-# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.12.6
+# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.12.7
 # Streamlit + Google Sheets
 # ЧАСТЬ 1/2
 # ============================================================
@@ -534,8 +534,6 @@ def calculate_financials(row):
         nds = 0.0
         amount_no_nds = amount
 
-    # v2.12.6: paid_value — сколько фактически оплачено по авто
-    # = amount - debt. При paid=1 debt=0 → paid_value = amount.
     paid_value = amount - debt
     if paid_value < 0:
         paid_value = 0.0
@@ -635,13 +633,6 @@ def is_trip_beznal_nds(trip_id, shipments):
 
 
 def compute_grand_totals(trips, shipments):
-    """
-    v2.12.6: ИСПРАВЛЕНО.
-    «Общая оплата» = сумма ФАКТИЧЕСКИ оплаченного по всем авто
-    в активных рейсах = Σ (amount - debt).
-    Учитывает флаг paid=1, авансы 1 и 2, доплаты (paid_amount).
-    Не пропускает «выданные» авто — они тоже входят в оплату.
-    """
     active_trip_ids = {s(t.get("id")) for t in trips
                        if not is_archived(t.get("archived", "0"))
                        and not is_deleted(t.get("deleted_at", ""))
@@ -659,16 +650,12 @@ def compute_grand_totals(trips, shipments):
     total_paid = 0.0
     active_cars_count = 0
     for x in active_cars:
-        # Считаем ВСЕ авто активных рейсов, включая выданные —
-        # чтобы «Общая оплата» отражала реально закрытые суммы.
         f = calculate_financials(x)
         total_amount += f["amount"]
         total_paid += f["paid_value"]
-        # Активных авто — тех, что ещё «в работе» на автовозе
         if not is_effectively_issued(x):
             active_cars_count += 1
 
-    # Задолженность нал/эквайринг — только по неоплаченным
     debt_nal = 0.0
     for x in active_cars:
         if not _is_nal_or_acquiring(x):
@@ -700,8 +687,8 @@ def compute_grand_totals(trips, shipments):
         "active_trips": len(active_trip_ids),
         "active_cars": active_cars_count,
         "total_amount": total_amount,
-        "total_paid": total_paid,       # ← новое: «Общая оплата»
-        "total_advance": total_paid,    # ← алиас для совместимости
+        "total_paid": total_paid,
+        "total_advance": total_paid,
         "debt_nal": debt_nal,
         "debt_beznal": debt_beznal,
         "nds_beznal": nds_beznal,
@@ -2508,9 +2495,6 @@ def ensure_first_admin():
 
 
 def can(action, role):
-    """
-    v2.12.6: dispatcher теперь имеет те же права, что director.
-    """
     DIRECTOR_RIGHTS = {
         "create_trip", "edit_trip", "delete_trip",
         "create_ship", "edit_ship", "delete_ship",
@@ -2528,7 +2512,7 @@ def can(action, role):
     rights = {
         "admin":      DIRECTOR_RIGHTS,
         "director":   DIRECTOR_RIGHTS,
-        "dispatcher": DIRECTOR_RIGHTS,   # ← как у director
+        "dispatcher": DIRECTOR_RIGHTS,
         "logist":     LOGIST_RIGHTS,
     }
     return action in rights.get(role, set())
@@ -2841,7 +2825,7 @@ def render_trip_split_form(trip_id, trip, nds_debt, nds_total,
         st.success("Платежи сохранены")
         st.rerun()# ============================================================
 # ЧАСТЬ 2/2: главная страница и точка входа
-# v2.12.6 — «Общая оплата» = сумма реально оплаченного
+# v2.12.7 — добавлено «✏ Изменить» в завершённых и архиве
 # ============================================================
 
 def main_page():
@@ -2852,7 +2836,6 @@ def main_page():
     if st.sidebar.button("Выйти", key="btn_logout", use_container_width=True):
         logout()
 
-    # v2.12.6: админ-панель доступна admin, director и dispatcher
     if role in ("admin", "director", "dispatcher"):
         with st.sidebar.expander("Админ-панель"):
             admin_panel()
@@ -3179,9 +3162,7 @@ def main_page():
                 payment_date=payment_date,
                 payment_comment=payment_comment,
                 payments_info=payments_info,
-            )
-
-            open_key = "open_details_" + s(trip_id)
+            )            open_key = "open_details_" + s(trip_id)
             is_open = st.session_state.get(open_key, False)
 
             col_hdr, col_btn = st.columns([12, 1])
@@ -3923,6 +3904,9 @@ def main_page():
                                 unsafe_allow_html=True,
                             )
 
+                    # ============================================================
+                    # v2.12.7: действия по авто для активных / завершённых / архива
+                    # ============================================================
                     if view_mode == "active" and not is_trace:
                         bc1, bc2, bc3, bc4 = st.columns(4)
                         paid_label = "❌ Снять оплату" if is_paid_flag else "✅ Оплачен"
@@ -3990,6 +3974,7 @@ def main_page():
                                 st.rerun()
 
                     elif view_mode == "completed" and not is_trace:
+                        # v2.12.7: добавлена кнопка «✏ Изменить» (4 колонки)
                         bc1, bc2 = st.columns(2)
                         paid_label = "❌ Снять оплату" if is_paid_flag else "✅ Оплачен"
                         if bc1.button(paid_label,
@@ -4019,7 +4004,7 @@ def main_page():
                                            "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
                                 st.rerun()
 
-                        bc3, bc4, bc5 = st.columns(3)
+                        bc3, bc4, bc5, bc6 = st.columns(4)
                         if bc3.button("📄 Акт", key="btn_act_inline_" + s(x["id"]),
                                       use_container_width=True):
                             st.session_state["show_act_for"] = x["id"]
@@ -4029,14 +4014,37 @@ def main_page():
                                       use_container_width=True):
                             st.session_state["show_history_for"] = x["id"]
                             st.rerun()
+                        if bc5.button("✏ Изменить",
+                                      key="btn_edit_c_" + s(x["id"]),
+                                      use_container_width=True):
+                            st.session_state["edit_ship_" + s(x["id"])] = True
+                            st.rerun()
                         if can("delete_ship", role):
-                            if bc5.button("🗑 Удалить авто",
+                            if bc6.button("🗑 Удалить авто",
                                           key="btn_delship_" + s(x["id"]),
                                           use_container_width=True):
                                 delete_shipment(x["id"])
                                 log_action(u["login"], role, "delete_ship",
                                            "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
                                 st.rerun()
+
+                    elif view_mode == "archive" and not is_trace:
+                        # v2.12.7: в архиве — Акт / История / Изменить
+                        ac1, ac2, ac3 = st.columns(3)
+                        if ac1.button("📄 Акт", key="btn_act_arch_" + s(x["id"]),
+                                      use_container_width=True):
+                            st.session_state["show_act_for"] = x["id"]
+                            st.rerun()
+                        if ac2.button("📜 История",
+                                      key="btn_hist_arch_" + s(x["id"]),
+                                      use_container_width=True):
+                            st.session_state["show_history_for"] = x["id"]
+                            st.rerun()
+                        if ac3.button("✏ Изменить",
+                                      key="btn_edit_arch_" + s(x["id"]),
+                                      use_container_width=True):
+                            st.session_state["edit_ship_" + s(x["id"])] = True
+                            st.rerun()
 
                     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -4244,7 +4252,7 @@ def main_page():
             st.markdown("---")
 
     # ============================================================
-    # ИТОГИ (v2.12.6: «Общая оплата» = реально оплачено)
+    # ИТОГИ
     # ============================================================
     st.markdown("---")
 
