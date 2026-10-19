@@ -1,7 +1,8 @@
 # ============================================================
-# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.12.7
+# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.12.8
 # Streamlit + Google Sheets
 # ЧАСТЬ 1/2
+# v2.12.8: оплата по безнал с НДС — только admin/director
 # ============================================================
 
 import streamlit as st
@@ -625,6 +626,18 @@ def _is_beznal_nds(x):
     return s(x.get("payer_type", "")).strip() == NDS_PAYER
 
 
+# v2.12.8: единая проверка, может ли роль оплачивать конкретное авто
+def can_pay_shipment(x, role):
+    """
+    Оплата авто разрешена:
+    - для нал / эквайринг — всем, у кого есть edit_payment;
+    - для безнал с НДС — только admin и director (право pay_beznal_nds).
+    """
+    if not _is_beznal_nds(x):
+        return can("edit_payment", role)
+    return can("pay_beznal_nds", role)
+
+
 def is_trip_beznal_nds(trip_id, shipments):
     for x in shipments:
         if s(x.get("trip_id")) == s(trip_id) and _is_beznal_nds(x):
@@ -1187,7 +1200,23 @@ def toggle_issued(shipment_id, current_value, current_ever):
     return "0" if was_issued else "1"
 
 
-def toggle_paid(shipment_id, current_paid, current_amount, current_advance):
+# v2.12.8: добавлена защита — безнал с НДС может оплачивать только admin/director
+def toggle_paid(shipment_id, current_paid, current_amount, current_advance,
+                role=None):
+    shipments = read_all_cached("shipments")
+    ship = next((x for x in shipments if s(x.get("id")) == s(shipment_id)), None)
+    if ship is None:
+        return current_paid
+
+    # backend-защита: нельзя менять paid у безнал-НДС без права pay_beznal_nds
+    if role is not None and not can_pay_shipment(ship, role):
+        log_action(
+            "SYSTEM", s(role), "toggle_paid_denied",
+            "shipment " + s(shipment_id)
+            + " (" + s(ship.get("payer_type", "")) + ") — нет прав"
+        )
+        return current_paid
+
     ws = get_ws_cached("shipments")
     row_idx = _find_row_index_by_id("shipments", shipment_id)
     if row_idx is None:
@@ -1229,7 +1258,13 @@ def delete_shipment(shipment_id):
 # ОПЛАТА РЕЙСА (безнал с НДС)
 # ============================================================
 
+# v2.12.8: только admin/director (право pay_beznal_nds)
 def pay_entire_trip_nds(trip_id, user_login, role):
+    if not can("pay_beznal_nds", role):
+        log_action(user_login, role, "pay_entire_trip_nds_denied",
+                   "trip " + s(trip_id) + " — нет прав")
+        return 0, 0, 0.0
+
     shipments = read_all("shipments", fresh=True)
     cars = [x for x in shipments
             if s(x.get("trip_id")) == s(trip_id)
@@ -1278,7 +1313,13 @@ def pay_entire_trip_nds(trip_id, user_login, role):
     return paid_count, skipped_count, closed_sum
 
 
+# v2.12.8: только admin/director (право pay_beznal_nds)
 def unpay_entire_trip_nds(trip_id, user_login, role):
+    if not can("pay_beznal_nds", role):
+        log_action(user_login, role, "unpay_entire_trip_nds_denied",
+                   "trip " + s(trip_id) + " — нет прав")
+        return 0
+
     shipments = read_all("shipments", fresh=True)
     cars = [x for x in shipments
             if s(x.get("trip_id")) == s(trip_id)
@@ -2240,10 +2281,27 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
 # БЛОК ОПЛАТЫ РЕЙСА
 # ============================================================
 
+# v2.12.8: оплата рейса по безнал-НДС — только admin/director
 def render_trip_payment_button(trip_id, cars, role, user_login,
                                trip_label="", container=None):
     if container is None:
         container = st
+
+    # ранний выход для ролей без права pay_beznal_nds
+    if not can("pay_beznal_nds", role):
+        nds_cars = [x for x in cars if _is_beznal_nds(x)]
+        if nds_cars:
+            unpaid = 0.0
+            for x in nds_cars:
+                f = calculate_financials(x)
+                if not check_paid(x.get("paid", "0")):
+                    unpaid += f["debt"]
+            if unpaid > 0.01:
+                container.info(
+                    "💵 Оплата рейса по «безнал с НДС» доступна "
+                    "только директору и администратору."
+                )
+        return
 
     nds_cars = [x for x in cars
                 if s(x.get("payer_type", "")).strip() == NDS_PAYER]
@@ -2494,8 +2552,18 @@ def ensure_first_admin():
         st.stop()
 
 
+# v2.12.8: право pay_beznal_nds — только у admin и director
 def can(action, role):
-    DIRECTOR_RIGHTS = {
+    ADMIN_DIRECTOR = {
+        "create_trip", "edit_trip", "delete_trip",
+        "create_ship", "edit_ship", "delete_ship",
+        "export", "print_act", "manage_users", "view_log",
+        "archive", "complete_trip", "transfer_ship",
+        "cancel_transfer", "edit_invoice", "edit_trace",
+        "manage_passwords", "edit_payment", "split_payment",
+        "pay_beznal_nds",
+    }
+    DISPATCHER = {
         "create_trip", "edit_trip", "delete_trip",
         "create_ship", "edit_ship", "delete_ship",
         "export", "print_act", "manage_users", "view_log",
@@ -2503,17 +2571,17 @@ def can(action, role):
         "cancel_transfer", "edit_invoice", "edit_trace",
         "manage_passwords", "edit_payment", "split_payment",
     }
-    LOGIST_RIGHTS = {
+    LOGIST = {
         "create_trip", "edit_trip", "create_ship", "edit_ship",
         "export", "print_act", "archive", "complete_trip",
         "transfer_ship", "cancel_transfer", "edit_invoice",
         "edit_trace", "edit_payment", "split_payment",
     }
     rights = {
-        "admin":      DIRECTOR_RIGHTS,
-        "director":   DIRECTOR_RIGHTS,
-        "dispatcher": DIRECTOR_RIGHTS,
-        "logist":     LOGIST_RIGHTS,
+        "admin":      ADMIN_DIRECTOR,
+        "director":   ADMIN_DIRECTOR,
+        "dispatcher": DISPATCHER,
+        "logist":     LOGIST,
     }
     return action in rights.get(role, set())
 
@@ -2823,9 +2891,12 @@ def render_trip_split_form(trip_id, trip, nds_debt, nds_total,
                    + " | частей: " + s(sum(1 for x in parsed if x["amount"] > 0.01)))
         st.session_state.pop("open_split_" + s(trip_id), None)
         st.success("Платежи сохранены")
-        st.rerun()# ============================================================
+        st.rerun()
+
+
+# ============================================================
 # ЧАСТЬ 2/2: главная страница и точка входа
-# v2.12.7 — добавлено «✏ Изменить» в завершённых и архиве
+# v2.12.8: ограничение оплаты по безнал с НДС
 # ============================================================
 
 def main_page():
@@ -3907,42 +3978,65 @@ def main_page():
                             )
 
                     # ============================================================
-                    # v2.12.7: действия по авто для активных / завершённых / архива
+                    # v2.12.8: действия по авто + ограничение оплаты безнал-НДС
                     # ============================================================
                     if view_mode == "active" and not is_trace:
                         bc1, bc2, bc3, bc4 = st.columns(4)
+
+                        paid_allowed = can_pay_shipment(x, role)
                         paid_label = "❌ Снять оплату" if is_paid_flag else "✅ Оплачен"
-                        if bc1.button(paid_label, key="btn_paid_" + s(x["id"]),
-                                      use_container_width=True):
-                            toggle_paid(x["id"], paid_val, amount_val, advance_val)
-                            log_action(u["login"], role, "toggle_paid",
-                                       "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
-                            st.rerun()
+
+                        if paid_allowed:
+                            if bc1.button(paid_label,
+                                          key="btn_paid_" + s(x["id"]),
+                                          use_container_width=True):
+                                toggle_paid(x["id"], paid_val,
+                                            amount_val, advance_val,
+                                            role=role)
+                                log_action(u["login"], role, "toggle_paid",
+                                           "рейс " + s(trip_id)
+                                           + ", поз " + s(x.get("position")))
+                                st.rerun()
+                        else:
+                            bc1.button(
+                                paid_label,
+                                key="btn_paid_" + s(x["id"]),
+                                use_container_width=True,
+                                disabled=True,
+                                help="Оплату по безнал с НДС может ставить "
+                                     "только директор или администратор",
+                            )
 
                         if check_issued(issued_val):
-                            if bc2.button("↩ Снять выдан", key="btn_issued_" + s(x["id"]),
+                            if bc2.button("↩ Снять выдан",
+                                          key="btn_issued_" + s(x["id"]),
                                           use_container_width=True):
                                 toggle_issued(x["id"], issued_val, "0")
                                 log_action(u["login"], role, "toggle_issued",
-                                           "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
+                                           "рейс " + s(trip_id)
+                                           + ", поз " + s(x.get("position")))
                                 st.rerun()
                         else:
                             issued_btn_label = "✅ Выдан"
                             if auto_issued:
                                 issued_btn_label = "✅ Выдан (аванс)"
-                            if bc2.button(issued_btn_label, key="btn_issued_" + s(x["id"]),
+                            if bc2.button(issued_btn_label,
+                                          key="btn_issued_" + s(x["id"]),
                                           use_container_width=True):
                                 toggle_issued(x["id"], issued_val, "0")
                                 log_action(u["login"], role, "toggle_issued",
-                                           "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
+                                           "рейс " + s(trip_id)
+                                           + ", поз " + s(x.get("position")))
                                 st.rerun()
 
-                        if bc3.button("📄 Акт", key="btn_act_inline_" + s(x["id"]),
+                        if bc3.button("📄 Акт",
+                                      key="btn_act_inline_" + s(x["id"]),
                                       use_container_width=True):
                             st.session_state["show_act_for"] = x["id"]
                             st.rerun()
 
-                        if bc4.button("✏ Изменить", key="btn_edit_" + s(x["id"]),
+                        if bc4.button("✏ Изменить",
+                                      key="btn_edit_" + s(x["id"]),
                                       use_container_width=True):
                             st.session_state["edit_ship_" + s(x["id"])] = True
 
@@ -3968,31 +4062,50 @@ def main_page():
                             st.session_state["show_history_for"] = x["id"]
                             st.rerun()
                         if can("delete_ship", role):
-                            if tc4.button("🗑 Удалить авто", key="btn_delship_" + s(x["id"]),
+                            if tc4.button("🗑 Удалить авто",
+                                          key="btn_delship_" + s(x["id"]),
                                           use_container_width=True):
                                 delete_shipment(x["id"])
                                 log_action(u["login"], role, "delete_ship",
-                                           "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
+                                           "рейс " + s(trip_id)
+                                           + ", поз " + s(x.get("position")))
                                 st.rerun()
 
                     elif view_mode == "completed" and not is_trace:
-                        # v2.12.7: 4 колонки + кнопка «Изменить»
                         bc1, bc2 = st.columns(2)
+
+                        paid_allowed = can_pay_shipment(x, role)
                         paid_label = "❌ Снять оплату" if is_paid_flag else "✅ Оплачен"
-                        if bc1.button(paid_label,
-                                      key="btn_paid_c_" + s(x["id"]),
-                                      use_container_width=True):
-                            toggle_paid(x["id"], paid_val, amount_val, advance_val)
-                            log_action(u["login"], role, "toggle_paid",
-                                       "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
-                            st.rerun()
+
+                        if paid_allowed:
+                            if bc1.button(paid_label,
+                                          key="btn_paid_c_" + s(x["id"]),
+                                          use_container_width=True):
+                                toggle_paid(x["id"], paid_val,
+                                            amount_val, advance_val,
+                                            role=role)
+                                log_action(u["login"], role, "toggle_paid",
+                                           "рейс " + s(trip_id)
+                                           + ", поз " + s(x.get("position")))
+                                st.rerun()
+                        else:
+                            bc1.button(
+                                paid_label,
+                                key="btn_paid_c_" + s(x["id"]),
+                                use_container_width=True,
+                                disabled=True,
+                                help="Оплату по безнал с НДС может ставить "
+                                     "только директор или администратор",
+                            )
+
                         if check_issued(issued_val):
                             if bc2.button("↩ Снять выдан",
                                           key="btn_issued_c_" + s(x["id"]),
                                           use_container_width=True):
                                 toggle_issued(x["id"], issued_val, "0")
                                 log_action(u["login"], role, "toggle_issued",
-                                           "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
+                                           "рейс " + s(trip_id)
+                                           + ", поз " + s(x.get("position")))
                                 st.rerun()
                         else:
                             issued_btn_label = "✅ Выдан"
@@ -4003,11 +4116,13 @@ def main_page():
                                           use_container_width=True):
                                 toggle_issued(x["id"], issued_val, "0")
                                 log_action(u["login"], role, "toggle_issued",
-                                           "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
+                                           "рейс " + s(trip_id)
+                                           + ", поз " + s(x.get("position")))
                                 st.rerun()
 
                         bc3, bc4, bc5, bc6 = st.columns(4)
-                        if bc3.button("📄 Акт", key="btn_act_inline_" + s(x["id"]),
+                        if bc3.button("📄 Акт",
+                                      key="btn_act_inline_" + s(x["id"]),
                                       use_container_width=True):
                             st.session_state["show_act_for"] = x["id"]
                             st.rerun()
@@ -4027,13 +4142,14 @@ def main_page():
                                           use_container_width=True):
                                 delete_shipment(x["id"])
                                 log_action(u["login"], role, "delete_ship",
-                                           "рейс " + s(trip_id) + ", поз " + s(x.get("position")))
+                                           "рейс " + s(trip_id)
+                                           + ", поз " + s(x.get("position")))
                                 st.rerun()
 
                     elif view_mode == "archive" and not is_trace:
-                        # v2.12.7: в архиве — Акт / История / Изменить
                         ac1, ac2, ac3 = st.columns(3)
-                        if ac1.button("📄 Акт", key="btn_act_arch_" + s(x["id"]),
+                        if ac1.button("📄 Акт",
+                                      key="btn_act_arch_" + s(x["id"]),
                                       use_container_width=True):
                             st.session_state["show_act_for"] = x["id"]
                             st.rerun()
