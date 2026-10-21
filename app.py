@@ -1,8 +1,9 @@
 # ============================================================
-# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.15.0
+# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.16.0
 # Streamlit + Google Sheets
-# v2.15.0: убраны верхние KPI, основные разделы возвращены наверх;
-#          карточка рейса сделана компактнее и адаптивнее для телефона
+# v2.16.0: платежи по каждому автомобилю разделены на 3 части;
+#          для каждой части сохраняются сумма, дата, получатель и комментарий;
+#          долг и статус оплаты считаются автоматически
 # ============================================================
 
 import streamlit as st
@@ -54,7 +55,10 @@ SHEET_SCHEMAS = {
                   "invoice_number", "invoice_date",
                   "transferred_to_trip", "transferred_at",
                   "transferred_from_trip",
-                  "advance_2", "advance_date_2", "paid_to_2"],
+                  "advance_2", "advance_date_2", "paid_to_2",
+                  "car_pay1_amount", "car_pay1_date", "car_pay1_to", "car_pay1_comment",
+                  "car_pay2_amount", "car_pay2_date", "car_pay2_to", "car_pay2_comment",
+                  "car_pay3_amount", "car_pay3_date", "car_pay3_to", "car_pay3_comment"],
     "transfer_history": ["id", "ts", "shipment_id", "from_trip", "to_trip",
                          "from_position", "to_position", "user_login", "note",
                          "cancelled"],
@@ -412,6 +416,19 @@ def ensure_sheets_once():
                     "AD": "advance_2",
                     "AE": "advance_date_2",
                     "AF": "paid_to_2",
+                    # v2.16.0 — 3 платежа по автомобилю
+                    "AG": "car_pay1_amount",
+                    "AH": "car_pay1_date",
+                    "AI": "car_pay1_to",
+                    "AJ": "car_pay1_comment",
+                    "AK": "car_pay2_amount",
+                    "AL": "car_pay2_date",
+                    "AM": "car_pay2_to",
+                    "AN": "car_pay2_comment",
+                    "AO": "car_pay3_amount",
+                    "AP": "car_pay3_date",
+                    "AQ": "car_pay3_to",
+                    "AR": "car_pay3_comment",
                 }
                 for col_letter, header_name in required_at.items():
                     idx = 0
@@ -423,7 +440,7 @@ def ensure_sheets_once():
                         try:
                             ws.update_cell(1, idx, header_name)
                         except Exception as e:
-                            _log_system_error("fix_v2107_col_" + col_letter, name, e)
+                            _log_system_error("fix_shipment_col_" + col_letter, name, e)
             except Exception as e:
                 _log_system_error("ensure_v2107_cols", name, e)
     return True
@@ -525,35 +542,102 @@ def is_effectively_issued(x):
     return False
 
 
-def calculate_financials(row):
-    """Единый расчёт денег по автомобилю.
+CAR_PAYMENT_PARTS = 3
 
-    advance + advance_2 — реальные авансы, они никогда не переписываются
-    при отметке "Оплачен".
-    paid_amount — сумма доплаты после авансов.
+
+def normalize_car_payments(payments):
+    """Возвращает ровно три безопасно нормализованных платежа."""
+    result = []
+    payments = payments or []
+    for i in range(CAR_PAYMENT_PARTS):
+        src = payments[i] if i < len(payments) and payments[i] else {}
+        result.append({
+            "amount": money_value(max(0.0, to_float(src.get("amount", 0)))),
+            "date": date_to_display_safe(src.get("date", "")),
+            "paid_to": s(src.get("paid_to", "")).strip(),
+            "comment": s(src.get("comment", "")).strip(),
+        })
+    return result
+
+
+def has_explicit_car_payments(row):
+    """True, если запись уже использует новую схему v2.16.0."""
+    for i in range(1, CAR_PAYMENT_PARTS + 1):
+        if to_float(row.get(f"car_pay{i}_amount")) > 0.01:
+            return True
+        if s(row.get(f"car_pay{i}_date", "")).strip():
+            return True
+        if s(row.get(f"car_pay{i}_to", "")).strip():
+            return True
+        if s(row.get(f"car_pay{i}_comment", "")).strip():
+            return True
+    return False
+
+
+def get_car_payments(row):
+    """Три платежа автомобиля с совместимостью со старыми данными.
+
+    Новые записи используют car_pay1..car_pay3. Старые записи автоматически
+    читаются из advance / advance_2 / paid_amount и не теряют историю.
     """
-    amount = max(0.0, to_float(row.get("amount")))
-    adv1 = max(0.0, to_float(row.get("advance")))
-    adv2 = max(0.0, to_float(row.get("advance_2")))
-    advance = adv1 + adv2
-    if amount > 0.01:
-        advance = min(advance, amount)
+    if has_explicit_car_payments(row):
+        payments = []
+        for i in range(1, CAR_PAYMENT_PARTS + 1):
+            payments.append({
+                "amount": money_value(max(0.0, to_float(row.get(f"car_pay{i}_amount")))),
+                "date": date_to_display_safe(row.get(f"car_pay{i}_date", "")),
+                "paid_to": s(row.get(f"car_pay{i}_to", "")).strip(),
+                "comment": s(row.get(f"car_pay{i}_comment", "")).strip(),
+            })
+        return payments
 
-    paid_amount = max(0.0, to_float(row.get("paid_amount")))
+    # Совместимость с версиями до v2.16.0.
+    return normalize_car_payments([
+        {
+            "amount": row.get("advance", 0),
+            "date": row.get("advance_date", ""),
+            "paid_to": row.get("paid_to", ""),
+            "comment": "",
+        },
+        {
+            "amount": row.get("advance_2", 0),
+            "date": row.get("advance_date_2", ""),
+            "paid_to": row.get("paid_to_2", ""),
+            "comment": "",
+        },
+        {
+            "amount": row.get("paid_amount", 0),
+            "date": row.get("date_pay", "") if to_float(row.get("paid_amount")) > 0.01 else "",
+            "paid_to": "",
+            "comment": "",
+        },
+    ])
+
+
+def car_payments_total(row):
+    return money_value(sum(p["amount"] for p in get_car_payments(row)))
+
+
+def payments_last_date(payments):
+    dates = [s(p.get("date", "")).strip() for p in normalize_car_payments(payments)
+             if s(p.get("date", "")).strip()]
+    return dates[-1] if dates else ""
+
+
+def calculate_financials(row):
+    """Единый расчёт денег по автомобилю для трёх платежей."""
+    amount = max(0.0, to_float(row.get("amount")))
+    payments = get_car_payments(row)
+    recorded_paid = money_value(sum(p["amount"] for p in payments))
+    if amount > 0.01:
+        recorded_paid = min(recorded_paid, amount)
+
     paid_flag = check_paid(row.get("paid", "0"))
     payer_type = s(row.get("payer_type"))
 
-    # Фактически получено: два аванса + отдельная доплата.
-    paid_value = advance + paid_amount
-    if amount > 0.01:
-        paid_value = min(paid_value, amount)
-
+    # paid=1 остаётся совместимым со старыми версиями и пакетной оплатой НДС.
+    paid_value = amount if paid_flag and amount > 0.01 else recorded_paid
     debt = max(0.0, amount - paid_value)
-    # paid — подтверждение полной оплаты. Даже если старые данные ещё
-    # не содержат paid_amount, оплаченная запись не должна показывать долг.
-    if paid_flag:
-        debt = 0.0
-        paid_value = amount
 
     if payer_type == NDS_PAYER:
         nds = amount * NDS_RATE / (1 + NDS_RATE)
@@ -564,12 +648,16 @@ def calculate_financials(row):
 
     status_text = "🟢 Оплачен" if debt <= 0.01 else "🔴 Долг"
 
+    p1, p2, p3 = payments
     return {
-        "amount": amount,
-        "advance": money_value(advance),
-        "advance_1": money_value(adv1),
-        "advance_2": money_value(adv2),
-        "paid_amount": money_value(paid_amount),
+        "amount": money_value(amount),
+        # Старые ключи сохранены, чтобы остальная логика приложения не ломалась.
+        "advance": money_value(p1["amount"] + p2["amount"]),
+        "advance_1": money_value(p1["amount"]),
+        "advance_2": money_value(p2["amount"]),
+        "paid_amount": money_value(p3["amount"]),
+        "payments": payments,
+        "recorded_paid": money_value(recorded_paid),
         "paid_value": money_value(paid_value),
         "debt": money_value(debt),
         "nds": money_value(nds),
@@ -1112,8 +1200,20 @@ def create_shipment(trip_id, position, car_model, client, amount,
                     advance, advance_date,
                     payer_type, customer, contract_number,
                     nds_amount, amount_no_nds, created_by,
-                    advance_2=0, advance_date_2="", paid_to_2=""):
-    adv1_norm, adv2_norm, _ = _normalize_advances(amount, advance, advance_2)
+                    advance_2=0, advance_date_2="", paid_to_2="",
+                    payments=None):
+    """Создаёт автомобиль и сохраняет до трёх отдельных платежей."""
+    if payments is None:
+        payments = [
+            {"amount": advance, "date": advance_date, "paid_to": paid_to, "comment": ""},
+            {"amount": advance_2, "date": advance_date_2, "paid_to": paid_to_2, "comment": ""},
+            {"amount": 0, "date": date_pay, "paid_to": "", "comment": ""},
+        ]
+    parts = normalize_car_payments(payments)
+    p1, p2, p3 = parts
+    total_paid = money_value(sum(p["amount"] for p in parts))
+    amount_val = money_value(amount)
+    paid_flag = "1" if amount_val > 0.01 and total_paid >= amount_val - 0.01 else "0"
 
     append_row("shipments", {
         "id": next_shipment_id(),
@@ -1121,13 +1221,14 @@ def create_shipment(trip_id, position, car_model, client, amount,
         "position": position,
         "car_model": s(car_model),
         "client": s(client),
-        "amount": money_value(amount),
-        "date_pay": s(date_pay),
-        "paid_to": s(paid_to),
+        "amount": amount_val,
+        "date_pay": payments_last_date(parts),
+        "paid_to": p1["paid_to"],
         "delivery_city": s(delivery_city),
         "vin": s(vin),
-        "advance": adv1_norm,
-        "advance_date": s(advance_date),
+        # Старые поля зеркалируются для совместимости со старыми отчётами.
+        "advance": p1["amount"],
+        "advance_date": p1["date"],
         "payer_type": s(payer_type),
         "customer": s(customer),
         "contract_number": s(contract_number),
@@ -1137,17 +1238,29 @@ def create_shipment(trip_id, position, car_model, client, amount,
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "issued": "0",
         "issued_ever": "0",
-        "paid": "0",
+        "paid": paid_flag,
         "archived": "0",
-        "paid_amount": 0,
+        "paid_amount": p3["amount"],
         "invoice_number": "",
         "invoice_date": "",
         "transferred_to_trip": "",
         "transferred_at": "",
         "transferred_from_trip": "",
-        "advance_2": adv2_norm,
-        "advance_date_2": s(advance_date_2),
-        "paid_to_2": s(paid_to_2),
+        "advance_2": p2["amount"],
+        "advance_date_2": p2["date"],
+        "paid_to_2": p2["paid_to"],
+        "car_pay1_amount": p1["amount"],
+        "car_pay1_date": p1["date"],
+        "car_pay1_to": p1["paid_to"],
+        "car_pay1_comment": p1["comment"],
+        "car_pay2_amount": p2["amount"],
+        "car_pay2_date": p2["date"],
+        "car_pay2_to": p2["paid_to"],
+        "car_pay2_comment": p2["comment"],
+        "car_pay3_amount": p3["amount"],
+        "car_pay3_date": p3["date"],
+        "car_pay3_to": p3["paid_to"],
+        "car_pay3_comment": p3["comment"],
     })
 
 
@@ -1155,61 +1268,141 @@ def update_shipment(shipment_id, position, car_model, client, amount,
                     date_pay, paid_to, delivery_city, vin, advance, advance_date,
                     payer_type, customer, contract_number,
                     nds_amount, amount_no_nds,
-                    advance_2=0, advance_date_2="", paid_to_2=""):
+                    advance_2=0, advance_date_2="", paid_to_2="",
+                    payments=None):
     ws = get_ws_cached("shipments")
     row_idx = _find_row_index_by_id("shipments", shipment_id)
     if row_idx is None:
         return False
 
-    adv1_norm, adv2_norm, _ = _normalize_advances(amount, advance, advance_2)
+    current = None
+    for r in read_all_cached("shipments"):
+        if s(r.get("id")) == s(shipment_id):
+            current = r
+            break
 
-    try:
-        amount_val = money_value(amount)
-        adv_total = adv1_norm + adv2_norm
-        auto_issued = (amount_val > 0.01 and adv_total >= amount_val - 0.01)
-    except Exception:
-        auto_issued = False
+    if payments is None:
+        if current is not None:
+            payments = get_car_payments(current)
+        else:
+            payments = [
+                {"amount": advance, "date": advance_date, "paid_to": paid_to, "comment": ""},
+                {"amount": advance_2, "date": advance_date_2, "paid_to": paid_to_2, "comment": ""},
+                {"amount": 0, "date": date_pay, "paid_to": "", "comment": ""},
+            ]
+    parts = normalize_car_payments(payments)
+    p1, p2, p3 = parts
+    amount_val = money_value(amount)
+    total_paid = money_value(sum(p["amount"] for p in parts))
 
-    current_issued_val = "0"
-    try:
-        current_rows = read_all_cached("shipments")
-        for r in current_rows:
-            if s(r.get("id")) == s(shipment_id):
-                current_issued_val = s(r.get("issued", "0")).strip() or "0"
-                break
-    except Exception:
-        pass
+    # Если редактируются только данные автомобиля, не снимаем старую отметку
+    # полной оплаты. При реальном изменении платежей статус пересчитывается.
+    current_parts = get_car_payments(current or {})
+    payments_changed = normalize_car_payments(current_parts) != parts
+    if (current is not None and check_paid(current.get("paid", "0"))
+            and not payments_changed):
+        paid_flag = "1"
+    else:
+        paid_flag = "1" if amount_val > 0.01 and total_paid >= amount_val - 0.01 else "0"
 
-    new_issued_val = current_issued_val
-    if auto_issued:
-        new_issued_val = "1"
-    elif current_issued_val == "1" and not auto_issued:
-        new_issued_val = "1"
+    current_issued_val = s((current or {}).get("issued", "0")).strip() or "0"
+    auto_issued = amount_val > 0.01 and (p1["amount"] + p2["amount"]) >= amount_val - 0.01
+    new_issued_val = "1" if auto_issued else current_issued_val
 
     payload = [
         {"range": "C" + str(row_idx), "values": [[position]]},
         {"range": "D" + str(row_idx), "values": [[s(car_model)]]},
         {"range": "E" + str(row_idx), "values": [[s(client)]]},
-        {"range": "F" + str(row_idx), "values": [[money_value(amount)]]},
-        {"range": "G" + str(row_idx), "values": [[s(date_pay)]]},
-        {"range": "H" + str(row_idx), "values": [[s(paid_to)]]},
+        {"range": "F" + str(row_idx), "values": [[amount_val]]},
+        {"range": "G" + str(row_idx), "values": [[payments_last_date(parts)]]},
+        {"range": "H" + str(row_idx), "values": [[p1["paid_to"]]]},
         {"range": "I" + str(row_idx), "values": [[s(delivery_city)]]},
         {"range": "J" + str(row_idx), "values": [[s(vin)]]},
-        {"range": "K" + str(row_idx), "values": [[adv1_norm]]},
-        {"range": "L" + str(row_idx), "values": [[s(advance_date)]]},
+        {"range": "K" + str(row_idx), "values": [[p1["amount"]]]},
+        {"range": "L" + str(row_idx), "values": [[p1["date"]]]},
         {"range": "M" + str(row_idx), "values": [[s(payer_type)]]},
         {"range": "N" + str(row_idx), "values": [[s(customer)]]},
         {"range": "O" + str(row_idx), "values": [[s(contract_number)]]},
         {"range": "P" + str(row_idx), "values": [[money_value(nds_amount)]]},
         {"range": "Q" + str(row_idx), "values": [[money_value(amount_no_nds)]]},
         {"range": "T" + str(row_idx), "values": [[new_issued_val]]},
-        {"range": "AD" + str(row_idx), "values": [[adv2_norm]]},
-        {"range": "AE" + str(row_idx), "values": [[s(advance_date_2)]]},
-        {"range": "AF" + str(row_idx), "values": [[s(paid_to_2)]]},
+        {"range": "V" + str(row_idx), "values": [[paid_flag]]},
+        {"range": "X" + str(row_idx), "values": [[p3["amount"]]]},
+        {"range": "AD" + str(row_idx), "values": [[p2["amount"]]]},
+        {"range": "AE" + str(row_idx), "values": [[p2["date"]]]},
+        {"range": "AF" + str(row_idx), "values": [[p2["paid_to"]]]},
+        {"range": "AG" + str(row_idx), "values": [[p1["amount"]]]},
+        {"range": "AH" + str(row_idx), "values": [[p1["date"]]]},
+        {"range": "AI" + str(row_idx), "values": [[p1["paid_to"]]]},
+        {"range": "AJ" + str(row_idx), "values": [[p1["comment"]]]},
+        {"range": "AK" + str(row_idx), "values": [[p2["amount"]]]},
+        {"range": "AL" + str(row_idx), "values": [[p2["date"]]]},
+        {"range": "AM" + str(row_idx), "values": [[p2["paid_to"]]]},
+        {"range": "AN" + str(row_idx), "values": [[p2["comment"]]]},
+        {"range": "AO" + str(row_idx), "values": [[p3["amount"]]]},
+        {"range": "AP" + str(row_idx), "values": [[p3["date"]]]},
+        {"range": "AQ" + str(row_idx), "values": [[p3["paid_to"]]]},
+        {"range": "AR" + str(row_idx), "values": [[p3["comment"]]]},
     ]
     ws.batch_update(payload, value_input_option="USER_ENTERED")
     invalidate_cache("shipments")
     return True
+
+
+def save_car_payments(shipment_id, payments, role=None, user_login=""):
+    """Сохраняет три платежа автомобиля без изменения остальных данных."""
+    shipments = read_all("shipments", fresh=True)
+    ship = next((x for x in shipments if s(x.get("id")) == s(shipment_id)), None)
+    if ship is None:
+        return False, "Автомобиль не найден"
+    if role is not None and not can_pay_shipment(ship, role):
+        return False, "Для этого типа оплаты у вашей роли нет права изменять платежи"
+
+    parts = normalize_car_payments(payments)
+    amount = money_value(ship.get("amount"))
+    total = money_value(sum(p["amount"] for p in parts))
+    if amount > 0.01 and total > amount + 0.01:
+        return False, ("Сумма трёх платежей больше стоимости перевозки на "
+                       + fmt_money(total - amount) + " ₽")
+
+    row_idx = _find_row_index_by_id("shipments", shipment_id)
+    if row_idx is None:
+        return False, "Строка автомобиля не найдена"
+
+    p1, p2, p3 = parts
+    paid_flag = "1" if amount > 0.01 and total >= amount - 0.01 else "0"
+    payload = [
+        # Новая детальная история платежей.
+        {"range": "AG" + str(row_idx), "values": [[p1["amount"]]]},
+        {"range": "AH" + str(row_idx), "values": [[p1["date"]]]},
+        {"range": "AI" + str(row_idx), "values": [[p1["paid_to"]]]},
+        {"range": "AJ" + str(row_idx), "values": [[p1["comment"]]]},
+        {"range": "AK" + str(row_idx), "values": [[p2["amount"]]]},
+        {"range": "AL" + str(row_idx), "values": [[p2["date"]]]},
+        {"range": "AM" + str(row_idx), "values": [[p2["paid_to"]]]},
+        {"range": "AN" + str(row_idx), "values": [[p2["comment"]]]},
+        {"range": "AO" + str(row_idx), "values": [[p3["amount"]]]},
+        {"range": "AP" + str(row_idx), "values": [[p3["date"]]]},
+        {"range": "AQ" + str(row_idx), "values": [[p3["paid_to"]]]},
+        {"range": "AR" + str(row_idx), "values": [[p3["comment"]]]},
+        # Старые поля оставляем синхронными для совместимости.
+        {"range": "K" + str(row_idx), "values": [[p1["amount"]]]},
+        {"range": "L" + str(row_idx), "values": [[p1["date"]]]},
+        {"range": "H" + str(row_idx), "values": [[p1["paid_to"]]]},
+        {"range": "AD" + str(row_idx), "values": [[p2["amount"]]]},
+        {"range": "AE" + str(row_idx), "values": [[p2["date"]]]},
+        {"range": "AF" + str(row_idx), "values": [[p2["paid_to"]]]},
+        {"range": "X" + str(row_idx), "values": [[p3["amount"]]]},
+        {"range": "G" + str(row_idx), "values": [[payments_last_date(parts)]]},
+        {"range": "V" + str(row_idx), "values": [[paid_flag]]},
+    ]
+    ws = get_ws_cached("shipments")
+    ws.batch_update(payload, value_input_option="USER_ENTERED")
+    invalidate_cache("shipments")
+    if user_login:
+        log_action(user_login, s(role), "edit_car_payments",
+                   "shipment " + s(shipment_id) + " | оплачено " + fmt_money(total) + " ₽")
+    return True, ""
 
 
 def toggle_issued(shipment_id, current_value, current_ever):
@@ -2011,38 +2204,28 @@ def show_print_list(rows):
 # ============================================================
 
 def render_shipment_form(form_key, c=None, submit_label="Сохранить авто",
-                         default_position=None):
+                         default_position=1):
+    """Форма автомобиля + до трёх отдельных платежей клиента."""
     defaults = {
-        "position": default_position if default_position else 1,
-        "car_model": "", "client": "", "vin": "",
-        "delivery_city": "", "amount": "", "date_pay": "", "paid_to": "",
-        "advance": "", "advance_date": "", "payer_type": "нал",
-        "customer": "", "contract_number": "",
-        "advance_2": "", "advance_date_2": "", "paid_to_2": "",
+        "position": int(default_position or 1),
+        "car_model": "", "client": "", "customer": "", "vin": "",
+        "delivery_city": "", "amount": "", "payer_type": PAYER_TYPES[0],
+        "contract_number": "",
     }
     if c:
-        try:
-            defaults["position"] = int(to_float(c.get("position")) or 1)
-        except Exception:
-            defaults["position"] = 1
+        defaults["position"] = max(1, min(MAX_CARS, int(to_float(c.get("position")) or 1)))
         defaults["car_model"] = s(c.get("car_model", ""))
         defaults["client"] = s(c.get("client", ""))
+        defaults["customer"] = s(c.get("customer", ""))
         defaults["vin"] = s(c.get("vin", ""))[:17]
         defaults["delivery_city"] = s(c.get("delivery_city", ""))
-        ar = c.get("amount", "")
-        defaults["amount"] = "" if ar in ("", None) else "{:.2f}".format(to_float(ar)).replace(".", ",")
-        defaults["date_pay"] = date_to_display_safe(c.get("date_pay", ""))
-        defaults["paid_to"] = s(c.get("paid_to", ""))
-        av = c.get("advance", "")
-        defaults["advance"] = "" if av in ("", None) else "{:.2f}".format(to_float(av)).replace(".", ",")
-        defaults["advance_date"] = date_to_display_safe(c.get("advance_date", ""))
-        defaults["payer_type"] = s(c.get("payer_type", "нал")) or "нал"
-        defaults["customer"] = s(c.get("customer", ""))
+        amount_val = c.get("amount", "")
+        defaults["amount"] = "" if amount_val in ("", None) else "{:.2f}".format(to_float(amount_val)).replace(".", ",")
+        defaults["payer_type"] = s(c.get("payer_type", "")) or PAYER_TYPES[0]
         defaults["contract_number"] = s(c.get("contract_number", ""))
-        av2 = c.get("advance_2", "")
-        defaults["advance_2"] = "" if av2 in ("", None) else "{:.2f}".format(to_float(av2)).replace(".", ",")
-        defaults["advance_date_2"] = date_to_display_safe(c.get("advance_date_2", ""))
-        defaults["paid_to_2"] = s(c.get("paid_to_2", ""))
+        payment_defaults = get_car_payments(c)
+    else:
+        payment_defaults = normalize_car_payments([])
 
     try:
         payer_index = PAYER_TYPES.index(defaults["payer_type"])
@@ -2051,96 +2234,112 @@ def render_shipment_form(form_key, c=None, submit_label="Сохранить ав
 
     with st.form(form_key, clear_on_submit=False):
         st.markdown("**Данные автомобиля**")
-
         col1, col2 = st.columns(2)
-        position = col1.number_input("Позиция (1–8)", min_value=1, max_value=MAX_CARS,
-                                     step=1, value=defaults["position"],
-                                     key=form_key + "_pos")
-        car_model = col2.text_input("Марка / модель авто", value=defaults["car_model"],
-                                     key=form_key + "_car")
+        position = col1.number_input(
+            "Позиция (1–8)", min_value=1, max_value=MAX_CARS, step=1,
+            value=defaults["position"], key=form_key + "_pos")
+        car_model = col2.text_input(
+            "Марка / модель авто", value=defaults["car_model"], key=form_key + "_car")
 
         col3, col4 = st.columns(2)
-        client = col3.text_input("ФИО клиента", value=defaults["client"],
-                                  key=form_key + "_client")
-        customer = col4.text_input("Заказчик (если нет ФИО клиента)",
-                                    value=defaults["customer"], key=form_key + "_customer")
+        client = col3.text_input("ФИО клиента", value=defaults["client"], key=form_key + "_client")
+        customer = col4.text_input(
+            "Заказчик (если нет ФИО клиента)", value=defaults["customer"], key=form_key + "_customer")
 
         col5, col6 = st.columns(2)
-        vin = col5.text_input("VIN (до 17 символов)", value=defaults["vin"],
-                              key=form_key + "_vin")
-        delivery_city = col6.text_input("Город доставки",
-                                         value=defaults["delivery_city"],
-                                         key=form_key + "_city")
+        vin = col5.text_input("VIN (до 17 символов)", value=defaults["vin"], key=form_key + "_vin")
+        delivery_city = col6.text_input(
+            "Город доставки", value=defaults["delivery_city"], key=form_key + "_city")
 
         col7, col8 = st.columns(2)
-        amount = col7.text_input("Сумма за перевозку (пример: 18333,33)",
-                                  value=defaults["amount"], key=form_key + "_amount")
-        payer_type = col8.selectbox("Способ оплаты", PAYER_TYPES, index=payer_index,
-                                     key=form_key + "_payer")
+        amount = col7.text_input(
+            "Сумма за перевозку", value=defaults["amount"],
+            placeholder="235000,00", key=form_key + "_amount")
+        payer_type = col8.selectbox(
+            "Тип оплаты", PAYER_TYPES, index=payer_index, key=form_key + "_payer")
 
-        col9, col10 = st.columns(2)
-        date_pay = col9.text_input("Дата оплаты (ДД.ММ.ГГГГ)",
-                                    value=defaults["date_pay"], key=form_key + "_dpay")
-        contract_number = col10.text_input("№ договора",
-                                             value=defaults["contract_number"],
-                                             key=form_key + "_contract")
+        contract_number = st.text_input(
+            "№ договора", value=defaults["contract_number"], key=form_key + "_contract")
 
         st.markdown("---")
-        st.markdown("### 💰 Аванс № 1")
-        colA1, colA2 = st.columns(2)
-        advance = colA1.text_input("Сумма аванса № 1", value=defaults["advance"],
-                                    key=form_key + "_adv")
-        advance_date = colA2.text_input("Дата аванса № 1 (ДД.ММ.ГГГГ)",
-                                         value=defaults["advance_date"],
-                                         key=form_key + "_advd")
-        paid_to = st.text_input("Кому передан аванс № 1 (комментарий)",
-                                 value=defaults["paid_to"], key=form_key + "_paidto")
+        st.markdown("#### 💳 Платежи клиента")
+        st.caption(
+            "Можно оставить платежи пустыми или разделить оплату на 1–3 части. "
+            "Для каждой части укажите сумму, дату, кому передали деньги и комментарий."
+        )
 
-        st.markdown("### 💰 Аванс № 2")
-        colB1, colB2 = st.columns(2)
-        advance_2 = colB1.text_input("Сумма аванса № 2", value=defaults["advance_2"],
-                                      key=form_key + "_adv2")
-        advance_date_2 = colB2.text_input("Дата аванса № 2 (ДД.ММ.ГГГГ)",
-                                           value=defaults["advance_date_2"],
-                                           key=form_key + "_advd2")
-        paid_to_2 = st.text_input("Кому передан аванс № 2 (комментарий)",
-                                   value=defaults["paid_to_2"], key=form_key + "_paidto2")
+        payments = []
+        for i in range(3):
+            d = payment_defaults[i]
+            st.markdown("**Платёж № " + str(i + 1) + "**")
+            c_amt, c_date = st.columns(2)
+            amount_default = "" if d["amount"] <= 0.01 else "{:.2f}".format(d["amount"]).replace(".", ",")
+            p_amount = c_amt.text_input(
+                "Сумма платежа", value=amount_default,
+                key=form_key + "_pay" + str(i + 1) + "_amount")
+            p_date = c_date.text_input(
+                "Дата (ДД.ММ.ГГГГ)", value=s(d["date"]),
+                key=form_key + "_pay" + str(i + 1) + "_date")
 
-        try:
-            amount_val_check = money_value(amount)
-            adv1_val = money_value(advance)
-            adv2_val = money_value(advance_2)
-            total_adv_val = adv1_val + adv2_val
-        except Exception:
-            amount_val_check = 0.0
-            adv1_val = 0.0
-            adv2_val = 0.0
-            total_adv_val = 0.0
+            c_to, c_comment = st.columns(2)
+            p_to = c_to.text_input(
+                "Кому оплатили", value=s(d["paid_to"]),
+                placeholder="Водителю / кассиру / организации",
+                key=form_key + "_pay" + str(i + 1) + "_to")
+            p_comment = c_comment.text_input(
+                "Комментарий", value=s(d["comment"]),
+                placeholder="Аванс / доплата / перевод ...",
+                key=form_key + "_pay" + str(i + 1) + "_comment")
+            payments.append({
+                "amount": p_amount, "date": p_date,
+                "paid_to": p_to, "comment": p_comment,
+            })
 
-        if amount_val_check > 0.01 and total_adv_val > amount_val_check + 0.01:
-            st.error("⚠️ Общая сумма авансов (" + fmt_money(total_adv_val)
-                     + " ₽) больше суммы перевозки (" + fmt_money(amount_val_check)
-                     + " ₽). При сохранении авансы будут автоматически "
-                     "уменьшены до суммы перевозки.")
-        elif amount_val_check > 0.01:
-            st.info("Общий аванс (1 + 2): **" + fmt_money(total_adv_val)
-                    + " ₽** из **" + fmt_money(amount_val_check) + " ₽**")
+        entered_total = sum(money_value(x["amount"]) for x in payments)
+        amount_check = money_value(amount)
+        if amount_check > 0.01:
+            remain = max(0.0, amount_check - entered_total)
+            st.caption(
+                "По введённым платежам: " + fmt_money(entered_total) + " ₽ · "
+                "остаток: " + fmt_money(remain) + " ₽"
+            )
 
         save = st.form_submit_button(submit_label)
         cancel = st.form_submit_button("Отмена")
 
+    # Старые ключи возвращаются для совместимости с обработчиками,
+    # но источником истины теперь является payments.
+    normalized_for_legacy = normalize_car_payments(payments)
+    p1, p2, p3 = normalized_for_legacy
     return {
         "position": position, "car_model": s(car_model), "client": s(client),
         "vin": s(vin), "delivery_city": s(delivery_city),
-        "amount": amount, "date_pay": s(date_pay), "paid_to": s(paid_to),
-        "advance": advance, "advance_date": s(advance_date),
-        "payer_type": s(payer_type), "customer": s(customer),
-        "contract_number": s(contract_number),
-        "advance_2": advance_2,
-        "advance_date_2": s(advance_date_2),
-        "paid_to_2": s(paid_to_2),
+        "amount": amount, "payer_type": s(payer_type),
+        "customer": s(customer), "contract_number": s(contract_number),
+        "payments": payments,
+        "date_pay": p3["date"], "paid_to": p1["paid_to"],
+        "advance": p1["amount"], "advance_date": p1["date"],
+        "advance_2": p2["amount"], "advance_date_2": p2["date"],
+        "paid_to_2": p2["paid_to"],
         "save": save, "cancel": cancel,
     }
+def parse_car_payments_ui(raw_payments):
+    """Проверяет суммы и даты, введённые пользователем."""
+    result = []
+    for idx, src in enumerate(raw_payments or [], start=1):
+        amount = money_value(src.get("amount", 0))
+        raw_date = s(src.get("date", "")).strip()
+        try:
+            date_val = parse_date_ui(raw_date) if raw_date else ""
+        except ValueError:
+            raise ValueError("Платёж № " + str(idx) + ": неверная дата. Используйте ДД.ММ.ГГГГ")
+        result.append({
+            "amount": amount,
+            "date": date_val,
+            "paid_to": s(src.get("paid_to", "")).strip(),
+            "comment": s(src.get("comment", "")).strip(),
+        })
+    return normalize_car_payments(result)
 
 
 # ============================================================
@@ -3239,19 +3438,20 @@ def _render_add_car_form(ctx):
         return
 
     try:
-        dp = parse_date_ui(f["date_pay"])
-        dpa = parse_date_ui(f["advance_date"])
-        dpa2 = parse_date_ui(f["advance_date_2"])
+        payments = parse_car_payments_ui(f["payments"])
     except ValueError as ex:
         st.error(str(ex))
         return
 
     amount = money_value(f["amount"])
-    adv1 = money_value(f["advance"])
-    adv2 = money_value(f["advance_2"])
-    adv1, adv2, trimmed = _normalize_advances(amount, adv1, adv2)
-    if trimmed:
-        st.warning("Авансы автоматически ограничены суммой перевозки.")
+    total_paid = money_value(sum(p["amount"] for p in payments))
+    if amount > 0.01 and total_paid > amount + 0.01:
+        st.error("Сумма трёх платежей больше стоимости перевозки на "
+                 + fmt_money(total_paid - amount) + " ₽")
+        return
+    if amount <= 0.01 and total_paid > 0.01:
+        st.error("Сначала укажите стоимость перевозки.")
+        return
 
     if f["payer_type"] == NDS_PAYER:
         nds = amount * NDS_RATE / (1 + NDS_RATE)
@@ -3260,15 +3460,19 @@ def _render_add_car_form(ctx):
         nds = 0.0
         no_nds = amount
 
+    p1, p2, p3 = payments
     create_shipment(
         trip_id, f["position"], f["car_model"], f["client"], amount,
-        dp, f["paid_to"], f["delivery_city"], f["vin"][:17],
-        adv1, dpa, f["payer_type"], f["customer"], f["contract_number"],
-        nds, no_nds, ctx["user_login"],
-        advance_2=adv2, advance_date_2=dpa2, paid_to_2=f["paid_to_2"],
+        payments_last_date(payments), p1["paid_to"],
+        f["delivery_city"], f["vin"][:17],
+        p1["amount"], p1["date"], f["payer_type"],
+        f["customer"], f["contract_number"], nds, no_nds, ctx["user_login"],
+        advance_2=p2["amount"], advance_date_2=p2["date"],
+        paid_to_2=p2["paid_to"], payments=payments,
     )
     log_action(ctx["user_login"], ctx["role"], "create_ship",
-               "рейс " + s(trip_id) + ", поз " + s(f["position"]))
+               "рейс " + s(trip_id) + ", поз " + s(f["position"])
+               + ", оплачено " + fmt_money(total_paid) + " ₽")
     st.session_state.pop(key, None)
     st.success("Автомобиль добавлен")
     st.rerun()
@@ -3292,19 +3496,20 @@ def _render_edit_car_form(ctx, car):
         return
 
     try:
-        dp = parse_date_ui(f["date_pay"])
-        dpa = parse_date_ui(f["advance_date"])
-        dpa2 = parse_date_ui(f["advance_date_2"])
+        payments = parse_car_payments_ui(f["payments"])
     except ValueError as ex:
         st.error(str(ex))
         return
 
     amount = money_value(f["amount"])
-    adv1 = money_value(f["advance"])
-    adv2 = money_value(f["advance_2"])
-    adv1, adv2, trimmed = _normalize_advances(amount, adv1, adv2)
-    if trimmed:
-        st.warning("Авансы автоматически ограничены суммой перевозки.")
+    total_paid = money_value(sum(p["amount"] for p in payments))
+    if amount > 0.01 and total_paid > amount + 0.01:
+        st.error("Сумма трёх платежей больше стоимости перевозки на "
+                 + fmt_money(total_paid - amount) + " ₽")
+        return
+    if amount <= 0.01 and total_paid > 0.01:
+        st.error("Сначала укажите стоимость перевозки.")
+        return
 
     if f["payer_type"] == NDS_PAYER:
         nds = amount * NDS_RATE / (1 + NDS_RATE)
@@ -3313,15 +3518,19 @@ def _render_edit_car_form(ctx, car):
         nds = 0.0
         no_nds = amount
 
+    p1, p2, p3 = payments
     update_shipment(
         sid, f["position"], f["car_model"], f["client"], amount,
-        dp, f["paid_to"], f["delivery_city"], f["vin"][:17],
-        adv1, dpa, f["payer_type"], f["customer"], f["contract_number"],
-        nds, no_nds,
-        advance_2=adv2, advance_date_2=dpa2, paid_to_2=f["paid_to_2"],
+        payments_last_date(payments), p1["paid_to"],
+        f["delivery_city"], f["vin"][:17],
+        p1["amount"], p1["date"], f["payer_type"],
+        f["customer"], f["contract_number"], nds, no_nds,
+        advance_2=p2["amount"], advance_date_2=p2["date"],
+        paid_to_2=p2["paid_to"], payments=payments,
     )
     log_action(ctx["user_login"], ctx["role"], "edit_ship",
-               "рейс " + s(ctx["trip_id"]) + ", поз " + s(f["position"]))
+               "рейс " + s(ctx["trip_id"]) + ", поз " + s(f["position"])
+               + ", оплачено " + fmt_money(total_paid) + " ₽")
     st.session_state.pop(key, None)
     st.success("Изменения сохранены")
     st.rerun()
@@ -3460,45 +3669,169 @@ def _render_trip_payment_meta_form(ctx):
             st.rerun()
 
 
-def render_trip_payment_section(ctx):
-    """Раздел 3. Все деньги в одном месте."""
-    st.markdown("### 💳 Оплата")
-    st.caption("Авансы, доплата, задолженность и оплата безнала с НДС собраны только здесь.")
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Сумма перевозок", fmt_money(ctx["total"]) + " ₽")
-    c2.metric("Оплачено", fmt_money(ctx["total_paid_value"]) + " ₽")
-    c3.metric("Задолженность", fmt_money(ctx["total_debt"]) + " ₽")
-    c4.metric("НДС 22%", fmt_money(ctx["total_nds"]) + " ₽")
+def _payment_line_html(index, payment):
+    amount = money_value(payment.get("amount", 0))
+    date_val = s(payment.get("date", "")).strip()
+    paid_to = s(payment.get("paid_to", "")).strip()
+    comment = s(payment.get("comment", "")).strip()
+    has_any = amount > 0.01 or date_val or paid_to or comment
+    if not has_any:
+        return ""
+
+    meta = []
+    if date_val:
+        meta.append("Дата: " + html.escape(date_val))
+    if paid_to:
+        meta.append("Кому: " + html.escape(paid_to))
+    if comment:
+        meta.append("Комментарий: " + html.escape(comment))
+    meta_html = " · ".join(meta) if meta else "Дополнительные данные не указаны"
+    return (
+        '<div style="padding:7px 9px; border:1px solid #e0e0e0; border-radius:8px; '
+        'margin:5px 0; font-size:13px; line-height:1.35;">'
+        '<b>Платёж № ' + str(index) + ': ' + fmt_money(amount) + ' ₽</b><br>'
+        '<span style="color:#555;">' + meta_html + '</span></div>'
+    )
+
+
+def _render_car_payment_editor(ctx, car):
+    sid = s(car.get("id"))
+    allowed = can_pay_shipment(car, ctx["role"])
+    key = "v216_pay_editor_" + sid
+
+    if not allowed:
+        st.info("Изменение платежей для безнала с НДС доступно только директору или администратору.")
+        return
+
+    if st.button("✏️ Внести / изменить платежи", key="v216_open_pay_" + sid,
+                 use_container_width=True):
+        st.session_state[key] = not st.session_state.get(key, False)
+        st.rerun()
+
+    if not st.session_state.get(key):
+        return
+
+    defaults = get_car_payments(car)
+    with st.form("v216_pay_form_" + sid, clear_on_submit=False):
+        st.markdown("**До трёх платежей по автомобилю**")
+        edited = []
+        for i in range(3):
+            d = defaults[i]
+            st.markdown("**Платёж № " + str(i + 1) + "**")
+            c1, c2 = st.columns(2)
+            amount_default = "" if d["amount"] <= 0.01 else "{:.2f}".format(d["amount"]).replace(".", ",")
+            p_amount = c1.text_input(
+                "Сумма", value=amount_default,
+                key="v216_pf_amt_" + sid + "_" + str(i))
+            p_date = c2.text_input(
+                "Дата (ДД.ММ.ГГГГ)", value=s(d["date"]),
+                key="v216_pf_date_" + sid + "_" + str(i))
+            c3, c4 = st.columns(2)
+            p_to = c3.text_input(
+                "Кому оплатили", value=s(d["paid_to"]),
+                key="v216_pf_to_" + sid + "_" + str(i))
+            p_comment = c4.text_input(
+                "Комментарий", value=s(d["comment"]),
+                key="v216_pf_comment_" + sid + "_" + str(i))
+            edited.append({
+                "amount": p_amount, "date": p_date,
+                "paid_to": p_to, "comment": p_comment,
+            })
+
+        total_now = sum(money_value(x["amount"]) for x in edited)
+        amount_total = money_value(car.get("amount"))
+        remain_now = max(0.0, amount_total - total_now)
+        st.caption("Введено: " + fmt_money(total_now) + " ₽ · остаток: "
+                   + fmt_money(remain_now) + " ₽")
+
+        b1, b2 = st.columns(2)
+        save = b1.form_submit_button("💾 Сохранить платежи", use_container_width=True)
+        cancel = b2.form_submit_button("Отмена", use_container_width=True)
+
+    if cancel:
+        st.session_state.pop(key, None)
+        st.rerun()
+    if not save:
+        return
+
+    try:
+        parsed = parse_car_payments_ui(edited)
+    except ValueError as ex:
+        st.error(str(ex))
+        return
+
+    total = money_value(sum(x["amount"] for x in parsed))
+    amount_total = money_value(car.get("amount"))
+    if amount_total > 0.01 and total > amount_total + 0.01:
+        st.error("Сумма платежей больше стоимости перевозки на "
+                 + fmt_money(total - amount_total) + " ₽")
+        return
+
+    ok, err = save_car_payments(
+        sid, parsed, role=ctx["role"], user_login=ctx["user_login"])
+    if not ok:
+        st.error(err)
+        return
+
+    st.session_state.pop(key, None)
+    st.success("Платежи сохранены. Долг пересчитан автоматически.")
+    st.rerun()
+
+
+def render_trip_payment_section(ctx):
+    """Раздел 3. Детальная история оплаты по каждому автомобилю."""
+    st.markdown("### 💳 Оплата")
+    st.caption(
+        "По каждому автомобилю можно сохранить до трёх платежей: сумма, дата, "
+        "кому оплатили и комментарий. Остаток долга рассчитывается автоматически."
+    )
+
+    # Компактный итог по рейсу без крупных metric-карточек.
+    st.markdown(
+        '<div style="display:flex; gap:8px; flex-wrap:wrap; margin:4px 0 10px 0;">'
+        '<div style="padding:6px 9px; border:1px solid #ddd; border-radius:8px; font-size:13px;">'
+        'Сумма: <b>' + fmt_money(ctx["total"]) + ' ₽</b></div>'
+        '<div style="padding:6px 9px; border:1px solid #ddd; border-radius:8px; font-size:13px;">'
+        'Оплачено: <b>' + fmt_money(ctx["total_paid_value"]) + ' ₽</b></div>'
+        '<div style="padding:6px 9px; border:1px solid #ddd; border-radius:8px; font-size:13px;">'
+        'Долг: <b>' + fmt_money(ctx["total_debt"]) + ' ₽</b></div>'
+        + (('<div style="padding:6px 9px; border:1px solid #ddd; border-radius:8px; font-size:13px;">'
+            'НДС 22%: <b>' + fmt_money(ctx["total_nds"]) + ' ₽</b></div>')
+           if ctx["total_nds"] > 0.01 else '')
+        + '</div>',
+        unsafe_allow_html=True,
+    )
 
     if ctx["has_nds"] and ctx["view_mode"] in ("active", "completed"):
-        st.markdown("#### Безнал с НДС")
-        render_trip_payment_button(
-            ctx["trip_id"], ctx["cars"], ctx["role"], ctx["user_login"],
-            trip_label=ctx["tractor"] + " " + ctx["driver"], container=st,
-        )
+        with st.expander("Безнал с НДС — оплата всего рейса", expanded=False):
+            render_trip_payment_button(
+                ctx["trip_id"], ctx["cars"], ctx["role"], ctx["user_login"],
+                trip_label=ctx["tractor"] + " " + ctx["driver"], container=st,
+            )
 
-        if can("split_payment", ctx["role"]):
-            info = ctx["payments_info"] or {}
-            parts_count = info.get("parts_count", 0)
-            split_label = "🧾 Разделить счёт"
-            if parts_count:
-                split_label += " · частей: " + s(parts_count)
-            if st.button(split_label, key="v214_split_btn_" + s(ctx["trip_id"]), use_container_width=True):
-                k = "open_split_" + s(ctx["trip_id"])
-                st.session_state[k] = not st.session_state.get(k, False)
-                st.rerun()
-            if st.session_state.get("open_split_" + s(ctx["trip_id"])):
-                render_trip_split_form(
-                    ctx["trip_id"], ctx["trip"], info.get("nds_debt", 0.0),
-                    info.get("nds_total", 0.0), ctx["user_login"], ctx["role"],
-                )
+            if can("split_payment", ctx["role"]):
+                info = ctx["payments_info"] or {}
+                parts_count = info.get("parts_count", 0)
+                split_label = "🧾 Разделить счёт"
+                if parts_count:
+                    split_label += " · частей: " + s(parts_count)
+                if st.button(split_label, key="v216_split_btn_" + s(ctx["trip_id"]),
+                             use_container_width=True):
+                    k = "open_split_" + s(ctx["trip_id"])
+                    st.session_state[k] = not st.session_state.get(k, False)
+                    st.rerun()
+                if st.session_state.get("open_split_" + s(ctx["trip_id"])):
+                    render_trip_split_form(
+                        ctx["trip_id"], ctx["trip"], info.get("nds_debt", 0.0),
+                        info.get("nds_total", 0.0), ctx["user_login"], ctx["role"],
+                    )
 
-        if can("edit_payment", ctx["role"]):
-            _render_trip_payment_meta_form(ctx)
+            if can("edit_payment", ctx["role"]):
+                _render_trip_payment_meta_form(ctx)
 
     st.divider()
-    st.markdown("#### Оплата по автомобилям")
+    st.markdown("#### Платежи по автомобилям")
     cars = _trip_normal_cars(ctx["cars"])
     if not cars:
         st.info("Нет автомобилей для оплаты.")
@@ -3506,33 +3839,44 @@ def render_trip_payment_section(ctx):
 
     for car in sorted(cars, key=lambda z: int(to_float(z.get("position")))):
         fin = calculate_financials(car)
-        sid = s(car.get("id"))
-        paid_flag = check_paid(car.get("paid", "0"))
+        payments = get_car_payments(car)
+        recorded = money_value(sum(p["amount"] for p in payments))
+        title_status = "✅ оплачено" if fin["debt"] <= 0.01 else "🔴 долг " + fmt_money(fin["debt"]) + " ₽"
         with st.expander(
             "Поз. " + s(car.get("position", "")) + " · " + s(car.get("car_model", ""))
-            + " · " + ("✅ оплачено" if fin["debt"] <= 0.01 else "🔴 долг " + fmt_money(fin["debt"]) + " ₽"),
+            + " · " + title_status,
             expanded=False,
         ):
-            a1, a2, a3, a4 = st.columns(4)
-            a1.metric("Сумма", fmt_money(fin["amount"]) + " ₽")
-            a2.metric("Аванс №1", fmt_money(fin["advance_1"]) + " ₽")
-            a3.metric("Аванс №2", fmt_money(fin["advance_2"]) + " ₽")
-            a4.metric("Доплата", fmt_money(fin["paid_amount"]) + " ₽")
-            st.markdown("**Тип оплаты:** " + (s(car.get("payer_type", "")) or "—")
-                        + "  \n**Остаток / долг:** " + fmt_money(fin["debt"]) + " ₽")
+            st.markdown(
+                '<div style="font-size:13px; line-height:1.45; margin-bottom:6px;">'
+                '<b>Стоимость:</b> ' + fmt_money(fin["amount"]) + ' ₽'
+                ' &nbsp;·&nbsp; <b>Оплачено:</b> ' + fmt_money(fin["paid_value"]) + ' ₽'
+                ' &nbsp;·&nbsp; <b>Остаток:</b> ' + fmt_money(fin["debt"]) + ' ₽'
+                '<br><b>Тип оплаты:</b> ' + html.escape(s(car.get("payer_type", "")) or "—")
+                + '</div>',
+                unsafe_allow_html=True,
+            )
 
-            allowed = can_pay_shipment(car, ctx["role"])
-            label = "↩ Снять оплату" if paid_flag else "✅ Отметить полностью оплаченным"
-            if allowed:
-                if st.button(label, key="v214_paid_" + sid, use_container_width=True):
-                    toggle_paid(sid, s(car.get("paid", "0")), fin["amount"], fin["advance"], role=ctx["role"])
-                    log_action(ctx["user_login"], ctx["role"], "toggle_paid",
-                               "рейс " + s(ctx["trip_id"]) + ", поз " + s(car.get("position")))
-                    st.rerun()
-            else:
-                st.button(label, key="v214_paid_disabled_" + sid, disabled=True,
-                          help="Безнал с НДС может оплачивать только директор или администратор",
-                          use_container_width=True)
+            shown = 0
+            for idx, payment in enumerate(payments, start=1):
+                line = _payment_line_html(idx, payment)
+                if line:
+                    st.markdown(line, unsafe_allow_html=True)
+                    shown += 1
+            if shown == 0:
+                st.caption("Платежей пока нет.")
+
+            # Старый флаг полной оплаты/пакетная оплата НДС может существовать без
+            # детальной расшифровки последнего платежа — показываем это явно.
+            if check_paid(car.get("paid", "0")) and recorded < fin["amount"] - 0.01:
+                st.warning(
+                    "Автомобиль отмечен полностью оплаченным, но в детализации платежей "
+                    "указано только " + fmt_money(recorded) + " ₽. "
+                    "Откройте редактирование платежей и заполните недостающий платёж."
+                )
+
+            if ctx["view_mode"] in ("active", "completed"):
+                _render_car_payment_editor(ctx, car)
 
 
 def _build_trip_print_rows(ctx):
