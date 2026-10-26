@@ -1,9 +1,9 @@
 # ============================================================
-# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.16.0
+# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.17.3
 # Streamlit + Google Sheets
-# v2.16.0: платежи по каждому автомобилю разделены на 3 части;
-#          для каждой части сохраняются сумма, дата, получатель и комментарий;
-#          долг и статус оплаты считаются автоматически
+# v2.17.3: исправлен расчёт суммы перевозок по месяцам;
+#          суммы собираются сначала по каждому рейсу из уникальных авто;
+#          добавлена расшифровка рейсов и контроль дублей
 # ============================================================
 
 import streamlit as st
@@ -16,6 +16,8 @@ import uuid
 import os
 import re
 import html
+import pandas as pd
+import altair as alt
 
 SHEET_ID = "1MHslz3VRowoOLtS_AAQ5h-tFm-fIXBN8noqtyQpmKLw"
 CRED_FILE = "gifted-mountain-508410-s3-96f38b5a0f63.json"
@@ -4178,6 +4180,698 @@ def render_trip_workspace(ctx):
 # ============================================================
 # v2.15.0 — АДАПТИВНЫЙ ИНТЕРФЕЙС
 # ============================================================
+# БИЗНЕС-АНАЛИТИКА ПО МЕСЯЦАМ И ЗА ГОД — v2.17.2
+# ============================================================
+# ВАЖНО:
+# - KPI «оплаты» строятся только по явно сохранённым суммам платежей;
+# - флаг paid=1 сам по себе НЕ считается денежным поступлением;
+# - платеж без даты НЕ относится к году/месяцу и НЕ входит в KPI;
+# - технические значения старых версий не должны дублировать оплату.
+
+ANALYTICS_MONTHS = [
+    (1, "Январь", "Янв"),
+    (2, "Февраль", "Фев"),
+    (3, "Март", "Мар"),
+    (4, "Апрель", "Апр"),
+    (5, "Май", "Май"),
+    (6, "Июнь", "Июн"),
+    (7, "Июль", "Июл"),
+    (8, "Август", "Авг"),
+    (9, "Сентябрь", "Сен"),
+    (10, "Октябрь", "Окт"),
+    (11, "Ноябрь", "Ноя"),
+    (12, "Декабрь", "Дек"),
+]
+
+
+def _parse_analytics_date(value):
+    """Безопасно превращает дату приложения в datetime или возвращает None."""
+    t = s(value).strip()
+    if not t:
+        return None
+    for fmt in (
+        "%d.%m.%Y", "%Y-%m-%d",
+        "%Y-%m-%d %H:%M:%S", "%d.%m.%Y %H:%M:%S",
+    ):
+        try:
+            return datetime.strptime(t, fmt)
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(t.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _analytics_trip_year(trip):
+    dt = _parse_analytics_date((trip or {}).get("date_departure", ""))
+    return dt.year if dt else None
+
+
+def _analytics_car_payments(row):
+    """Возвращает платежи авто, пригодные именно для управленческой аналитики.
+
+    Новая схема car_pay1..3 является приоритетной. Для старых строк берём только
+    реально существовавшие поля авансов/доплаты. Техническую резервную копию
+    paid_amount из старой v2.12.8 не считаем отдельным платежом.
+
+    Сумма платежей дополнительно ограничивается стоимостью перевозки: даже если
+    в старой строке остались дублирующие значения, аналитика не сможет посчитать
+    больше стоимости конкретного автомобиля.
+    """
+    amount_limit = max(0.0, money_value((row or {}).get("amount", 0)))
+    ignored_legacy_backup = 0.0
+
+    if has_explicit_car_payments(row):
+        raw = get_car_payments(row)
+    else:
+        # Старые данные до v2.16.0.
+        adv1 = money_value(row.get("advance", 0))
+        adv2 = money_value(row.get("advance_2", 0))
+        paid_amount = money_value(row.get("paid_amount", 0))
+
+        # v2.12.8 могла хранить в paid_amount резервную копию старого аванса,
+        # одновременно заменив advance полной суммой. Это не третий платёж.
+        old_adv1, old_adv2, legacy = _legacy_original_advances(row)
+        if legacy:
+            ignored_legacy_backup = paid_amount
+            raw = [
+                {
+                    "amount": old_adv1,
+                    "date": date_to_display_safe(row.get("advance_date", "")),
+                    "paid_to": s(row.get("paid_to", "")).strip(),
+                    "comment": "",
+                },
+                {
+                    "amount": old_adv2,
+                    "date": date_to_display_safe(row.get("advance_date_2", "")),
+                    "paid_to": s(row.get("paid_to_2", "")).strip(),
+                    "comment": "",
+                },
+                {"amount": 0.0, "date": "", "paid_to": "", "comment": ""},
+            ]
+        else:
+            raw = [
+                {
+                    "amount": adv1,
+                    "date": date_to_display_safe(row.get("advance_date", "")),
+                    "paid_to": s(row.get("paid_to", "")).strip(),
+                    "comment": "",
+                },
+                {
+                    "amount": adv2,
+                    "date": date_to_display_safe(row.get("advance_date_2", "")),
+                    "paid_to": s(row.get("paid_to_2", "")).strip(),
+                    "comment": "",
+                },
+                {
+                    "amount": paid_amount,
+                    "date": date_to_display_safe(row.get("date_pay", "")),
+                    "paid_to": "",
+                    "comment": "",
+                },
+            ]
+
+    # Защита от дублей/ошибок старых строк: не больше стоимости перевозки.
+    remaining = amount_limit
+    result = []
+    clipped = 0.0
+    for p in normalize_car_payments(raw):
+        original = max(0.0, money_value(p.get("amount", 0)))
+        if amount_limit <= 0.01:
+            accepted = 0.0
+        else:
+            accepted = min(original, max(0.0, remaining))
+        clipped += max(0.0, original - accepted)
+        remaining = max(0.0, remaining - accepted)
+        result.append({
+            "amount": money_value(accepted),
+            "date": date_to_display_safe(p.get("date", "")),
+            "paid_to": s(p.get("paid_to", "")).strip(),
+            "comment": s(p.get("comment", "")).strip(),
+        })
+
+    return result, money_value(ignored_legacy_backup), money_value(clipped)
+
+
+def _analytics_available_years(trips, shipments):
+    years = {datetime.now().year}
+    trip_by_id = {
+        s(t.get("id")): t for t in trips
+        if not is_deleted(t.get("deleted_at", ""))
+    }
+
+    for t in trip_by_id.values():
+        dt = _parse_analytics_date(t.get("date_departure", ""))
+        if dt:
+            years.add(dt.year)
+        for p in extract_trip_payments(t):
+            pdt = _parse_analytics_date(p.get("date", ""))
+            if pdt and to_float(p.get("amount")) > 0.01:
+                years.add(pdt.year)
+
+    for x in shipments:
+        if is_trace_row(x):
+            continue
+        parts, _, _ = _analytics_car_payments(x)
+        for p in parts:
+            pdt = _parse_analytics_date(p.get("date", ""))
+            if pdt and to_float(p.get("amount")) > 0.01:
+                years.add(pdt.year)
+
+    return sorted(years, reverse=True)
+
+
+def _analytics_transport_identity(row):
+    """Ключ автомобиля для защиты аналитики от дублей внутри одного рейса.
+
+    Приоритет:
+    1) VIN — самый надёжный идентификатор;
+    2) если VIN нет, используем комбинацию позиции, модели, клиента и суммы;
+    3) в крайнем случае — ID строки.
+
+    Ключ применяется ТОЛЬКО внутри одного рейса, поэтому повторная перевозка
+    того же VIN в другом отдельном рейсе не будет ошибочно потеряна.
+    """
+    vin = re.sub(r"[^A-Z0-9]", "", s(row.get("vin", "")).upper())
+    if vin:
+        return ("vin", vin)
+
+    pos = s(row.get("position", "")).strip()
+    model = " ".join(s(row.get("car_model", "")).lower().split())
+    client = " ".join(
+        (s(row.get("client", "")) or s(row.get("customer", ""))).lower().split()
+    )
+    amount = money_value(row.get("amount", 0))
+
+    if pos or model or client:
+        return ("fallback", pos, model, client, amount)
+
+    sid = s(row.get("id", "")).strip()
+    if sid:
+        return ("id", sid)
+
+    return ("row", id(row))
+
+
+def _analytics_choose_duplicate_row(old_row, new_row):
+    """Выбирает наиболее информативную строку, если один автомобиль задублирован."""
+    def score(row):
+        explicit = 1 if has_explicit_car_payments(row) else 0
+        pay_total = 0.0
+        try:
+            parts, _, _ = _analytics_car_payments(row)
+            pay_total = sum(to_float(p.get("amount")) for p in parts)
+        except Exception:
+            pass
+        has_client = 1 if (s(row.get("client", "")).strip()
+                           or s(row.get("customer", "")).strip()) else 0
+        has_vin = 1 if s(row.get("vin", "")).strip() else 0
+        return (explicit, pay_total, has_vin, has_client,
+                max(0.0, money_value(row.get("amount", 0))))
+
+    return new_row if score(new_row) > score(old_row) else old_row
+
+
+def _analytics_unique_shipments_by_trip(shipments):
+    """Возвращает реальные уникальные автомобили по каждому рейсу.
+
+    Технические строки переноса исключаются. Дубликаты внутри одного рейса
+    не суммируются второй раз.
+    """
+    grouped = {}
+    duplicate_rows = 0
+    duplicate_amount = 0.0
+
+    for x in shipments:
+        if is_trace_row(x):
+            continue
+
+        tid = s(x.get("trip_id", "")).strip()
+        if not tid:
+            continue
+
+        key = _analytics_transport_identity(x)
+        bucket = grouped.setdefault(tid, {})
+        if key not in bucket:
+            bucket[key] = x
+            continue
+
+        duplicate_rows += 1
+        old = bucket[key]
+        old_amount = max(0.0, money_value(old.get("amount", 0)))
+        new_amount = max(0.0, money_value(x.get("amount", 0)))
+
+        chosen = _analytics_choose_duplicate_row(old, x)
+        bucket[key] = chosen
+
+        # В контроль выводим сумму той строки, которая не была использована.
+        if chosen is old:
+            duplicate_amount += new_amount
+        else:
+            duplicate_amount += old_amount
+
+    result = {
+        tid: list(bucket.values())
+        for tid, bucket in grouped.items()
+    }
+    return result, int(duplicate_rows), money_value(duplicate_amount)
+
+
+def build_business_analytics(trips, shipments, year):
+    """Собирает управленческую аналитику за один год.
+
+    Правила v2.17.3:
+    - рейсы считаются по уникальному ID и дате выезда;
+    - сумма перевозок строится СНАЧАЛА по каждому рейсу;
+    - внутри рейса один автомобиль учитывается только один раз;
+    - технические строки переноса не участвуют;
+    - подтверждённые оплаты считаются отдельно по фактическим датам;
+    - paid=1 сам по себе не создаёт денежное поступление.
+    """
+    year = int(year)
+    months = {
+        num: {
+            "month_num": num,
+            "month": name,
+            "short": short,
+            "trips": 0,
+            "transport_amount": 0.0,
+            "cash_acq": 0.0,
+            "beznal_nds": 0.0,
+        }
+        for num, name, short in ANALYTICS_MONTHS
+    }
+
+    # Канонический список рейсов: одна строка на один ID.
+    valid_trips = [t for t in trips if not is_deleted(t.get("deleted_at", ""))]
+    trip_by_id = {}
+    for t in valid_trips:
+        tid = s(t.get("id", "")).strip()
+        if not tid:
+            continue
+        if tid not in trip_by_id:
+            trip_by_id[tid] = t
+
+    trip_year = {tid: _analytics_trip_year(t) for tid, t in trip_by_id.items()}
+
+    # Уникальные автомобили по каждому рейсу. Это единый источник для
+    # графика суммы перевозок и для проверки сумм безнал-НДС.
+    unique_by_trip, transport_duplicate_rows, transport_duplicate_amount = (
+        _analytics_unique_shipments_by_trip(shipments)
+    )
+
+    # Количество рейсов по месяцам.
+    for tid, t in trip_by_id.items():
+        dt = _parse_analytics_date(t.get("date_departure", ""))
+        if dt and dt.year == year:
+            months[dt.month]["trips"] += 1
+
+    # ------------------------------------------------------------
+    # СУММА ПЕРЕВОЗОК: сначала итог каждого рейса, потом месяц.
+    # ------------------------------------------------------------
+    transport_trip_rows = []
+
+    for tid, trip in trip_by_id.items():
+        dep_dt = _parse_analytics_date(trip.get("date_departure", ""))
+        if not dep_dt or dep_dt.year != year:
+            continue
+
+        cars = unique_by_trip.get(tid, [])
+        trip_amount = 0.0
+        counted_cars = 0
+
+        for x in cars:
+            amount = max(0.0, money_value(x.get("amount", 0)))
+            if amount <= 0.01:
+                continue
+            trip_amount += amount
+            counted_cars += 1
+
+        trip_amount = money_value(trip_amount)
+        months[dep_dt.month]["transport_amount"] += trip_amount
+
+        transport_trip_rows.append({
+            "month_num": dep_dt.month,
+            "month": ANALYTICS_MONTHS[dep_dt.month - 1][1],
+            "date": dep_dt.strftime("%d.%m.%Y"),
+            "trip_id": tid,
+            "tractor": s(trip.get("tractor_number", "")).strip(),
+            "driver": s(trip.get("driver", "")).strip(),
+            "route": s(trip.get("route", "")).strip(),
+            "cars": counted_cars,
+            "amount": trip_amount,
+        })
+
+    # Контроль качества платежных данных. Эти суммы НЕ входят в KPI.
+    undated_cash = 0.0
+    undated_nds = 0.0
+    ignored_legacy_backup = 0.0
+    clipped_duplicates = 0.0
+    invalid_trip_splits = 0
+    invalid_trip_split_amount = 0.0
+
+    # Стоимость безнал-НДС по каждому рейсу — по тем же уникальным авто,
+    # чтобы дубли не увеличивали допустимый лимит оплаты.
+    nds_contract_by_trip = {}
+    for tid, cars in unique_by_trip.items():
+        total = 0.0
+        for x in cars:
+            if not _is_beznal_nds(x):
+                continue
+            total += max(0.0, money_value(x.get("amount", 0)))
+        nds_contract_by_trip[tid] = money_value(total)
+
+    # Валидные платежи безнал-НДС, введённые на уровне рейса.
+    nds_split_trip_ids = set()
+    for tid, t in trip_by_id.items():
+        parts = extract_trip_payments(t)
+        positive_parts = [p for p in parts if to_float(p.get("amount")) > 0.01]
+        if not positive_parts:
+            continue
+
+        contract_total = money_value(nds_contract_by_trip.get(tid, 0.0))
+        split_total = money_value(sum(to_float(p.get("amount")) for p in positive_parts))
+
+        if contract_total <= 0.01 or split_total > contract_total + 0.01:
+            invalid_trip_splits += 1
+            invalid_trip_split_amount += split_total
+            continue
+
+        nds_split_trip_ids.add(tid)
+        for p in positive_parts:
+            amount = money_value(p.get("amount"))
+            dt = _parse_analytics_date(p.get("date", ""))
+            if dt is None:
+                if trip_year.get(tid) == year:
+                    undated_nds += amount
+                continue
+            if dt.year == year:
+                months[dt.month]["beznal_nds"] += amount
+
+    # Платежи по автомобилям — также только по уникальным строкам.
+    for tid, cars in unique_by_trip.items():
+        for x in cars:
+            payer_type = s(x.get("payer_type", "")).strip()
+
+            if payer_type in ("нал", "эквайринг"):
+                target_key = "cash_acq"
+            elif payer_type == NDS_PAYER:
+                if tid in nds_split_trip_ids:
+                    continue
+                target_key = "beznal_nds"
+            else:
+                continue
+
+            payments, ignored_backup, clipped = _analytics_car_payments(x)
+            ignored_legacy_backup += ignored_backup
+            clipped_duplicates += clipped
+
+            for p in payments:
+                amount = money_value(p.get("amount"))
+                if amount <= 0.01:
+                    continue
+                dt = _parse_analytics_date(p.get("date", ""))
+                if dt is None:
+                    if trip_year.get(tid) == year:
+                        if target_key == "cash_acq":
+                            undated_cash += amount
+                        else:
+                            undated_nds += amount
+                    continue
+                if dt.year == year:
+                    months[dt.month][target_key] += amount
+
+    rows = []
+    for num, name, short in ANALYTICS_MONTHS:
+        row = months[num]
+        row["transport_amount"] = money_value(row["transport_amount"])
+        row["cash_acq"] = money_value(row["cash_acq"])
+        row["beznal_nds"] = money_value(row["beznal_nds"])
+        row["total_payments"] = money_value(row["cash_acq"] + row["beznal_nds"])
+        rows.append(row)
+
+    total_trips = sum(r["trips"] for r in rows)
+    total_transport_amount = money_value(sum(r["transport_amount"] for r in rows))
+    dated_cash = money_value(sum(r["cash_acq"] for r in rows))
+    dated_nds = money_value(sum(r["beznal_nds"] for r in rows))
+
+    transport_trip_rows.sort(
+        key=lambda r: (r["month_num"], _parse_analytics_date(r["date"]) or datetime.min,
+                       r["trip_id"])
+    )
+
+    return {
+        "year": year,
+        "rows": rows,
+        "total_trips": total_trips,
+        "total_transport_amount": total_transport_amount,
+        "transport_trip_rows": transport_trip_rows,
+        "transport_duplicate_rows": transport_duplicate_rows,
+        "transport_duplicate_amount": transport_duplicate_amount,
+        "dated_cash_acq": dated_cash,
+        "dated_beznal_nds": dated_nds,
+        "undated_cash_acq": money_value(undated_cash),
+        "undated_beznal_nds": money_value(undated_nds),
+        "total_cash_acq": dated_cash,
+        "total_beznal_nds": dated_nds,
+        "total_payments": money_value(dated_cash + dated_nds),
+        "ignored_legacy_backup": money_value(ignored_legacy_backup),
+        "clipped_duplicates": money_value(clipped_duplicates),
+        "invalid_trip_splits": int(invalid_trip_splits),
+        "invalid_trip_split_amount": money_value(invalid_trip_split_amount),
+    }
+
+def render_business_analytics(trips, shipments):
+    """Рисует аналитику перевозок и подтверждённых оплат с контролем дублей."""
+    st.markdown("---")
+    st.subheader("📊 Аналитика бизнеса")
+    st.caption(
+        "Рейсы считаются по дате выезда. В денежные показатели попадают только "
+        "реально записанные суммы платежей с указанной датой. Флаг «Оплачен» сам "
+        "по себе больше не создаёт выручку."
+    )
+
+    years = _analytics_available_years(trips, shipments)
+    current_year = datetime.now().year
+    default_idx = years.index(current_year) if current_year in years else 0
+
+    c_year, c_note = st.columns([1, 3])
+    with c_year:
+        selected_year = st.selectbox(
+            "Год аналитики",
+            options=years,
+            index=default_idx,
+            key="business_analytics_year",
+        )
+    with c_note:
+        st.caption(
+            "Архивные и завершённые рейсы учитываются, удалённые — нет. "
+            "Платежи без даты показываются отдельно и не включаются в итог года."
+        )
+
+    data = build_business_analytics(trips, shipments, selected_year)
+
+    st.markdown(
+        '<div class="analytics-kpi-grid">'
+        '<div class="analytics-kpi-card"><div class="analytics-kpi-label">Рейсов за год</div>'
+        '<div class="analytics-kpi-value">' + s(data["total_trips"]) + '</div></div>'
+        '<div class="analytics-kpi-card"><div class="analytics-kpi-label">Нал + эквайринг</div>'
+        '<div class="analytics-kpi-value">' + fmt_money(data["total_cash_acq"]) + ' ₽</div></div>'
+        '<div class="analytics-kpi-card"><div class="analytics-kpi-label">Безнал с НДС</div>'
+        '<div class="analytics-kpi-value">' + fmt_money(data["total_beznal_nds"]) + ' ₽</div></div>'
+        '<div class="analytics-kpi-card"><div class="analytics-kpi-label">Всего подтверждено оплат</div>'
+        '<div class="analytics-kpi-value">' + fmt_money(data["total_payments"]) + ' ₽</div></div>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    # Единый порядок категорий для ВСЕХ графиков: январь → декабрь слева направо.
+    month_order = [short for _, _, short in ANALYTICS_MONTHS]
+
+    st.markdown("#### 🚛 Количество рейсов по месяцам")
+    trips_df = pd.DataFrame([
+        {"Месяц": r["short"], "Рейсы": r["trips"]}
+        for r in data["rows"]
+    ])
+    trips_chart = (
+        alt.Chart(trips_df)
+        .mark_bar()
+        .encode(
+            x=alt.X("Месяц:N", sort=month_order, title=None),
+            y=alt.Y("Рейсы:Q", title="Количество рейсов"),
+            tooltip=[
+                alt.Tooltip("Месяц:N", title="Месяц"),
+                alt.Tooltip("Рейсы:Q", title="Рейсов"),
+            ],
+        )
+        .properties(height=260)
+    )
+    st.altair_chart(trips_chart, use_container_width=True)
+
+    st.markdown("#### 🚚 Сумма перевозок по месяцам")
+    transport_df = pd.DataFrame([
+        {"Месяц": r["short"], "Сумма перевозок": r["transport_amount"]}
+        for r in data["rows"]
+    ])
+    transport_chart = (
+        alt.Chart(transport_df)
+        .mark_bar()
+        .encode(
+            x=alt.X("Месяц:N", sort=month_order, title=None),
+            y=alt.Y("Сумма перевозок:Q", title="Сумма, ₽"),
+            tooltip=[
+                alt.Tooltip("Месяц:N", title="Месяц"),
+                alt.Tooltip("Сумма перевозок:Q", title="Сумма перевозок", format=",.2f"),
+            ],
+        )
+        .properties(height=300)
+    )
+    st.altair_chart(transport_chart, use_container_width=True)
+    st.caption(
+        "Сумма перевозок относится к месяцу по дате выезда рейса. "
+        "Сначала считается сумма каждого рейса из уникальных автомобилей, "
+        "затем складываются рейсы месяца."
+    )
+
+    with st.expander("🔎 Проверить сумму перевозок по рейсам", expanded=False):
+        st.caption(
+            "Здесь видно, из каких рейсов складывается каждый месяц. "
+            "Если сумма сентября или октября кажется большой, можно сразу увидеть конкретный рейс."
+        )
+        detail_rows = []
+        for r in data.get("transport_trip_rows", []):
+            detail_rows.append({
+                "Месяц": r["month"],
+                "Дата выезда": r["date"],
+                "Рейс": r["trip_id"],
+                "Тягач": r["tractor"],
+                "Водитель": r["driver"],
+                "Маршрут": r["route"],
+                "Авто": r["cars"],
+                "Сумма рейса": fmt_money(r["amount"]) + " ₽",
+            })
+        if detail_rows:
+            st.dataframe(
+                pd.DataFrame(detail_rows),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("За выбранный год рейсы с суммами перевозок не найдены.")
+
+        if data.get("transport_duplicate_rows", 0) > 0:
+            st.warning(
+                "Исключено повторных строк автомобилей: "
+                + s(data["transport_duplicate_rows"])
+                + " · на сумму " + fmt_money(data["transport_duplicate_amount"]) + " ₽. "
+                "Эти строки не вошли в график повторно."
+            )
+
+    st.markdown("#### 💳 Подтверждённые оплаты по месяцам")
+    money_df = pd.DataFrame([
+        {
+            "Месяц": r["short"],
+            "Нал + эквайринг": r["cash_acq"],
+            "Безнал с НДС": r["beznal_nds"],
+        }
+        for r in data["rows"]
+    ])
+    money_long = money_df.melt(
+        id_vars=["Месяц"],
+        value_vars=["Нал + эквайринг", "Безнал с НДС"],
+        var_name="Тип оплаты",
+        value_name="Сумма",
+    )
+    money_chart = (
+        alt.Chart(money_long)
+        .mark_bar()
+        .encode(
+            x=alt.X("Месяц:N", sort=month_order, title=None),
+            xOffset=alt.XOffset("Тип оплаты:N"),
+            y=alt.Y("Сумма:Q", title="Подтверждённые оплаты, ₽"),
+            color=alt.Color("Тип оплаты:N", title="Тип оплаты"),
+            tooltip=[
+                alt.Tooltip("Месяц:N", title="Месяц"),
+                alt.Tooltip("Тип оплаты:N", title="Тип оплаты"),
+                alt.Tooltip("Сумма:Q", title="Сумма", format=",.2f"),
+            ],
+        )
+        .properties(height=320)
+    )
+    st.altair_chart(money_chart, use_container_width=True)
+
+    st.markdown("#### 📋 По месяцам")
+    table_rows = []
+    for r in data["rows"]:
+        table_rows.append({
+            "Месяц": r["month"],
+            "Рейсов": r["trips"],
+            "Сумма перевозок": fmt_money(r["transport_amount"]) + " ₽",
+            "Нал + эквайринг": fmt_money(r["cash_acq"]) + " ₽",
+            "Безнал с НДС": fmt_money(r["beznal_nds"]) + " ₽",
+            "Всего оплат": fmt_money(r["total_payments"]) + " ₽",
+        })
+
+    table_rows.append({
+        "Месяц": "ИТОГО ЗА ГОД",
+        "Рейсов": data["total_trips"],
+        "Сумма перевозок": fmt_money(data["total_transport_amount"]) + " ₽",
+        "Нал + эквайринг": fmt_money(data["total_cash_acq"]) + " ₽",
+        "Безнал с НДС": fmt_money(data["total_beznal_nds"]) + " ₽",
+        "Всего оплат": fmt_money(data["total_payments"]) + " ₽",
+    })
+    st.dataframe(
+        pd.DataFrame(table_rows),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    undated_total = money_value(
+        data["undated_cash_acq"] + data["undated_beznal_nds"]
+    )
+    if undated_total > 0.01:
+        st.warning(
+            "Есть введённые суммы без даты на " + fmt_money(undated_total)
+            + " ₽. Они НЕ включены в годовой итог. Укажите дату платежа, "
+              "чтобы сумма попала в нужный месяц и год."
+        )
+
+    # Прозрачный контроль, чтобы владелец видел, почему старые данные не попали
+    # в выручку и мог исправить их без скрытых допущений.
+    has_control = (
+        data["ignored_legacy_backup"] > 0.01
+        or data["clipped_duplicates"] > 0.01
+        or data["invalid_trip_splits"] > 0
+        or data.get("transport_duplicate_rows", 0) > 0
+    )
+    if has_control:
+        with st.expander("⚠️ Контроль старых данных", expanded=False):
+            if data.get("transport_duplicate_rows", 0) > 0:
+                st.write(
+                    "Повторных строк автомобилей исключено из суммы перевозок: **"
+                    + s(data["transport_duplicate_rows"]) + "** · **"
+                    + fmt_money(data["transport_duplicate_amount"]) + " ₽**."
+                )
+            if data["ignored_legacy_backup"] > 0.01:
+                st.write(
+                    "Технические резервные значения старых версий не учтены как "
+                    "отдельная оплата: **" + fmt_money(data["ignored_legacy_backup"]) + " ₽**."
+                )
+            if data["clipped_duplicates"] > 0.01:
+                st.write(
+                    "Обнаружены дубли/переплаты в старых полях; сумма сверх стоимости "
+                    "перевозок исключена: **" + fmt_money(data["clipped_duplicates"]) + " ₽**."
+                )
+            if data["invalid_trip_splits"] > 0:
+                st.write(
+                    "Некорректных разбиений оплаты рейса: **"
+                    + s(data["invalid_trip_splits"]) + "** на сумму **"
+                    + fmt_money(data["invalid_trip_split_amount"]) + " ₽**. "
+                    "Они не включены как безнал; вместо них используются платежи автомобилей."
+                )
+
+# ============================================================
 
 def inject_responsive_ui_css():
     """Компактная типографика и адаптация Streamlit под телефон/планшет."""
@@ -4241,6 +4935,31 @@ def inject_responsive_ui_css():
         }
         .trip-money-grid { margin-top: 1px; }
 
+        .analytics-kpi-grid {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 8px;
+            margin: 0.35rem 0 0.85rem 0;
+        }
+        .analytics-kpi-card {
+            border: 1px solid rgba(128,128,128,.28);
+            border-radius: 9px;
+            padding: 9px 11px;
+            background: rgba(128,128,128,.035);
+            min-width: 0;
+        }
+        .analytics-kpi-label {
+            font-size: 0.72rem;
+            opacity: .72;
+            margin-bottom: 3px;
+        }
+        .analytics-kpi-value {
+            font-size: 1.03rem;
+            font-weight: 700;
+            line-height: 1.2;
+            overflow-wrap: anywhere;
+        }
+
         div[data-testid="stRadio"] div[role="radiogroup"] {
             display: flex;
             flex-wrap: wrap;
@@ -4274,6 +4993,13 @@ def inject_responsive_ui_css():
                 font-size: 0.77rem;
                 gap: 4px 12px;
             }
+            .analytics-kpi-grid {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+                gap: 6px;
+            }
+            .analytics-kpi-card { padding: 7px 8px; }
+            .analytics-kpi-label { font-size: 0.67rem; }
+            .analytics-kpi-value { font-size: 0.90rem; }
             .stButton > button, .stDownloadButton > button {
                 min-height: 2.25rem;
                 padding: 0.30rem 0.42rem;
@@ -4285,6 +5011,7 @@ def inject_responsive_ui_css():
 
         @media (max-width: 430px) {
             .trip-mini-grid { grid-template-columns: 1fr; }
+            .analytics-kpi-grid { grid-template-columns: 1fr; }
             .trip-route-line { display: grid; grid-template-columns: 1fr; }
             div[data-testid="stRadio"] div[role="radiogroup"] {
                 gap: 0.1rem 0.5rem;
@@ -4784,6 +5511,9 @@ def main_page():
             '</div>',
             unsafe_allow_html=True,
         )
+
+    # Управленческая аналитика — ниже итогов.
+    render_business_analytics(trips, shipments)
 
 
 # ============================================================
