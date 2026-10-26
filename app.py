@@ -1,8 +1,9 @@
 # ============================================================
-# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.17.4
+# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.17.5
 # Streamlit + Google Sheets
-# v2.17.4: графики учитывают оплаты активных, завершённых и архивных рейсов;
-#          для старых архивных записей добавлена безопасная совместимость paid=1;
+# v2.17.5: технический мусор старых версий больше не выводится в аналитике;
+#          резервные поля и суммы сверх стоимости молча исключаются;
+#          архивные оплаты по-прежнему учитываются в графиках.
 #          современные платежи 1/2/3 остаются приоритетным источником
 # ============================================================
 
@@ -4258,18 +4259,13 @@ def _analytics_archive_fallback_date(row, trip):
 
 
 def _analytics_car_payments(row):
-    """Возвращает платежи авто, пригодные именно для управленческой аналитики.
+    """Платежи автомобиля для управленческой аналитики.
 
-    Новая схема car_pay1..3 является приоритетной. Для старых строк берём только
-    реально существовавшие поля авансов/доплаты. Техническую резервную копию
-    paid_amount из старой v2.12.8 не считаем отдельным платежом.
-
-    Сумма платежей дополнительно ограничивается стоимостью перевозки: даже если
-    в старой строке остались дублирующие значения, аналитика не сможет посчитать
-    больше стоимости конкретного автомобиля.
+    Новая схема car_pay1..3 имеет приоритет. Старые технические резервные поля
+    не считаются отдельной оплатой. Любые старые дубли/переплаты автоматически
+    обрезаются до стоимости конкретной перевозки и нигде отдельно не показываются.
     """
     amount_limit = max(0.0, money_value((row or {}).get("amount", 0)))
-    ignored_legacy_backup = 0.0
 
     if has_explicit_car_payments(row):
         raw = get_car_payments(row)
@@ -4283,7 +4279,6 @@ def _analytics_car_payments(row):
         # одновременно заменив advance полной суммой. Это не третий платёж.
         old_adv1, old_adv2, legacy = _legacy_original_advances(row)
         if legacy:
-            ignored_legacy_backup = paid_amount
             raw = [
                 {
                     "amount": old_adv1,
@@ -4324,14 +4319,12 @@ def _analytics_car_payments(row):
     # Защита от дублей/ошибок старых строк: не больше стоимости перевозки.
     remaining = amount_limit
     result = []
-    clipped = 0.0
     for p in normalize_car_payments(raw):
         original = max(0.0, money_value(p.get("amount", 0)))
         if amount_limit <= 0.01:
             accepted = 0.0
         else:
             accepted = min(original, max(0.0, remaining))
-        clipped += max(0.0, original - accepted)
         remaining = max(0.0, remaining - accepted)
         result.append({
             "amount": money_value(accepted),
@@ -4340,7 +4333,7 @@ def _analytics_car_payments(row):
             "comment": s(p.get("comment", "")).strip(),
         })
 
-    return result, money_value(ignored_legacy_backup), money_value(clipped)
+    return result
 
 
 def _analytics_available_years(trips, shipments):
@@ -4362,7 +4355,7 @@ def _analytics_available_years(trips, shipments):
     for x in shipments:
         if is_trace_row(x):
             continue
-        parts, _, _ = _analytics_car_payments(x)
+        parts = _analytics_car_payments(x)
         for p in parts:
             pdt = _parse_analytics_date(p.get("date", ""))
             if pdt and to_float(p.get("amount")) > 0.01:
@@ -4409,7 +4402,7 @@ def _analytics_choose_duplicate_row(old_row, new_row):
         explicit = 1 if has_explicit_car_payments(row) else 0
         pay_total = 0.0
         try:
-            parts, _, _ = _analytics_car_payments(row)
+            parts = _analytics_car_payments(row)
             pay_total = sum(to_float(p.get("amount")) for p in parts)
         except Exception:
             pass
@@ -4470,7 +4463,7 @@ def _analytics_unique_shipments_by_trip(shipments):
 def build_business_analytics(trips, shipments, year):
     """Собирает управленческую аналитику за один год.
 
-    Правила v2.17.4:
+    Правила v2.17.5:
     - рейсы считаются по уникальному ID и дате выезда;
     - сумма перевозок строится СНАЧАЛА по каждому рейсу;
     - внутри рейса один автомобиль учитывается только один раз;
@@ -4508,7 +4501,7 @@ def build_business_analytics(trips, shipments, year):
 
     # Уникальные автомобили по каждому рейсу. Это единый источник для
     # графика суммы перевозок и для проверки сумм безнал-НДС.
-    unique_by_trip, transport_duplicate_rows, transport_duplicate_amount = (
+    unique_by_trip, _duplicate_rows, _duplicate_amount = (
         _analytics_unique_shipments_by_trip(shipments)
     )
 
@@ -4554,15 +4547,9 @@ def build_business_analytics(trips, shipments, year):
             "amount": trip_amount,
         })
 
-    # Контроль качества платежных данных. Эти суммы НЕ входят в KPI.
+    # Платежи без даты не включаем в месячные KPI.
     undated_cash = 0.0
     undated_nds = 0.0
-    ignored_legacy_backup = 0.0
-    clipped_duplicates = 0.0
-    invalid_trip_splits = 0
-    invalid_trip_split_amount = 0.0
-    archive_legacy_payments = 0
-    archive_legacy_amount = 0.0
 
     # Стоимость безнал-НДС по каждому рейсу — по тем же уникальным авто,
     # чтобы дубли не увеличивали допустимый лимит оплаты.
@@ -4587,8 +4574,8 @@ def build_business_analytics(trips, shipments, year):
         split_total = money_value(sum(to_float(p.get("amount")) for p in positive_parts))
 
         if contract_total <= 0.01 or split_total > contract_total + 0.01:
-            invalid_trip_splits += 1
-            invalid_trip_split_amount += split_total
+            # Некорректное старое разбиение просто игнорируем; ниже используем
+            # допустимые платежи по автомобилям.
             continue
 
         nds_split_trip_ids.add(tid)
@@ -4599,9 +4586,6 @@ def build_business_analytics(trips, shipments, year):
                 # Старые архивные безнал-платежи могли хранить сумму без даты.
                 # Для графика используем безопасную историческую дату рейса.
                 dt = _analytics_archive_fallback_date({}, t)
-                if dt is not None:
-                    archive_legacy_payments += 1
-                    archive_legacy_amount += amount
             if dt is None:
                 if trip_year.get(tid) == year:
                     undated_nds += amount
@@ -4623,9 +4607,7 @@ def build_business_analytics(trips, shipments, year):
             else:
                 continue
 
-            payments, ignored_backup, clipped = _analytics_car_payments(x)
-            ignored_legacy_backup += ignored_backup
-            clipped_duplicates += clipped
+            payments = _analytics_car_payments(x)
 
             trip = trip_by_id.get(tid, {})
             archived_trip = is_archived(trip.get("archived", "0"))
@@ -4648,8 +4630,6 @@ def build_business_analytics(trips, shipments, year):
                     if (archived_trip and fallback_dt is not None
                             and _parse_analytics_date(p2.get("date", "")) is None):
                         p2["date"] = fallback_dt.strftime("%d.%m.%Y")
-                        archive_legacy_payments += 1
-                        archive_legacy_amount += amount
                 prepared_payments.append(p2)
 
             amount_limit = max(0.0, money_value(x.get("amount", 0)))
@@ -4663,8 +4643,6 @@ def build_business_analytics(trips, shipments, year):
                         "paid_to": "",
                         "comment": "Архивная оплата старого формата",
                     })
-                    archive_legacy_payments += 1
-                    archive_legacy_amount += missing_paid
 
             for p in prepared_payments:
                 amount = money_value(p.get("amount"))
@@ -4706,8 +4684,6 @@ def build_business_analytics(trips, shipments, year):
         "total_trips": total_trips,
         "total_transport_amount": total_transport_amount,
         "transport_trip_rows": transport_trip_rows,
-        "transport_duplicate_rows": transport_duplicate_rows,
-        "transport_duplicate_amount": transport_duplicate_amount,
         "dated_cash_acq": dated_cash,
         "dated_beznal_nds": dated_nds,
         "undated_cash_acq": money_value(undated_cash),
@@ -4715,12 +4691,6 @@ def build_business_analytics(trips, shipments, year):
         "total_cash_acq": dated_cash,
         "total_beznal_nds": dated_nds,
         "total_payments": money_value(dated_cash + dated_nds),
-        "ignored_legacy_backup": money_value(ignored_legacy_backup),
-        "clipped_duplicates": money_value(clipped_duplicates),
-        "invalid_trip_splits": int(invalid_trip_splits),
-        "invalid_trip_split_amount": money_value(invalid_trip_split_amount),
-        "archive_legacy_payments": int(archive_legacy_payments),
-        "archive_legacy_amount": money_value(archive_legacy_amount),
     }
 
 def render_business_analytics(trips, shipments):
@@ -4748,7 +4718,8 @@ def render_business_analytics(trips, shipments):
     with c_note:
         st.caption(
             "Активные, завершённые и архивные рейсы учитываются в графиках; "
-            "удалённые — нет. Для старого архива без детальной истории оплаты "
+            "удалённые — нет. Старые технические резервные поля автоматически "
+            "исключаются из расчёта. Для старого архива без детальной истории оплаты "
             "используется сохранённая дата оплаты рейса/авто, а при её отсутствии — "
             "историческая дата завершения/рейса."
         )
@@ -4843,14 +4814,6 @@ def render_business_analytics(trips, shipments):
         else:
             st.info("За выбранный год рейсы с суммами перевозок не найдены.")
 
-        if data.get("transport_duplicate_rows", 0) > 0:
-            st.warning(
-                "Исключено повторных строк автомобилей: "
-                + s(data["transport_duplicate_rows"])
-                + " · на сумму " + fmt_money(data["transport_duplicate_amount"]) + " ₽. "
-                "Эти строки не вошли в график повторно."
-            )
-
     st.markdown("#### 💳 Подтверждённые оплаты по месяцам")
     money_df = pd.DataFrame([
         {
@@ -4920,47 +4883,8 @@ def render_business_analytics(trips, shipments):
               "чтобы сумма попала в нужный месяц и год."
         )
 
-    # Прозрачный контроль, чтобы владелец видел, почему старые данные не попали
-    # в выручку и мог исправить их без скрытых допущений.
-    has_control = (
-        data["ignored_legacy_backup"] > 0.01
-        or data["clipped_duplicates"] > 0.01
-        or data["invalid_trip_splits"] > 0
-        or data["archive_legacy_payments"] > 0
-        or data.get("transport_duplicate_rows", 0) > 0
-    )
-    if has_control:
-        with st.expander("⚠️ Контроль старых данных", expanded=False):
-            if data["archive_legacy_payments"] > 0:
-                st.info(
-                    "Архив: восстановлено исторических оплат для графиков: **"
-                    + s(data["archive_legacy_payments"]) + "** записей на **"
-                    + fmt_money(data["archive_legacy_amount"]) + " ₽**. "
-                    "Современные платежи 1/2/3 при этом повторно не считаются."
-                )
-            if data.get("transport_duplicate_rows", 0) > 0:
-                st.write(
-                    "Повторных строк автомобилей исключено из суммы перевозок: **"
-                    + s(data["transport_duplicate_rows"]) + "** · **"
-                    + fmt_money(data["transport_duplicate_amount"]) + " ₽**."
-                )
-            if data["ignored_legacy_backup"] > 0.01:
-                st.write(
-                    "Технические резервные значения старых версий не учтены как "
-                    "отдельная оплата: **" + fmt_money(data["ignored_legacy_backup"]) + " ₽**."
-                )
-            if data["clipped_duplicates"] > 0.01:
-                st.write(
-                    "Обнаружены дубли/переплаты в старых полях; сумма сверх стоимости "
-                    "перевозок исключена: **" + fmt_money(data["clipped_duplicates"]) + " ₽**."
-                )
-            if data["invalid_trip_splits"] > 0:
-                st.write(
-                    "Некорректных разбиений оплаты рейса: **"
-                    + s(data["invalid_trip_splits"]) + "** на сумму **"
-                    + fmt_money(data["invalid_trip_split_amount"]) + " ₽**. "
-                    "Они не включены как безнал; вместо них используются платежи автомобилей."
-                )
+    # Технические резервные поля и старые превышения намеренно не показываем:
+    # они уже исключены из расчётов и не являются реальными деньгами бизнеса.
 
 # ============================================================
 
