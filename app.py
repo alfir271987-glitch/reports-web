@@ -1,10 +1,9 @@
 # ============================================================
-# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.17.5
+# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.17.6
 # Streamlit + Google Sheets
-# v2.17.5: технический мусор старых версий больше не выводится в аналитике;
-#          резервные поля и суммы сверх стоимости молча исключаются;
-#          архивные оплаты по-прежнему учитываются в графиках.
-#          современные платежи 1/2/3 остаются приоритетным источником
+# v2.17.6: к полю «Погрузка от» добавлен «Договор №» на уровне рейса;
+#          номер договора показывается в карточке рейса, печати и актах;
+#          старые рейсы сохраняются без изменений, новая колонка добавляется автоматически.
 # ============================================================
 
 import streamlit as st
@@ -37,7 +36,8 @@ SHEET_SCHEMAS = {
     # P=payment_date, Q=payment_comment,
     # R=pay1_amount, S=pay1_date, T=pay1_comment,
     # U=pay2_amount, V=pay2_date, W=pay2_comment,
-    # X=pay3_amount, Y=pay3_date, Z=pay3_comment
+    # X=pay3_amount, Y=pay3_date, Z=pay3_comment,
+    # AA=loading_contract_number
     "trips": ["id", "tractor_number", "driver", "route",
               "date_departure", "date_return", "created_by", "created_at",
               "archived", "completed", "completed_at",
@@ -46,7 +46,8 @@ SHEET_SCHEMAS = {
               "payment_date", "payment_comment",
               "pay1_amount", "pay1_date", "pay1_comment",
               "pay2_amount", "pay2_date", "pay2_comment",
-              "pay3_amount", "pay3_date", "pay3_comment"],
+              "pay3_amount", "pay3_date", "pay3_comment",
+              "loading_contract_number"],
     "shipments": ["id", "trip_id", "position", "car_model", "client",
                   "amount", "date_pay", "paid_to",
                   "delivery_city", "vin",
@@ -851,7 +852,10 @@ def describe_trip(trip):
     if s(trip.get("driver", "")):
         parts.append(s(trip.get("driver", "")))
     if s(trip.get("loading_from", "")):
-        parts.append("погрузка от " + s(trip.get("loading_from", "")))
+        loading_label = "погрузка от " + s(trip.get("loading_from", ""))
+        if s(trip.get("loading_contract_number", "")):
+            loading_label += " · договор № " + s(trip.get("loading_contract_number", ""))
+        parts.append(loading_label)
     if s(trip.get("route", "")):
         parts.append(s(trip.get("route", "")))
     dep = date_to_display_safe(trip.get("date_departure", ""))
@@ -1015,7 +1019,8 @@ def clear_trip_payments_split(trip_id):
 # CRUD: РЕЙСЫ
 # ============================================================
 
-def create_trip(tractor, driver, route, dep, ret, created_by, loading_from=""):
+def create_trip(tractor, driver, route, dep, ret, created_by,
+                loading_from="", loading_contract_number=""):
     append_row("trips", {
         "id": next_trip_id(),
         "tractor_number": s(tractor), "driver": s(driver), "route": s(route),
@@ -1034,11 +1039,13 @@ def create_trip(tractor, driver, route, dep, ret, created_by, loading_from=""):
         "pay1_amount": "", "pay1_date": "", "pay1_comment": "",
         "pay2_amount": "", "pay2_date": "", "pay2_comment": "",
         "pay3_amount": "", "pay3_date": "", "pay3_comment": "",
+        "loading_contract_number": s(loading_contract_number),
     })
 
 
 def update_trip(trip_id, tractor, driver, route, dep, ret,
-                loading_from="", payment_date="", payment_comment=""):
+                loading_from="", loading_contract_number="",
+                payment_date="", payment_comment=""):
     ws = get_ws_cached("trips")
     row_idx = _find_row_index_by_id("trips", trip_id)
     if row_idx is None:
@@ -1052,6 +1059,7 @@ def update_trip(trip_id, tractor, driver, route, dep, ret,
         {"range": "O" + str(row_idx), "values": [[s(loading_from)]]},
         {"range": "P" + str(row_idx), "values": [[s(payment_date)]]},
         {"range": "Q" + str(row_idx), "values": [[s(payment_comment)]]},
+        {"range": "AA" + str(row_idx), "values": [[s(loading_contract_number)]]},
     ]
     ws.batch_update(payload, value_input_option="USER_ENTERED")
     invalidate_cache("trips")
@@ -1922,6 +1930,7 @@ def get_shipment_history(shipment_id):
 def render_act_html(trip, shipment):
     route = s(trip.get("route", "")) if trip else ""
     loading_from = s(trip.get("loading_from", "")) if trip else ""
+    loading_contract_number = s(trip.get("loading_contract_number", "")) if trip else ""
     car_model = s(shipment.get("car_model", ""))
     client = s(shipment.get("client", ""))
     customer = s(shipment.get("customer", ""))
@@ -1956,7 +1965,10 @@ def render_act_html(trip, shipment):
     p.append("<p><b>VIN:</b> " + (vin if vin else "_" * 20) + "</p>")
     p.append("<p><b>Маршрут:</b> " + route + "</p>")
     if loading_from:
-        p.append("<p><b>Погрузка от:</b> " + loading_from + "</p>")
+        loading_line = "<p><b>Погрузка от:</b> " + loading_from
+        if loading_contract_number:
+            loading_line += " &nbsp;·&nbsp; <b>Договор №:</b> " + loading_contract_number
+        p.append(loading_line + "</p>")
     p.append("<p>&nbsp;</p>")
     p.append('<p><b>Груз сдал:</b> <span class="mono">' + LINE_LONG +
              "</span> / Сагитдинов М.Н. /</p>")
@@ -1976,6 +1988,7 @@ def render_act_html(trip, shipment):
 def render_act_text(trip, shipment):
     route = s(trip.get("route", "")) if trip else ""
     loading_from = s(trip.get("loading_from", "")) if trip else ""
+    loading_contract_number = s(trip.get("loading_contract_number", "")) if trip else ""
     car_model = s(shipment.get("car_model", ""))
     client = s(shipment.get("client", ""))
     customer = s(shipment.get("customer", ""))
@@ -1994,7 +2007,10 @@ def render_act_text(trip, shipment):
         "Маршрут: " + route,
     ]
     if loading_from:
-        lines.append("Погрузка от: " + loading_from)
+        loading_line = "Погрузка от: " + loading_from
+        if loading_contract_number:
+            loading_line += " · Договор № " + loading_contract_number
+        lines.append(loading_line)
     lines += [
         "", "",
         "Груз сдал: " + LINE_LONG + " / Сагитдинов М.Н. /",
@@ -2049,7 +2065,7 @@ def render_print_list_doc(rows, title="СПИСОК ПЕРЕВОЗИМЫХ АВ�
     cur_group = None
     for r in rows:
         key = (s(r.get("tractor")), s(r.get("driver")),
-               s(r.get("loading_from")),
+               s(r.get("loading_from")), s(r.get("loading_contract_number")),
                s(r.get("route")), s(r.get("dep")))
         if key != cur_key:
             if cur_group:
@@ -2059,6 +2075,7 @@ def render_print_list_doc(rows, title="СПИСОК ПЕРЕВОЗИМЫХ АВ�
                 "tractor": s(r.get("tractor")),
                 "driver": s(r.get("driver")),
                 "loading_from": s(r.get("loading_from")),
+                "loading_contract_number": s(r.get("loading_contract_number")),
                 "route": s(r.get("route")),
                 "dep": s(r.get("dep")),
                 "cars": [],
@@ -2131,6 +2148,8 @@ def render_print_list_doc(rows, title="СПИСОК ПЕРЕВОЗИМЫХ АВ�
         p.append(' &nbsp;·&nbsp; <b>Водитель:</b> ' + s(g["driver"]))
         if s(g.get("loading_from", "")):
             p.append(' &nbsp;·&nbsp; <b>Погрузка от:</b> ' + s(g["loading_from"]))
+            if s(g.get("loading_contract_number", "")):
+                p.append(' &nbsp;·&nbsp; <b>Договор №:</b> ' + s(g["loading_contract_number"]))
         if s(g["route"]):
             p.append(' &nbsp;·&nbsp; <b>Маршрут:</b> ' + s(g["route"]))
         p.append("</div>")
@@ -2361,7 +2380,7 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
                        incoming_total_advance=0.0,
                        incoming_total_debt=0.0,
                        total_in_route=None,
-                       loading_from="",
+                       loading_from="", loading_contract_number="",
                        payment_date="", payment_comment="",
                        payments_info=None):
     if active_count == 0 and issued_count == 0 and not has_transfers and incoming_count == 0:
@@ -2373,7 +2392,10 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
 
     title_parts = [s(tractor), s(driver)]
     if s(loading_from):
-        title_parts.append("погрузка от " + s(loading_from))
+        loading_title = "погрузка от " + s(loading_from)
+        if s(loading_contract_number):
+            loading_title += " · договор № " + s(loading_contract_number)
+        title_parts.append(loading_title)
     title_parts.append(s(route))
     title_parts.append("выезд " + s(dep))
     title = " — ".join([p for p in title_parts if p])
@@ -2466,10 +2488,14 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
 
     loading_html = ""
     if s(loading_from):
+        contract_html = (
+            ' &nbsp;·&nbsp; Договор № ' + s(loading_contract_number)
+            if s(loading_contract_number) else ''
+        )
         loading_html = (
             '<div style="margin-top:4px; font-size:13px; '
             'color:#0d47a1; font-weight:bold; word-wrap:break-word;">'
-            '📦 Погрузка от: ' + s(loading_from) +
+            '📦 Погрузка от: ' + s(loading_from) + contract_html +
             '</div>'
         )
 
@@ -3256,7 +3282,9 @@ def _render_trip_info_box(ctx):
         '<div class="trip-mini-grid">' + cells(items_top) + '</div>'
         '<div class="trip-route-line">'
         '<span><b>Маршрут:</b> ' + esc(ctx["route"] or "—") + '</span>'
-        '<span><b>Погрузка от:</b> ' + esc(ctx["loading_from"] or "—") + '</span>'
+        '<span><b>Погрузка от:</b> ' + esc(ctx["loading_from"] or "—")
+        + (' · <b>Договор №:</b> ' + esc(ctx["loading_contract_number"])
+           if ctx.get("loading_contract_number") else '') + '</span>'
         '<span><b>Возвращение:</b> ' + esc(ctx["ret"] or "—") + '</span>'
         '</div>'
         '<div class="trip-mini-grid trip-money-grid">' + cells(items_money, debt_last=True) + '</div>'
@@ -3279,7 +3307,11 @@ def _render_trip_edit_form(ctx):
         c3, c4 = st.columns(2)
         e_route = c3.text_input("Маршрут", value=ctx["route"])
         e_dep = c4.text_input("Дата выезда (ДД.ММ.ГГГГ)", value=ctx["dep"])
-        e_loading_from = st.text_input("Погрузка от", value=ctx["loading_from"])
+        c5, c6 = st.columns(2)
+        e_loading_from = c5.text_input("Погрузка от", value=ctx["loading_from"])
+        e_loading_contract_number = c6.text_input(
+            "Договор №", value=ctx.get("loading_contract_number", "")
+        )
         e_ret = st.text_input("Дата возвращения (можно пусто)", value=ctx["ret"])
         ok = st.form_submit_button("💾 Сохранить изменения")
         cancel = st.form_submit_button("Отмена")
@@ -3297,6 +3329,7 @@ def _render_trip_edit_form(ctx):
             update_trip(
                 trip_id, e_tractor, e_driver, e_route, dep_fmt, ret_fmt,
                 loading_from=e_loading_from,
+                loading_contract_number=e_loading_contract_number,
                 payment_date=ctx["payment_date"],
                 payment_comment=ctx["payment_comment"],
             )
@@ -3900,7 +3933,9 @@ def _build_trip_print_rows(ctx):
                 car, ctx["trips"], ctx["transfer_history"])
         rows.append({
             "tractor": ctx["tractor"], "driver": ctx["driver"],
-            "loading_from": ctx["loading_from"], "route": ctx["route"],
+            "loading_from": ctx["loading_from"],
+            "loading_contract_number": ctx.get("loading_contract_number", ""),
+            "route": ctx["route"],
             "dep": ctx["dep"], "position": s(car.get("position", "")),
             "car_model": s(car.get("car_model", "")), "vin": s(car.get("vin", "")),
             "client": s(car.get("client", "")), "customer": s(car.get("customer", "")),
@@ -4463,7 +4498,7 @@ def _analytics_unique_shipments_by_trip(shipments):
 def build_business_analytics(trips, shipments, year):
     """Собирает управленческую аналитику за один год.
 
-    Правила v2.17.5:
+    Правила v2.17.6:
     - рейсы считаются по уникальному ID и дате выезда;
     - сумма перевозок строится СНАЧАЛА по каждому рейсу;
     - внутри рейса один автомобиль учитывается только один раз;
@@ -5141,6 +5176,7 @@ def main_page():
                     "tractor": s(t.get("tractor_number", "")),
                     "driver": s(t.get("driver", "")),
                     "loading_from": s(t.get("loading_from", "")),
+                    "loading_contract_number": s(t.get("loading_contract_number", "")),
                     "route": s(t.get("route", "")),
                     "dep": date_to_display_safe(t.get("date_departure", "")),
                     "position": s(x.get("position", "")),
@@ -5294,9 +5330,14 @@ def main_page():
                 c3, c4 = st.columns(2)
                 route = c3.text_input("Маршрут")
                 dep = c4.text_input("Дата выезда (ДД.ММ.ГГГГ)", placeholder="12.05.2026")
-                loading_from = st.text_input(
-                    "Погрузка от (пример: СюрЛогистика)",
-                    placeholder="СюрЛогистика"
+                c5, c6 = st.columns(2)
+                loading_from = c5.text_input(
+                    "Погрузка от (пример: Рейл Трейн Сервис)",
+                    placeholder="Рейл Трейн Сервис"
+                )
+                loading_contract_number = c6.text_input(
+                    "Договор №",
+                    placeholder="например 154/26"
                 )
                 ret = st.text_input("Дата возвращения (можно пусто)", placeholder="20.05.2026")
                 ok = st.form_submit_button("Сохранить рейс")
@@ -5314,12 +5355,17 @@ def main_page():
                     except ValueError as e:
                         st.error(str(e))
                     else:
-                        create_trip(tractor, driver, route, dep_fmt, ret_fmt,
-                                    u["login"], loading_from=loading_from)
+                        create_trip(
+                            tractor, driver, route, dep_fmt, ret_fmt, u["login"],
+                            loading_from=loading_from,
+                            loading_contract_number=loading_contract_number,
+                        )
                         log_action(u["login"], role, "create_trip",
                                    s(tractor) + " " + s(driver) + " " + s(dep_fmt)
                                    + (" | погрузка от " + s(loading_from)
-                                      if s(loading_from) else ""))
+                                      if s(loading_from) else "")
+                                   + (" | договор № " + s(loading_contract_number)
+                                      if s(loading_contract_number) else ""))
                         st.session_state.pop("show_new_trip", None)
                         st.success("Рейс добавлен")
                         st.rerun()
@@ -5337,6 +5383,7 @@ def main_page():
             dep = date_to_display_safe(t.get("date_departure", ""))
             ret = date_to_display_safe(t.get("date_return", ""))
             loading_from = s(t.get("loading_from", ""))
+            loading_contract_number = s(t.get("loading_contract_number", ""))
             payment_date = s(t.get("payment_date", ""))
             payment_comment = s(t.get("payment_comment", ""))
             trip_completed = check_completed(t.get("completed", "0"))
@@ -5400,6 +5447,7 @@ def main_page():
                 incoming_total_debt=incoming_debt,
                 total_in_route=total_in_route,
                 loading_from=loading_from,
+                loading_contract_number=loading_contract_number,
                 payment_date=payment_date,
                 payment_comment=payment_comment,
                 payments_info=payments_info,
@@ -5441,6 +5489,7 @@ def main_page():
                 "dep": dep,
                 "ret": ret,
                 "loading_from": loading_from,
+                "loading_contract_number": loading_contract_number,
                 "payment_date": payment_date,
                 "payment_comment": payment_comment,
                 "trip_completed": trip_completed,
