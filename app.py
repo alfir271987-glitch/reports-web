@@ -1,9 +1,10 @@
 # ============================================================
-# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.17.7
+# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.17.9
 # Streamlit + Google Sheets
-# v2.17.6: к полю «Погрузка от» добавлен «Договор №» на уровне рейса;
-#          номер договора показывается в карточке рейса, печати и актах;
-#          старые рейсы сохраняются без изменений, новая колонка добавляется автоматически.
+# v2.17.9: функционал и структура v2.17.7 сохранены;
+#          добавлена защита от временных ошибок/квот Google Sheets (429/5xx);
+#          убрано лишнее принудительное чтение users при каждом запуске;
+#          ошибки Google API теперь показываются понятным сообщением без traceback.
 # ============================================================
 
 import streamlit as st
@@ -14,6 +15,7 @@ import hashlib
 import hmac
 import uuid
 import os
+import time
 from pathlib import Path
 import re
 import html
@@ -38,7 +40,7 @@ SHEET_SCHEMAS = {
     # R=pay1_amount, S=pay1_date, T=pay1_comment,
     # U=pay2_amount, V=pay2_date, W=pay2_comment,
     # X=pay3_amount, Y=pay3_date, Z=pay3_comment,
-    # AA=loading_contract_number
+    # AA=loading_contract_number, AB=trip_number
     "trips": ["id", "tractor_number", "driver", "route",
               "date_departure", "date_return", "created_by", "created_at",
               "archived", "completed", "completed_at",
@@ -48,7 +50,7 @@ SHEET_SCHEMAS = {
               "pay1_amount", "pay1_date", "pay1_comment",
               "pay2_amount", "pay2_date", "pay2_comment",
               "pay3_amount", "pay3_date", "pay3_comment",
-              "loading_contract_number"],
+              "loading_contract_number", "trip_number"],
     "shipments": ["id", "trip_id", "position", "car_model", "client",
                   "amount", "date_pay", "paid_to",
                   "delivery_city", "vin",
@@ -361,10 +363,88 @@ def get_ws_cached(name):
     return get_book().worksheet(name)
 
 
+def _gspread_status_code(exc):
+    """Безопасно извлекает HTTP-код из gspread APIError."""
+    response = getattr(exc, "response", None)
+    try:
+        return int(getattr(response, "status_code", 0) or 0)
+    except Exception:
+        return 0
+
+
+def _gspread_reason(exc):
+    """Короткая безопасная причина без токенов/учётных данных."""
+    err = getattr(exc, "error", None)
+    if isinstance(err, dict):
+        status = s(err.get("status", "")).strip()
+        message = s(err.get("message", "")).strip()
+        if status and message:
+            return status + ": " + message
+        if status:
+            return status
+        if message:
+            return message
+    return ""
+
+
+def _google_api_help_text(exc, operation="чтение Google Sheets"):
+    code = _gspread_status_code(exc)
+    reason = _gspread_reason(exc)
+    if code == 429:
+        text = (
+            "Google Sheets временно ограничил количество запросов (HTTP 429). "
+            "Приложение уже выполнило автоматические повторы. "
+            "Обновите страницу через несколько секунд; данные не повреждены."
+        )
+    elif code == 403:
+        text = (
+            "Google отклонил доступ (HTTP 403). Проверьте, что таблица открыта "
+            "для service account из JSON/secrets и что Google Sheets API включён."
+        )
+    elif code == 404:
+        text = (
+            "Google не нашёл таблицу или лист (HTTP 404). Проверьте SHEET_ID и названия листов."
+        )
+    elif code in (500, 502, 503, 504):
+        text = (
+            "Временная ошибка Google Sheets (HTTP " + s(code) + "). "
+            "Приложение выполнило автоматические повторы; попробуйте обновить страницу."
+        )
+    elif code:
+        text = "Google Sheets вернул HTTP " + s(code) + " при операции: " + operation + "."
+    else:
+        text = "Google Sheets не выполнил операцию: " + operation + "."
+    if reason:
+        text += " Причина: " + reason
+    return text
+
+
+def _gspread_call_with_retry(func, operation="Google Sheets", attempts=5):
+    """Повторяет только временные API-ошибки; 403/404 не маскирует."""
+    delays = [1.0, 2.0, 4.0, 7.0]
+    last_exc = None
+    for attempt in range(max(1, attempts)):
+        try:
+            return func()
+        except gspread.exceptions.APIError as exc:
+            last_exc = exc
+            code = _gspread_status_code(exc)
+            retryable = code in (429, 500, 502, 503, 504) or code == 0
+            if not retryable or attempt >= attempts - 1:
+                raise
+            time.sleep(delays[min(attempt, len(delays) - 1)])
+    if last_exc is not None:
+        raise last_exc
+
+
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def read_all_cached(name):
     ws = get_ws_cached(name)
-    return ws.get_all_records()
+    return _gspread_call_with_retry(
+        lambda: ws.get_all_records(),
+        operation="чтение листа " + s(name),
+        attempts=5,
+    )
 
 
 def read_all(name, fresh=False):
@@ -400,6 +480,11 @@ def _find_row_index_by_id(name, row_id):
 
 
 def _migrate_trips_n_to_o(ws):
+    """Сохраняет старую миграцию и один раз назначает номера старым рейсам.
+
+    trip_number хранится в конце листа trips, поэтому существующие колонки
+    не сдвигаются. Уже назначенные номера никогда не перенумеровываются.
+    """
     try:
         all_vals = ws.get_all_values()
         if len(all_vals) < 2:
@@ -411,8 +496,51 @@ def _migrate_trips_n_to_o(ws):
             if n_val and not looks_like_datetime(n_val) and not o_val:
                 updates.append({"range": "O" + str(i), "values": [[n_val]]})
                 updates.append({"range": "N" + str(i), "values": [[""]]})
+
+        # v2.17.9 — порядковый номер рейса.
+        # Для существующих строк заполняем только пустые номера, в порядке строк листа.
+        headers = [s(v).strip() for v in all_vals[0]]
+        if "trip_number" in headers:
+            num_idx = headers.index("trip_number")
+            used = set()
+            for row in all_vals[1:]:
+                raw = s(row[num_idx]).strip() if len(row) > num_idx else ""
+                if raw:
+                    try:
+                        n = int(to_float(raw))
+                        if n > 0:
+                            used.add(n)
+                    except Exception:
+                        pass
+
+            next_no = 1
+            col_no = num_idx + 1
+            col_letters = ""
+            ncol = col_no
+            while ncol:
+                ncol, rem = divmod(ncol - 1, 26)
+                col_letters = chr(ord("A") + rem) + col_letters
+
+            for row_no, row in enumerate(all_vals[1:], start=2):
+                raw = s(row[num_idx]).strip() if len(row) > num_idx else ""
+                if raw:
+                    continue
+                # Пустые технические строки без id не нумеруем.
+                row_id = s(row[0]).strip() if row else ""
+                if not row_id:
+                    continue
+                while next_no in used:
+                    next_no += 1
+                updates.append({
+                    "range": col_letters + str(row_no),
+                    "values": [[next_no]],
+                })
+                used.add(next_no)
+                next_no += 1
+
         if updates:
             ws.batch_update(updates, value_input_option="USER_ENTERED")
+            invalidate_cache("trips")
     except Exception as e:
         _log_system_error("migrate_trips_n_to_o", "trips", e)
 
@@ -566,6 +694,20 @@ def next_trip_id():
         except Exception:
             pass
     return max_id + 1
+
+
+def next_trip_number():
+    """Следующий постоянный порядковый номер рейса."""
+    rows = read_all_cached("trips")
+    max_no = 0
+    for r in rows:
+        try:
+            v = int(to_float(r.get("trip_number")))
+            if v > max_no:
+                max_no = v
+        except Exception:
+            pass
+    return max_no + 1
 
 
 def next_shipment_id():
@@ -905,6 +1047,9 @@ def describe_trip(trip):
     if not trip:
         return ""
     parts = []
+    trip_no = s(trip.get("trip_number", "")).strip()
+    if trip_no:
+        parts.append("рейс № " + trip_no)
     if s(trip.get("tractor_number", "")):
         parts.append(s(trip.get("tractor_number", "")))
     if s(trip.get("driver", "")):
@@ -1079,8 +1224,10 @@ def clear_trip_payments_split(trip_id):
 
 def create_trip(tractor, driver, route, dep, ret, created_by,
                 loading_from="", loading_contract_number=""):
+    new_trip_id = next_trip_id()
+    new_trip_number = next_trip_number()
     append_row("trips", {
-        "id": next_trip_id(),
+        "id": new_trip_id,
         "tractor_number": s(tractor), "driver": s(driver), "route": s(route),
         "date_departure": s(dep), "date_return": s(ret),
         "created_by": s(created_by),
@@ -1098,7 +1245,9 @@ def create_trip(tractor, driver, route, dep, ret, created_by,
         "pay2_amount": "", "pay2_date": "", "pay2_comment": "",
         "pay3_amount": "", "pay3_date": "", "pay3_comment": "",
         "loading_contract_number": s(loading_contract_number),
+        "trip_number": new_trip_number,
     })
+    return new_trip_number
 
 
 def update_trip(trip_id, tractor, driver, route, dep, ret,
@@ -2890,7 +3039,9 @@ def logout():
 
 
 def ensure_first_admin():
-    users = read_all("users", fresh=True)
+    # После ensure_sheets_once() не делаем лишний принудительный запрос к API.
+    # append_row/invalidate_cache сами очищают кэш при создании пользователя.
+    users = read_all("users")
     if not users:
         st.warning("Первый запуск: создайте аккаунт администратора")
         with st.form("create_admin"):
@@ -5488,19 +5639,20 @@ def main_page():
                     except ValueError as e:
                         st.error(str(e))
                     else:
-                        create_trip(
+                        new_trip_number = create_trip(
                             tractor, driver, route, dep_fmt, ret_fmt, u["login"],
                             loading_from=loading_from,
                             loading_contract_number=loading_contract_number,
                         )
                         log_action(u["login"], role, "create_trip",
-                                   s(tractor) + " " + s(driver) + " " + s(dep_fmt)
+                                   "рейс № " + s(new_trip_number) + " | "
+                                   + s(tractor) + " " + s(driver) + " " + s(dep_fmt)
                                    + (" | погрузка от " + s(loading_from)
                                       if s(loading_from) else "")
                                    + (" | договор № " + s(loading_contract_number)
                                       if s(loading_contract_number) else ""))
                         st.session_state.pop("show_new_trip", None)
-                        st.success("Рейс добавлен")
+                        st.success("Рейс № " + s(new_trip_number) + " добавлен")
                         st.rerun()
 
     st.subheader(VIEW_LABELS.get(view_mode, "Рейсы"))
@@ -5517,6 +5669,7 @@ def main_page():
             ret = date_to_display_safe(t.get("date_return", ""))
             loading_from = s(t.get("loading_from", ""))
             loading_contract_number = s(t.get("loading_contract_number", ""))
+            trip_number = s(t.get("trip_number", "")).strip()
             payment_date = s(t.get("payment_date", ""))
             payment_comment = s(t.get("payment_comment", ""))
             trip_completed = check_completed(t.get("completed", "0"))
@@ -5589,7 +5742,19 @@ def main_page():
             open_key = "open_details_" + s(trip_id)
             is_open = st.session_state.get(open_key, False)
 
-            col_hdr, col_btn = st.columns([12, 1])
+            # v2.17.9 — отдельный столбец слева с постоянным номером рейса.
+            col_no, col_hdr, col_btn = st.columns([1.15, 11.0, 1.0])
+            with col_no:
+                st.markdown(
+                    '<div style="min-height:76px; display:flex; flex-direction:column; '
+                    'align-items:center; justify-content:center; background:#eef5ff; '
+                    'border:1px solid #bfd3f2; border-radius:10px; padding:8px 4px; '
+                    'box-sizing:border-box; margin-top:0;">'
+                    '<div style="font-size:11px; color:#5d6b7e; font-weight:600;">№ рейса</div>'
+                    '<div style="font-size:24px; line-height:1.1; color:#1558b0; font-weight:800;">'
+                    + (trip_number or "—") + '</div></div>',
+                    unsafe_allow_html=True,
+                )
             with col_hdr:
                 st.markdown(header_html, unsafe_allow_html=True)
             with col_btn:
@@ -5616,6 +5781,7 @@ def main_page():
             trip_ctx = {
                 "trip": t,
                 "trip_id": trip_id,
+                "trip_number": trip_number,
                 "tractor": tractor,
                 "driver": driver,
                 "route": route,
@@ -5722,18 +5888,31 @@ def main():
 
     if not st.session_state.get("sheets_ready"):
         try:
-            ensure_sheets_once()
+            _gspread_call_with_retry(
+                ensure_sheets_once,
+                operation="проверка структуры Google Sheets",
+                attempts=5,
+            )
             st.session_state["sheets_ready"] = True
+        except gspread.exceptions.APIError as e:
+            st.error(_google_api_help_text(e, "проверка структуры Google Sheets"))
+            st.info("Данные в Google Sheets не изменялись и не удалялись.")
+            st.stop()
         except Exception as e:
             st.error("Ошибка подключения к Google Sheets: "
                      + type(e).__name__ + ": " + s(e))
             st.stop()
 
-    ensure_first_admin()
-    if "user" not in st.session_state:
-        login_page()
-    else:
-        main_page()
+    try:
+        ensure_first_admin()
+        if "user" not in st.session_state:
+            login_page()
+        else:
+            main_page()
+    except gspread.exceptions.APIError as e:
+        st.error(_google_api_help_text(e, "работа с Google Sheets"))
+        st.info("Это ошибка доступа/квоты Google API, а не потеря данных приложения.")
+        st.stop()
 
 
 if __name__ == "__main__":
