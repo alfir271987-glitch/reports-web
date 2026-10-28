@@ -1,5 +1,5 @@
 # ============================================================
-# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.17.6
+# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.17.7
 # Streamlit + Google Sheets
 # v2.17.6: к полю «Погрузка от» добавлен «Договор №» на уровне рейса;
 #          номер договора показывается в карточке рейса, печати и актах;
@@ -14,6 +14,7 @@ import hashlib
 import hmac
 import uuid
 import os
+from pathlib import Path
 import re
 import html
 import pandas as pd
@@ -287,12 +288,69 @@ def check_lockout(u):
 # GOOGLE SHEETS
 # ============================================================
 
+
+def _resolve_credentials_file():
+    """Ищет JSON-ключ Google независимо от папки запуска Streamlit."""
+    candidates = []
+
+    def add(path):
+        try:
+            path = Path(path).expanduser()
+        except Exception:
+            return
+        if path not in candidates:
+            candidates.append(path)
+
+    try:
+        script_dir = Path(__file__).resolve().parent
+        add(script_dir / CRED_FILE)
+        add(script_dir.parent / CRED_FILE)
+    except Exception:
+        pass
+
+    try:
+        cwd = Path.cwd()
+        add(cwd / CRED_FILE)
+        add(cwd.parent / CRED_FILE)
+    except Exception:
+        pass
+
+    home = Path.home()
+    desktop_dirs = [home / "Desktop", home / "OneDrive" / "Desktop"]
+    add(home / CRED_FILE)
+    for desktop in desktop_dirs:
+        add(desktop / CRED_FILE)
+        if desktop.exists():
+            try:
+                for found in desktop.glob("*/" + CRED_FILE):
+                    add(found)
+            except Exception:
+                pass
+
+    for candidate in candidates:
+        try:
+            if candidate.is_file():
+                return str(candidate), [str(x) for x in candidates]
+        except Exception:
+            continue
+    return "", [str(x) for x in candidates]
+
+
 @st.cache_resource
 def get_book():
-    if os.path.exists(CRED_FILE):
-        creds = ServiceAccountCredentials.from_json_keyfile_name(CRED_FILE, SCOPES)
+    cred_path, searched = _resolve_credentials_file()
+    if cred_path:
+        creds = ServiceAccountCredentials.from_json_keyfile_name(cred_path, SCOPES)
     else:
-        creds_dict = dict(st.secrets["gcp_service_account"])
+        try:
+            creds_dict = dict(st.secrets["gcp_service_account"])
+        except Exception:
+            searched_text = "\n".join("- " + x for x in searched)
+            raise FileNotFoundError(
+                "Не найден JSON-ключ Google Sheets: " + CRED_FILE + ".\n"
+                "Скопируйте этот файл в ту же папку, где находится app.py.\n"
+                "Проверены пути:\n" + searched_text
+            )
         creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, SCOPES)
     client = gspread.authorize(creds)
     return client.open_by_key(SHEET_ID)
@@ -2384,11 +2442,11 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
                        payment_date="", payment_comment="",
                        payments_info=None):
     if active_count == 0 and issued_count == 0 and not has_transfers and incoming_count == 0:
-        bg, bd = "#fafafa", "#dddddd"
+        bg, bd = "#f8fafc", "#cbd5e1"
     elif total_debt > 0.01:
-        bg, bd = "#ffcdd2", "#e53935"
+        bg, bd = "#fff7f7", "#f2a3a3"
     else:
-        bg, bd = "#c8e6c9", "#43a047"
+        bg, bd = "#f2fbf5", "#86d39d"
 
     title_parts = [s(tractor), s(driver)]
     if s(loading_from):
@@ -2559,7 +2617,8 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
     html = (
         '<div style="background-color:' + bg +
         '; border:2px solid ' + bd +
-        '; border-radius:8px; padding:10px 14px; margin-bottom:6px; '
+        '; border-radius:12px; padding:11px 14px; margin-bottom:9px; '
+        'box-shadow:0 2px 9px rgba(15,23,42,.055); '
         'font-size:14px; word-wrap:break-word;">'
         '<div style="display:flex; justify-content:space-between; '
         'align-items:center; gap:10px; flex-wrap:wrap;">'
@@ -4924,29 +4983,121 @@ def render_business_analytics(trips, shipments):
 # ============================================================
 
 def inject_responsive_ui_css():
-    """Компактная типографика и адаптация Streamlit под телефон/планшет."""
+    """Только визуальное оформление: логика и структура приложения не меняются."""
     st.markdown(
         """
         <style>
+        :root {
+            --ui-bg: #f4f7fb;
+            --ui-card: #ffffff;
+            --ui-border: #dbe5f0;
+            --ui-text: #0f172a;
+            --ui-muted: #64748b;
+            --ui-blue: #2563eb;
+        }
+        html, body, [class*="css"] { font-family: Inter, "Segoe UI", Arial, sans-serif; }
+        .stApp {
+            background:
+                radial-gradient(circle at 14% -8%, rgba(37,99,235,.10), transparent 30rem),
+                linear-gradient(180deg, #f8fbff 0px, var(--ui-bg) 320px, var(--ui-bg) 100%);
+            color: var(--ui-text);
+        }
+        header[data-testid="stHeader"] { background: rgba(244,247,251,.84); }
         .block-container {
             max-width: 1500px;
-            padding-top: 0.9rem;
-            padding-bottom: 2rem;
+            padding-top: 0.65rem;
+            padding-bottom: 2.2rem;
         }
-        h1 { font-size: 1.65rem !important; line-height: 1.2 !important; }
-        h2 { font-size: 1.35rem !important; }
-        h3 { font-size: 1.15rem !important; }
-        h4 { font-size: 1.05rem !important; }
+        .app-title-wrap {
+            background: rgba(255,255,255,.97);
+            border: 1px solid var(--ui-border);
+            border-left: 5px solid var(--ui-blue);
+            border-radius: 14px;
+            padding: 15px 18px 14px 18px;
+            margin: 0 0 12px 0;
+            box-shadow: 0 5px 18px rgba(15,23,42,.055);
+        }
+        .app-title {
+            color: #0b1f3a;
+            font-size: 1.85rem;
+            font-weight: 800;
+            line-height: 1.12;
+            letter-spacing: -.02em;
+        }
+        .app-title-sub { color: var(--ui-muted); font-size: .88rem; margin-top: 5px; }
+        h1 { font-size: 1.75rem !important; color: var(--ui-text) !important; font-weight: 800 !important; }
+        h2 { font-size: 1.35rem !important; color: var(--ui-text) !important; }
+        h3 { font-size: 1.15rem !important; color: var(--ui-text) !important; }
+        h4 { font-size: 1.05rem !important; color: var(--ui-text) !important; }
+
+        section[data-testid="stSidebar"] {
+            background: #f8fbff;
+            border-right: 1px solid var(--ui-border);
+        }
+        section[data-testid="stSidebar"] > div { padding-top: 1rem; }
+
+        .stButton > button, .stDownloadButton > button {
+            border-radius: 9px !important;
+            border: 1px solid #cbd9e8 !important;
+            background: #ffffff !important;
+            color: #17324d !important;
+            box-shadow: 0 1px 2px rgba(15,23,42,.025);
+            transition: all .13s ease;
+        }
+        .stButton > button:hover, .stDownloadButton > button:hover {
+            border-color: #6fa1ef !important;
+            color: #174ea6 !important;
+            background: #f6faff !important;
+            box-shadow: 0 2px 7px rgba(37,99,235,.09);
+        }
+        .stButton button p, .stDownloadButton button p { font-size: 0.88rem; }
+
+        div[data-testid="stExpander"] {
+            background: rgba(255,255,255,.94);
+            border: 1px solid var(--ui-border) !important;
+            border-radius: 11px !important;
+            box-shadow: 0 1px 4px rgba(15,23,42,.025);
+        }
+        div[data-testid="stForm"] {
+            background: rgba(255,255,255,.94);
+            border-color: var(--ui-border) !important;
+            border-radius: 12px !important;
+        }
+        div[data-baseweb="input"] > div,
+        div[data-baseweb="select"] > div,
+        textarea { background: #ffffff !important; border-color: #cfdae7 !important; }
+
+        div[data-testid="stRadio"] div[role="radiogroup"] {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.30rem 0.85rem;
+            background: rgba(255,255,255,.88);
+            border: 1px solid var(--ui-border);
+            padding: 7px 10px;
+            border-radius: 11px;
+            width: fit-content;
+            max-width: 100%;
+        }
+        div[data-testid="stRadio"] label p {
+            font-size: 0.88rem !important;
+            font-weight: 600;
+            color: #27425f;
+        }
 
         .trip-section-title {
             font-size: 1.08rem;
-            font-weight: 700;
+            font-weight: 750;
             line-height: 1.25;
-            margin: 0.15rem 0 0.2rem 0;
+            margin: 0.15rem 0 0.25rem 0;
+            color: #102a43;
         }
         .trip-compact {
             margin-top: 0.35rem;
-            margin-bottom: 0.25rem;
+            margin-bottom: 0.35rem;
+            background: rgba(255,255,255,.88);
+            border: 1px solid var(--ui-border);
+            border-radius: 12px;
+            padding: 9px;
         }
         .trip-mini-grid {
             display: grid;
@@ -4954,34 +5105,29 @@ def inject_responsive_ui_css():
             gap: 7px;
         }
         .trip-mini-card {
-            border: 1px solid rgba(128,128,128,.30);
-            border-radius: 8px;
-            padding: 7px 9px;
+            border: 1px solid #dbe5f0;
+            border-radius: 9px;
+            padding: 8px 10px;
             min-width: 0;
-            background: rgba(128,128,128,.035);
+            background: #ffffff;
         }
-        .trip-mini-label {
-            font-size: 0.70rem;
-            line-height: 1.15;
-            opacity: .72;
-            margin-bottom: 3px;
-        }
+        .trip-mini-label { font-size: 0.70rem; line-height: 1.15; color: #718096; margin-bottom: 3px; }
         .trip-mini-value {
             font-size: 0.90rem;
             line-height: 1.25;
-            font-weight: 650;
+            font-weight: 700;
+            color: #172b4d;
             overflow-wrap: anywhere;
         }
-        .trip-mini-debt .trip-mini-value {
-            color: #c62828;
-        }
+        .trip-mini-debt .trip-mini-value { color: #c53030; }
         .trip-route-line {
             display: flex;
             flex-wrap: wrap;
             gap: 5px 18px;
             font-size: 0.82rem;
             line-height: 1.35;
-            padding: 7px 2px;
+            padding: 8px 3px;
+            color: #425466;
         }
         .trip-money-grid { margin-top: 1px; }
 
@@ -4992,61 +5138,45 @@ def inject_responsive_ui_css():
             margin: 0.35rem 0 0.85rem 0;
         }
         .analytics-kpi-card {
-            border: 1px solid rgba(128,128,128,.28);
-            border-radius: 9px;
-            padding: 9px 11px;
-            background: rgba(128,128,128,.035);
+            border: 1px solid var(--ui-border);
+            border-radius: 11px;
+            padding: 10px 12px;
+            background: #ffffff;
             min-width: 0;
+            box-shadow: 0 2px 8px rgba(15,23,42,.035);
         }
-        .analytics-kpi-label {
-            font-size: 0.72rem;
-            opacity: .72;
-            margin-bottom: 3px;
-        }
+        .analytics-kpi-label { font-size: 0.72rem; color: #718096; margin-bottom: 3px; }
         .analytics-kpi-value {
             font-size: 1.03rem;
-            font-weight: 700;
+            font-weight: 750;
+            color: #102a43;
             line-height: 1.2;
             overflow-wrap: anywhere;
         }
-
-        div[data-testid="stRadio"] div[role="radiogroup"] {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 0.15rem 0.75rem;
+        div[data-testid="stDataFrame"] {
+            background: #ffffff;
+            border: 1px solid var(--ui-border);
+            border-radius: 11px;
+            overflow: hidden;
         }
-        div[data-testid="stRadio"] label p {
-            font-size: 0.88rem !important;
-        }
-        .stButton button p, .stDownloadButton button p {
-            font-size: 0.88rem;
-        }
+        div[data-testid="stAlert"] { border-radius: 10px; }
+        hr { border-color: #dde6ef !important; }
 
         @media (max-width: 768px) {
-            .block-container {
-                padding-left: 0.65rem;
-                padding-right: 0.65rem;
-                padding-top: 0.55rem;
-            }
+            .block-container { padding-left: 0.65rem; padding-right: 0.65rem; padding-top: 0.45rem; }
+            .app-title-wrap { padding: 12px 13px; border-radius: 11px; }
+            .app-title { font-size: 1.38rem; }
+            .app-title-sub { font-size: .78rem; }
             h1 { font-size: 1.32rem !important; }
             h2 { font-size: 1.18rem !important; }
             h3 { font-size: 1.06rem !important; }
             .trip-section-title { font-size: 1rem; }
-            .trip-mini-grid {
-                grid-template-columns: repeat(2, minmax(0, 1fr));
-                gap: 6px;
-            }
+            .trip-mini-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
             .trip-mini-card { padding: 6px 7px; }
             .trip-mini-label { font-size: 0.66rem; }
             .trip-mini-value { font-size: 0.84rem; }
-            .trip-route-line {
-                font-size: 0.77rem;
-                gap: 4px 12px;
-            }
-            .analytics-kpi-grid {
-                grid-template-columns: repeat(2, minmax(0, 1fr));
-                gap: 6px;
-            }
+            .trip-route-line { font-size: 0.77rem; gap: 4px 12px; }
+            .analytics-kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
             .analytics-kpi-card { padding: 7px 8px; }
             .analytics-kpi-label { font-size: 0.67rem; }
             .analytics-kpi-value { font-size: 0.90rem; }
@@ -5058,14 +5188,11 @@ def inject_responsive_ui_css():
             div[data-testid="stRadio"] label p { font-size: 0.80rem !important; }
             div[data-testid="stHorizontalBlock"] { gap: 0.35rem; }
         }
-
         @media (max-width: 430px) {
             .trip-mini-grid { grid-template-columns: 1fr; }
             .analytics-kpi-grid { grid-template-columns: 1fr; }
             .trip-route-line { display: grid; grid-template-columns: 1fr; }
-            div[data-testid="stRadio"] div[role="radiogroup"] {
-                gap: 0.1rem 0.5rem;
-            }
+            div[data-testid="stRadio"] div[role="radiogroup"] { gap: 0.1rem 0.5rem; width: 100%; }
         }
         </style>
         """,
@@ -5112,7 +5239,13 @@ def main_page():
     if st.sidebar.button("🚪 Выйти", key="btn_logout", use_container_width=True):
         logout()
 
-    st.title("Учёт рейсов и перевозок")
+    st.markdown(
+        '<div class="app-title-wrap">'
+        '<div class="app-title">🚛 Учёт рейсов и перевозок</div>'
+        '<div class="app-title-sub">Рейсы · автомобили · оплаты · документы · аналитика</div>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
 
     # Основные разделы снова находятся сверху, а не в боковом меню.
     selected_view = st.radio(
