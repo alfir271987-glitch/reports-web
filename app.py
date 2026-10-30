@@ -1,5 +1,5 @@
 # ============================================================
-# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.17.10
+# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.17.11
 # Streamlit + Google Sheets
 # v2.17.10: функционал v2.17.9 сохранён без изменений;
 #           убран голубой фон интерфейса; основной фон нейтральный бело-серый;
@@ -2591,10 +2591,30 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
                        payments_info=None):
     if active_count == 0 and issued_count == 0 and not has_transfers and incoming_count == 0:
         bg, bd = "#f8fafc", "#cbd5e1"
+        payment_status_html = ""
+        status_shadow = "rgba(15,23,42,.055)"
     elif total_debt > 0.01:
-        bg, bd = "#fff7f7", "#f2a3a3"
+        # Высокий контраст: красный сразу показывает неоплаченный рейс.
+        bg, bd = "#ffd6d6", "#d71920"
+        payment_status_html = (
+            '<span style="background:#c8102e; color:#fff; '
+            'padding:5px 12px; border-radius:999px; font-size:12px; '
+            'font-weight:900; letter-spacing:.35px; white-space:nowrap; '
+            'box-shadow:0 2px 7px rgba(200,16,46,.28); margin-left:6px;">'
+            '🔴 НЕ ОПЛАЧЕН</span>'
+        )
+        status_shadow = "rgba(200,16,46,.20)"
     else:
-        bg, bd = "#f2fbf5", "#86d39d"
+        # Высокий контраст: зелёный сразу показывает полностью оплаченный рейс.
+        bg, bd = "#cdf5d6", "#129447"
+        payment_status_html = (
+            '<span style="background:#0b8f3a; color:#fff; '
+            'padding:5px 12px; border-radius:999px; font-size:12px; '
+            'font-weight:900; letter-spacing:.35px; white-space:nowrap; '
+            'box-shadow:0 2px 7px rgba(11,143,58,.25); margin-left:6px;">'
+            '🟢 ОПЛАЧЕН</span>'
+        )
+        status_shadow = "rgba(11,143,58,.16)"
 
     title_parts = [s(tractor), s(driver)]
     if s(loading_from):
@@ -2764,16 +2784,16 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
 
     html = (
         '<div style="background-color:' + bg +
-        '; border:2px solid ' + bd +
+        '; border:3px solid ' + bd +
         '; border-radius:12px; padding:11px 14px; margin-bottom:9px; '
-        'box-shadow:0 2px 9px rgba(15,23,42,.055); '
+        'box-shadow:0 3px 12px ' + status_shadow + '; '
         'font-size:14px; word-wrap:break-word;">'
         '<div style="display:flex; justify-content:space-between; '
         'align-items:center; gap:10px; flex-wrap:wrap;">'
         '<div style="font-weight:bold; flex:1; min-width:200px;">'
         + title +
         '</div>'
-        '<div>' + badges + completed_html + '</div>'
+        '<div>' + payment_status_html + badges + completed_html + '</div>'
         '</div>'
         + loading_html +
         '<div style="color:#333; margin-top:4px; display:flex; '
@@ -3439,16 +3459,16 @@ def _shipment_ui_status(x):
     auto_issued = is_advance_covers(x)
 
     if debt <= 0.01 and issued and auto_issued and not check_issued(x.get("issued", "0")):
-        return "🟢 Выдан (аванс покрыл сумму)", "#e8f5e9", "#2e7d32"
+        return "🟢 Выдан (аванс покрыл сумму)", "#c8f3d2", "#0b8f3a"
     if debt <= 0.01 and issued:
-        return "🟢 Выдан", "#e8f5e9", "#2e7d32"
+        return "🟢 Выдан", "#c8f3d2", "#0b8f3a"
     if debt <= 0.01 and paid:
-        return "🟢 Оплачен", "#e8f5e9", "#2e7d32"
+        return "🟢 Оплачен", "#c8f3d2", "#0b8f3a"
     if debt <= 0.01:
-        return "🟢 Без долга", "#e8f5e9", "#2e7d32"
+        return "🟢 Без долга", "#c8f3d2", "#0b8f3a"
     if issued:
-        return "🔴 Выдан с долгом", "#ffebee", "#c62828"
-    return "🔴 Долг", "#ffebee", "#c62828"
+        return "🔴 Выдан с долгом", "#ffd4d4", "#d71920"
+    return "🔴 Долг", "#ffd4d4", "#d71920"
 
 
 def _render_trip_info_box(ctx):
@@ -3835,7 +3855,7 @@ def render_trip_cars_section(ctx):
 
         with st.expander(title, expanded=False):
             st.markdown(
-                '<div style="background:' + bg + '; border-left:5px solid ' + border
+                '<div style="background:' + bg + '; border-left:7px solid ' + border
                 + '; padding:10px 12px; border-radius:6px;">'
                 '<b>Клиент:</b> ' + client + '<br>'
                 '<b>VIN:</b> ' + (s(car.get("vin", ""))[:17] or '—') + '<br>'
@@ -5267,7 +5287,17 @@ def inject_responsive_ui_css():
             color: #202124;
             overflow-wrap: anywhere;
         }
-        .trip-mini-debt .trip-mini-value { color: #c53030; }
+        .trip-money-grid .trip-mini-card:nth-child(3) {
+            background: #dcfce7;
+            border: 2px solid #22a447;
+        }
+        .trip-money-grid .trip-mini-card:nth-child(3) .trip-mini-label,
+        .trip-money-grid .trip-mini-card:nth-child(3) .trip-mini-value { color: #075f2b; font-weight: 800; }
+        .trip-mini-debt {
+            background: #ffe1e1 !important;
+            border: 2px solid #e11d2e !important;
+        }
+        .trip-mini-debt .trip-mini-label, .trip-mini-debt .trip-mini-value { color: #a70018; font-weight: 850; }
         .trip-route-line {
             display: flex;
             flex-wrap: wrap;
@@ -5739,7 +5769,7 @@ def main_page():
             open_key = "open_details_" + s(trip_id)
             is_open = st.session_state.get(open_key, False)
 
-            # v2.17.10 — номер рейса сохранён; оформление номера сделано нейтральным.
+            # v2.17.11 — номер рейса сохранён; статусы оплаты усилены визуально.
             col_no, col_hdr, col_btn = st.columns([1.15, 11.0, 1.0])
             with col_no:
                 st.markdown(
