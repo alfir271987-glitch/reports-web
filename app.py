@@ -1,10 +1,9 @@
 # ============================================================
-# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.17.9
+# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.17.10
 # Streamlit + Google Sheets
-# v2.17.9: функционал и структура v2.17.7 сохранены;
-#          добавлена защита от временных ошибок/квот Google Sheets (429/5xx);
-#          убрано лишнее принудительное чтение users при каждом запуске;
-#          ошибки Google API теперь показываются понятным сообщением без traceback.
+# v2.17.10: функционал v2.17.9 сохранён без изменений;
+#           убран голубой фон интерфейса; основной фон нейтральный бело-серый;
+#           зелёный используется для успешных/оплаченных состояний, красный — для долга/ошибок.
 # ============================================================
 
 import streamlit as st
@@ -2639,7 +2638,7 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
         inv_num = s(trip_invoice_number).strip()
         inv_date = s(trip_invoice_date).strip()
         if inv_num or inv_date:
-            inv_html = ('<span style="background:#1976d2; color:#fff; '
+            inv_html = ('<span style="background:#4b5563; color:#fff; '
                         'padding:2px 10px; border-radius:12px; font-size:12px; '
                         'font-weight:bold; white-space:nowrap; margin-left:6px;">'
                         '📄 Счёт № ' + (inv_num or "—")
@@ -2701,7 +2700,7 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
         )
         loading_html = (
             '<div style="margin-top:4px; font-size:13px; '
-            'color:#0d47a1; font-weight:bold; word-wrap:break-word;">'
+            'color:#374151; font-weight:bold; word-wrap:break-word;">'
             '📦 Погрузка от: ' + s(loading_from) + contract_html +
             '</div>'
         )
@@ -2711,7 +2710,7 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
         pd_disp = date_to_display_safe(payment_date) if s(payment_date).strip() else "—"
         pc_disp = s(payment_comment).strip() if s(payment_comment).strip() else "—"
         payment_html = (
-            '<div style="background:#e3f2fd; border-left:4px solid #1976d2; '
+            '<div style="background:#f5f5f5; border-left:4px solid #9ca3af; '
             'padding:6px 10px; margin-top:6px; border-radius:4px; '
             'font-size:13px; word-wrap:break-word;">'
             '💳 <b>Дата оплаты:</b> ' + pd_disp
@@ -5139,21 +5138,19 @@ def inject_responsive_ui_css():
         """
         <style>
         :root {
-            --ui-bg: #f4f7fb;
+            --ui-bg: #f3f4f6;
             --ui-card: #ffffff;
-            --ui-border: #dbe5f0;
-            --ui-text: #0f172a;
-            --ui-muted: #64748b;
-            --ui-blue: #2563eb;
+            --ui-border: #d7d9dd;
+            --ui-text: #202124;
+            --ui-muted: #6b7280;
+            --ui-blue: #5f6368;
         }
         html, body, [class*="css"] { font-family: Inter, "Segoe UI", Arial, sans-serif; }
         .stApp {
-            background:
-                radial-gradient(circle at 14% -8%, rgba(37,99,235,.10), transparent 30rem),
-                linear-gradient(180deg, #f8fbff 0px, var(--ui-bg) 320px, var(--ui-bg) 100%);
+            background: var(--ui-bg);
             color: var(--ui-text);
         }
-        header[data-testid="stHeader"] { background: rgba(244,247,251,.84); }
+        header[data-testid="stHeader"] { background: rgba(243,244,246,.94); }
         .block-container {
             max-width: 1500px;
             padding-top: 0.65rem;
@@ -5169,7 +5166,7 @@ def inject_responsive_ui_css():
             box-shadow: 0 5px 18px rgba(15,23,42,.055);
         }
         .app-title {
-            color: #0b1f3a;
+            color: #202124;
             font-size: 1.85rem;
             font-weight: 800;
             line-height: 1.12;
@@ -5182,24 +5179,24 @@ def inject_responsive_ui_css():
         h4 { font-size: 1.05rem !important; color: var(--ui-text) !important; }
 
         section[data-testid="stSidebar"] {
-            background: #f8fbff;
+            background: #f7f7f7;
             border-right: 1px solid var(--ui-border);
         }
         section[data-testid="stSidebar"] > div { padding-top: 1rem; }
 
         .stButton > button, .stDownloadButton > button {
             border-radius: 9px !important;
-            border: 1px solid #cbd9e8 !important;
+            border: 1px solid #d1d5db !important;
             background: #ffffff !important;
-            color: #17324d !important;
+            color: #202124 !important;
             box-shadow: 0 1px 2px rgba(15,23,42,.025);
             transition: all .13s ease;
         }
         .stButton > button:hover, .stDownloadButton > button:hover {
-            border-color: #6fa1ef !important;
-            color: #174ea6 !important;
-            background: #f6faff !important;
-            box-shadow: 0 2px 7px rgba(37,99,235,.09);
+            border-color: #9ca3af !important;
+            color: #202124 !important;
+            background: #f3f4f6 !important;
+            box-shadow: 0 2px 7px rgba(31,41,55,.08);
         }
         .stButton button p, .stDownloadButton button p { font-size: 0.88rem; }
 
@@ -5216,7 +5213,7 @@ def inject_responsive_ui_css():
         }
         div[data-baseweb="input"] > div,
         div[data-baseweb="select"] > div,
-        textarea { background: #ffffff !important; border-color: #cfdae7 !important; }
+        textarea { background: #ffffff !important; border-color: #d1d5db !important; }
 
         div[data-testid="stRadio"] div[role="radiogroup"] {
             display: flex;
@@ -5232,7 +5229,7 @@ def inject_responsive_ui_css():
         div[data-testid="stRadio"] label p {
             font-size: 0.88rem !important;
             font-weight: 600;
-            color: #27425f;
+            color: #374151;
         }
 
         .trip-section-title {
@@ -5240,7 +5237,7 @@ def inject_responsive_ui_css():
             font-weight: 750;
             line-height: 1.25;
             margin: 0.15rem 0 0.25rem 0;
-            color: #102a43;
+            color: #202124;
         }
         .trip-compact {
             margin-top: 0.35rem;
@@ -5256,7 +5253,7 @@ def inject_responsive_ui_css():
             gap: 7px;
         }
         .trip-mini-card {
-            border: 1px solid #dbe5f0;
+            border: 1px solid #d7d9dd;
             border-radius: 9px;
             padding: 8px 10px;
             min-width: 0;
@@ -5267,7 +5264,7 @@ def inject_responsive_ui_css():
             font-size: 0.90rem;
             line-height: 1.25;
             font-weight: 700;
-            color: #172b4d;
+            color: #202124;
             overflow-wrap: anywhere;
         }
         .trip-mini-debt .trip-mini-value { color: #c53030; }
@@ -5278,7 +5275,7 @@ def inject_responsive_ui_css():
             font-size: 0.82rem;
             line-height: 1.35;
             padding: 8px 3px;
-            color: #425466;
+            color: #4b5563;
         }
         .trip-money-grid { margin-top: 1px; }
 
@@ -5300,7 +5297,7 @@ def inject_responsive_ui_css():
         .analytics-kpi-value {
             font-size: 1.03rem;
             font-weight: 750;
-            color: #102a43;
+            color: #202124;
             line-height: 1.2;
             overflow-wrap: anywhere;
         }
@@ -5311,7 +5308,7 @@ def inject_responsive_ui_css():
             overflow: hidden;
         }
         div[data-testid="stAlert"] { border-radius: 10px; }
-        hr { border-color: #dde6ef !important; }
+        hr { border-color: #dedede !important; }
 
         @media (max-width: 768px) {
             .block-container { padding-left: 0.65rem; padding-right: 0.65rem; padding-top: 0.45rem; }
@@ -5742,16 +5739,16 @@ def main_page():
             open_key = "open_details_" + s(trip_id)
             is_open = st.session_state.get(open_key, False)
 
-            # v2.17.9 — отдельный столбец слева с постоянным номером рейса.
+            # v2.17.10 — номер рейса сохранён; оформление номера сделано нейтральным.
             col_no, col_hdr, col_btn = st.columns([1.15, 11.0, 1.0])
             with col_no:
                 st.markdown(
                     '<div style="min-height:76px; display:flex; flex-direction:column; '
-                    'align-items:center; justify-content:center; background:#eef5ff; '
-                    'border:1px solid #bfd3f2; border-radius:10px; padding:8px 4px; '
+                    'align-items:center; justify-content:center; background:#ffffff; '
+                    'border:1px solid #d1d5db; border-radius:10px; padding:8px 4px; '
                     'box-sizing:border-box; margin-top:0;">'
                     '<div style="font-size:11px; color:#5d6b7e; font-weight:600;">№ рейса</div>'
-                    '<div style="font-size:24px; line-height:1.1; color:#1558b0; font-weight:800;">'
+                    '<div style="font-size:24px; line-height:1.1; color:#202124; font-weight:800;">'
                     + (trip_number or "—") + '</div></div>',
                     unsafe_allow_html=True,
                 )
