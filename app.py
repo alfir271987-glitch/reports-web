@@ -1,5 +1,5 @@
 # ============================================================
-# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.17.11
+# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.17.12
 # Streamlit + Google Sheets
 # v2.17.10: функционал v2.17.9 сохранён без изменений;
 #           убран голубой фон интерфейса; основной фон нейтральный бело-серый;
@@ -4812,8 +4812,11 @@ def build_business_analytics(trips, shipments, year):
         })
 
     # Платежи без даты не включаем в месячные KPI.
+    # Одновременно сохраняем подробную расшифровку, чтобы пользователь видел,
+    # какой именно рейс/автомобиль не попал в график и где нужно указать дату.
     undated_cash = 0.0
     undated_nds = 0.0
+    undated_details = []
 
     # Стоимость безнал-НДС по каждому рейсу — по тем же уникальным авто,
     # чтобы дубли не увеличивали допустимый лимит оплаты.
@@ -4853,6 +4856,29 @@ def build_business_analytics(trips, shipments, year):
             if dt is None:
                 if trip_year.get(tid) == year:
                     undated_nds += amount
+                    raw_date = s(p.get("date", "")).strip()
+                    undated_details.append({
+                        "trip_number": s(t.get("trip_number", "")).strip(),
+                        "trip_id": tid,
+                        "tractor": s(t.get("tractor_number", "")).strip(),
+                        "driver": s(t.get("driver", "")).strip(),
+                        "route": s(t.get("route", "")).strip(),
+                        "source": "Оплата рейса №" + s(p.get("idx", "")),
+                        "car_model": "",
+                        "vin": "",
+                        "client": "",
+                        "payer_type": NDS_PAYER,
+                        "amount": amount,
+                        "date_value": raw_date,
+                        "reason": (
+                            "Дата платежа не указана" if not raw_date
+                            else "Дата платежа не распознана: " + raw_date
+                        ),
+                        "where_fix": (
+                            "Рейс → Оплата → Безнал с НДС — оплата всего рейса → "
+                            "платёж №" + s(p.get("idx", ""))
+                        ),
+                    })
                 continue
             if dt.year == year:
                 months[dt.month]["beznal_nds"] += amount
@@ -4908,7 +4934,7 @@ def build_business_analytics(trips, shipments, year):
                         "comment": "Архивная оплата старого формата",
                     })
 
-            for p in prepared_payments:
+            for payment_idx, p in enumerate(prepared_payments, start=1):
                 amount = money_value(p.get("amount"))
                 if amount <= 0.01:
                     continue
@@ -4919,6 +4945,36 @@ def build_business_analytics(trips, shipments, year):
                             undated_cash += amount
                         else:
                             undated_nds += amount
+
+                        raw_date = s(p.get("date", "")).strip()
+                        undated_details.append({
+                            "trip_number": s(trip.get("trip_number", "")).strip(),
+                            "trip_id": tid,
+                            "tractor": s(trip.get("tractor_number", "")).strip(),
+                            "driver": s(trip.get("driver", "")).strip(),
+                            "route": s(trip.get("route", "")).strip(),
+                            "source": "Платёж автомобиля №" + s(payment_idx),
+                            "car_model": s(x.get("car_model", "")).strip(),
+                            "vin": s(x.get("vin", "")).strip(),
+                            "client": (
+                                s(x.get("client", "")).strip()
+                                or s(x.get("customer", "")).strip()
+                            ),
+                            "payer_type": payer_type,
+                            "amount": amount,
+                            "date_value": raw_date,
+                            "reason": (
+                                "Дата платежа не указана" if not raw_date
+                                else "Дата платежа не распознана: " + raw_date
+                            ),
+                            "where_fix": (
+                                "Рейс → Оплата → автомобиль"
+                                + (" " + s(x.get("car_model", "")).strip()
+                                   if s(x.get("car_model", "")).strip() else "")
+                                + " → Внести / изменить платежи → платёж №"
+                                + s(payment_idx)
+                            ),
+                        })
                     continue
                 if dt.year == year:
                     months[dt.month][target_key] += amount
@@ -4942,6 +4998,15 @@ def build_business_analytics(trips, shipments, year):
                        r["trip_id"])
     )
 
+    def _undated_sort_key(r):
+        try:
+            trip_no = int(to_float(r.get("trip_number")))
+        except Exception:
+            trip_no = 10 ** 9
+        return (trip_no, s(r.get("tractor", "")), s(r.get("source", "")))
+
+    undated_details.sort(key=_undated_sort_key)
+
     return {
         "year": year,
         "rows": rows,
@@ -4952,6 +5017,7 @@ def build_business_analytics(trips, shipments, year):
         "dated_beznal_nds": dated_nds,
         "undated_cash_acq": money_value(undated_cash),
         "undated_beznal_nds": money_value(undated_nds),
+        "undated_details": undated_details,
         "total_cash_acq": dated_cash,
         "total_beznal_nds": dated_nds,
         "total_payments": money_value(dated_cash + dated_nds),
@@ -5141,11 +5207,57 @@ def render_business_analytics(trips, shipments):
         data["undated_cash_acq"] + data["undated_beznal_nds"]
     )
     if undated_total > 0.01:
+        undated_details = data.get("undated_details", [])
         st.warning(
-            "Есть введённые суммы без даты на " + fmt_money(undated_total)
-            + " ₽. Они НЕ включены в годовой итог. Укажите дату платежа, "
-              "чтобы сумма попала в нужный месяц и год."
+            "⚠️ В аналитику не вошли платежи без корректной даты на "
+            + fmt_money(undated_total)
+            + " ₽. Это НЕ потерянные деньги и не ошибка суммы: платёж сохранён, "
+              "но приложение не может определить месяц и год без даты. "
+              "Откройте расшифровку ниже и укажите дату платежа."
         )
+
+        with st.expander(
+            "🔎 Какие платежи не вошли в графики — "
+            + s(len(undated_details))
+            + " записей",
+            expanded=True,
+        ):
+            if undated_details:
+                detail_rows = []
+                for d in undated_details:
+                    trip_label = (
+                        "№ " + s(d.get("trip_number"))
+                        if s(d.get("trip_number", "")).strip()
+                        else s(d.get("trip_id", ""))
+                    )
+                    detail_rows.append({
+                        "Рейс": trip_label,
+                        "Тягач": s(d.get("tractor", "")),
+                        "Водитель": s(d.get("driver", "")),
+                        "Автомобиль": s(d.get("car_model", "")) or "—",
+                        "VIN": s(d.get("vin", "")) or "—",
+                        "Клиент": s(d.get("client", "")) or "—",
+                        "Тип оплаты": s(d.get("payer_type", "")),
+                        "Какой платёж": s(d.get("source", "")),
+                        "Сумма": fmt_money(d.get("amount", 0)) + " ₽",
+                        "Причина": s(d.get("reason", "")),
+                        "Где исправить": s(d.get("where_fix", "")),
+                    })
+
+                st.dataframe(
+                    pd.DataFrame(detail_rows),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                st.caption(
+                    "После указания даты этот платёж автоматически попадёт в "
+                    "соответствующий месяц и год при следующем пересчёте аналитики."
+                )
+            else:
+                st.info(
+                    "Сумма без даты обнаружена, но источник не удалось однозначно "
+                    "определить. Проверьте раздел «Оплата» у рейсов выбранного года."
+                )
 
     # Технические резервные поля и старые превышения намеренно не показываем:
     # они уже исключены из расчётов и не являются реальными деньгами бизнеса.
@@ -5769,7 +5881,7 @@ def main_page():
             open_key = "open_details_" + s(trip_id)
             is_open = st.session_state.get(open_key, False)
 
-            # v2.17.11 — номер рейса сохранён; статусы оплаты усилены визуально.
+            # v2.17.12 — расшифровка платежей без даты в аналитике.
             col_no, col_hdr, col_btn = st.columns([1.15, 11.0, 1.0])
             with col_no:
                 st.markdown(
