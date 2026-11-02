@@ -1,5 +1,5 @@
 # ============================================================
-# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.17.12
+# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.17.14
 # Streamlit + Google Sheets
 # v2.17.10: функционал v2.17.9 сохранён без изменений;
 #           убран голубой фон интерфейса; основной фон нейтральный бело-серый;
@@ -5007,6 +5007,68 @@ def build_business_analytics(trips, shipments, year):
 
     undated_details.sort(key=_undated_sort_key)
 
+    # ------------------------------------------------------------
+    # КОНТРОЛЬ КОЛИЧЕСТВА РЕЙСОВ И ПОРЯДКОВОГО НОМЕРА
+    # ------------------------------------------------------------
+    # trip_number — сквозной порядковый номер созданного рейса. Он не обязан
+    # совпадать с количеством рейсов в выбранном году: удалённые рейсы, рейсы
+    # другого года и строки с некорректной датой в годовую аналитику не входят.
+    existing_trip_numbers = set()
+    max_trip_number = 0
+    trip_count_excluded = []
+
+    for t in trips:
+        tid = s(t.get("id", "")).strip()
+        if not tid:
+            continue
+        try:
+            trip_no = int(to_float(t.get("trip_number")))
+        except Exception:
+            trip_no = 0
+        if trip_no > 0:
+            existing_trip_numbers.add(trip_no)
+            max_trip_number = max(max_trip_number, trip_no)
+
+        dep_raw = s(t.get("date_departure", "")).strip()
+        dep_dt = _parse_analytics_date(dep_raw)
+        deleted = is_deleted(t.get("deleted_at", ""))
+
+        # Полностью соответствует правилам подсчёта рейсов выше.
+        if not deleted and dep_dt and dep_dt.year == year:
+            continue
+
+        if deleted:
+            reason = "Удалённый рейс — в аналитику не входит"
+        elif not dep_raw:
+            reason = "Не указана дата выезда"
+        elif not dep_dt:
+            reason = "Дата выезда не распознана: " + dep_raw
+        else:
+            reason = "Дата выезда относится к " + str(dep_dt.year) + " году"
+
+        trip_count_excluded.append({
+            "trip_number": trip_no if trip_no > 0 else "",
+            "tractor": s(t.get("tractor_number", "")).strip(),
+            "driver": s(t.get("driver", "")).strip(),
+            "route": s(t.get("route", "")).strip(),
+            "date_departure": dep_dt.strftime("%d.%m.%Y") if dep_dt else dep_raw,
+            "reason": reason,
+        })
+
+    missing_trip_numbers = []
+    if max_trip_number > 0:
+        missing_trip_numbers = [
+            n for n in range(1, max_trip_number + 1)
+            if n not in existing_trip_numbers
+        ]
+
+    trip_count_excluded.sort(
+        key=lambda r: (
+            int(r.get("trip_number")) if s(r.get("trip_number", "")).isdigit() else 10 ** 9,
+            s(r.get("tractor", "")),
+        )
+    )
+
     return {
         "year": year,
         "rows": rows,
@@ -5018,6 +5080,9 @@ def build_business_analytics(trips, shipments, year):
         "undated_cash_acq": money_value(undated_cash),
         "undated_beznal_nds": money_value(undated_nds),
         "undated_details": undated_details,
+        "max_trip_number": max_trip_number,
+        "trip_count_excluded": trip_count_excluded,
+        "missing_trip_numbers": missing_trip_numbers,
         "total_cash_acq": dated_cash,
         "total_beznal_nds": dated_nds,
         "total_payments": money_value(dated_cash + dated_nds),
@@ -5058,7 +5123,7 @@ def render_business_analytics(trips, shipments):
 
     st.markdown(
         '<div class="analytics-kpi-grid">'
-        '<div class="analytics-kpi-card"><div class="analytics-kpi-label">Рейсов за год</div>'
+        '<div class="analytics-kpi-card"><div class="analytics-kpi-label">Рейсов учтено за год</div>'
         '<div class="analytics-kpi-value">' + s(data["total_trips"]) + '</div></div>'
         '<div class="analytics-kpi-card"><div class="analytics-kpi-label">Нал + эквайринг</div>'
         '<div class="analytics-kpi-value">' + fmt_money(data["total_cash_acq"]) + ' ₽</div></div>'
@@ -5069,6 +5134,49 @@ def render_business_analytics(trips, shipments):
         '</div>',
         unsafe_allow_html=True,
     )
+
+    # Поясняем разницу между сквозным номером рейса и количеством в аналитике.
+    max_trip_no = int(to_float(data.get("max_trip_number", 0)))
+    excluded_count = len(data.get("trip_count_excluded", []))
+    missing_nums = data.get("missing_trip_numbers", [])
+    if max_trip_no > 0 and max_trip_no != int(data.get("total_trips", 0)):
+        st.info(
+            "Последний присвоенный № рейса: " + str(max_trip_no)
+            + ". В аналитику за " + str(selected_year) + " год вошло: "
+            + str(data.get("total_trips", 0))
+            + ". № рейса — это сквозной порядковый номер созданного рейса, "
+            + "а не счётчик строк в выбранном году."
+        )
+        with st.expander(
+            "🔎 Почему № рейса " + str(max_trip_no)
+            + ", а в аналитике " + str(data.get("total_trips", 0))
+        ):
+            st.caption(
+                "В годовую аналитику входят только неудалённые рейсы с корректной "
+                "датой выезда выбранного года. Ниже показаны пронумерованные рейсы, "
+                "которые не вошли в текущий годовой счётчик."
+            )
+            control_rows = []
+            for r in data.get("trip_count_excluded", []):
+                control_rows.append({
+                    "№ рейса": r.get("trip_number") or "—",
+                    "Тягач": r.get("tractor") or "—",
+                    "Водитель": r.get("driver") or "—",
+                    "Маршрут": r.get("route") or "—",
+                    "Дата выезда": r.get("date_departure") or "—",
+                    "Почему не вошёл": r.get("reason") or "—",
+                })
+            if control_rows:
+                st.dataframe(pd.DataFrame(control_rows), use_container_width=True, hide_index=True)
+            else:
+                st.success("Пронумерованных исключённых рейсов не найдено.")
+            if missing_nums:
+                st.warning(
+                    "В последовательности номеров отсутствуют: "
+                    + ", ".join(str(x) for x in missing_nums[:50])
+                    + (" …" if len(missing_nums) > 50 else "")
+                    + ". Это может означать, что строка была физически удалена из таблицы."
+                )
 
     # Единый порядок категорий для ВСЕХ графиков: январь → декабрь слева направо.
     month_order = [short for _, _, short in ANALYTICS_MONTHS]
@@ -5285,7 +5393,7 @@ def inject_responsive_ui_css():
         header[data-testid="stHeader"] { background: rgba(243,244,246,.94); }
         .block-container {
             max-width: 1500px;
-            padding-top: 0.65rem;
+            padding-top: 3.75rem;
             padding-bottom: 2.2rem;
         }
         .app-title-wrap {
@@ -5453,7 +5561,7 @@ def inject_responsive_ui_css():
         hr { border-color: #dedede !important; }
 
         @media (max-width: 768px) {
-            .block-container { padding-left: 0.65rem; padding-right: 0.65rem; padding-top: 0.45rem; }
+            .block-container { padding-left: 0.65rem; padding-right: 0.65rem; padding-top: 3.35rem; }
             .app-title-wrap { padding: 12px 13px; border-radius: 11px; }
             .app-title { font-size: 1.38rem; }
             .app-title-sub { font-size: .78rem; }
@@ -5881,7 +5989,7 @@ def main_page():
             open_key = "open_details_" + s(trip_id)
             is_open = st.session_state.get(open_key, False)
 
-            # v2.17.12 — расшифровка платежей без даты в аналитике.
+            # v2.17.13 — расшифровка платежей без даты в аналитике.
             col_no, col_hdr, col_btn = st.columns([1.15, 11.0, 1.0])
             with col_no:
                 st.markdown(
