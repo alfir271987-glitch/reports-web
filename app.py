@@ -1,6 +1,8 @@
 # ============================================================
-# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.17.16
+# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.17.17
 # Streamlit + Google Sheets
+# v2.17.17: пересчёт по актуальному «Кому», аннулирование старых отметок сдачи
+#           при изменении суммы/получателя и обновление полей редактора.
 # v2.17.16: кнопка «Наличные к сдаче», отметки «Сдано» и журнал сдачи в отдельном листе.
 # v2.17.15: сводка наличных по ФИО получателя (только активные и завершённые рейсы).
 # v2.17.10: функционал v2.17.9 сохранён без изменений;
@@ -1494,7 +1496,7 @@ def update_shipment(shipment_id, position, car_model, client, amount,
                     payer_type, customer, contract_number,
                     nds_amount, amount_no_nds,
                     advance_2=0, advance_date_2="", paid_to_2="",
-                    payments=None):
+                    payments=None, user_login=""):
     ws = get_ws_cached("shipments")
     row_idx = _find_row_index_by_id("shipments", shipment_id)
     if row_idx is None:
@@ -1571,6 +1573,9 @@ def update_shipment(shipment_id, position, car_model, client, amount,
     ]
     ws.batch_update(payload, value_input_option="USER_ENTERED")
     invalidate_cache("shipments")
+    # Старая отметка «Сдано» не должна относиться к новому ФИО или сумме.
+    retire_changed_cash_handover_keys(
+        current, parts, payer_type, amount_val, user_login=user_login)
     return True
 
 
@@ -1624,6 +1629,8 @@ def save_car_payments(shipment_id, payments, role=None, user_login=""):
     ws = get_ws_cached("shipments")
     ws.batch_update(payload, value_input_option="USER_ENTERED")
     invalidate_cache("shipments")
+    retire_changed_cash_handover_keys(
+        ship, parts, ship.get("payer_type", ""), amount, user_login=user_login)
     if user_login:
         log_action(user_login, s(role), "edit_car_payments",
                    "shipment " + s(shipment_id) + " | оплачено " + fmt_money(total) + " ₽")
@@ -3800,7 +3807,12 @@ def _render_edit_car_form(ctx, car):
         f["customer"], f["contract_number"], nds, no_nds,
         advance_2=p2["amount"], advance_date_2=p2["date"],
         paid_to_2=p2["paid_to"], payments=payments,
+        user_login=ctx["user_login"],
     )
+    # Форма со статическими ключами не должна сохранять прежнее «Кому».
+    for state_key in list(st.session_state.keys()):
+        if state_key.startswith("editcar_" + sid + "_"):
+            st.session_state.pop(state_key, None)
     log_action(ctx["user_login"], ctx["role"], "edit_ship",
                "рейс " + s(ctx["trip_id"]) + ", поз " + s(f["position"])
                + ", оплачено " + fmt_money(total_paid) + " ₽")
@@ -4048,7 +4060,12 @@ def _render_car_payment_editor(ctx, car):
         return
 
     st.session_state.pop(key, None)
-    st.success("Платежи сохранены. Долг пересчитан автоматически.")
+    # При повторном открытии формы всегда показываем значения из Google Sheets.
+    for index in range(3):
+        for field in ("amt", "date", "to", "comment"):
+            st.session_state.pop(
+                "v216_pf_" + field + "_" + sid + "_" + str(index), None)
+    st.success("Платежи и наличные по ФИО пересчитаны автоматически.")
     st.rerun()
 
 
@@ -5612,7 +5629,7 @@ def inject_responsive_ui_css():
 # ============================================================
 
 # ============================================================
-# НАЛИЧНЫЕ К СДАЧЕ — v2.17.16
+# НАЛИЧНЫЕ К СДАЧЕ — v2.17.17
 # Новый cash_handovers — журнал СОБЫТИЙ, старые оплаты не изменяются.
 # ============================================================
 
@@ -5632,17 +5649,94 @@ def cash_payment_key(detail):
 
 
 def cash_handover_current(rows):
-    """Последнее событие для каждого платежа: surrendered или restored.
+    """Последняя отметка по платежу с учётом отмены устаревшей записи.
 
-    Поддержка возврата ошибочно отмеченных записей без удаления истории.
+    «superseded» означает, что изменились ФИО, сумма или тип оплаты.
+    Старое подтверждение больше не влияет на новые наличные, но остаётся
+    в журнале Google Sheets как история действий.
     """
     current = {}
     for row in rows or []:
         key = s(row.get("payment_key", "")).strip()
         action = s(row.get("action", "")).strip()
-        if key and action in ("surrendered", "restored"):
+        if key and action in ("surrendered", "restored", "superseded"):
             current[key] = dict(row) if action == "surrendered" else None
     return {key: event for key, event in current.items() if event is not None}
+
+
+def cash_payment_keys_for_parts(shipment_id, payer_type, amount_limit, parts):
+    """Отпечатки только наличных платежей с защитой от старых переплат."""
+    if s(payer_type).strip().casefold() != "нал" or not shipment_id:
+        return set()
+    remaining = max(0.0, money_value(amount_limit))
+    keys = set()
+    for number, payment in enumerate(normalize_car_payments(parts), start=1):
+        accepted = min(max(0.0, money_value(payment.get("amount", 0))), remaining)
+        remaining = max(0.0, remaining - accepted)
+        if accepted > 0.01:
+            keys.add(cash_payment_key({
+                "shipment_id": shipment_id,
+                "payment_number": number,
+                "amount": accepted,
+                "person": s(payment.get("paid_to", "")).strip(),
+            }))
+    return keys
+
+
+def cash_current_payment_keys(shipments):
+    """Все актуальные наличные (включая архив для истории сдачи)."""
+    keys = set()
+    for shipment in shipments or []:
+        if is_trace_row(shipment):
+            continue
+        keys.update(cash_payment_keys_for_parts(
+            s(shipment.get("id", "")).strip(), shipment.get("payer_type", ""),
+            shipment.get("amount", 0), _analytics_car_payments(shipment)))
+    return keys
+
+
+def retire_changed_cash_handover_keys(old_shipment, new_parts,
+                                     new_payer_type, new_amount,
+                                     user_login=""):
+    """После редактирования гасит старые отметки «Сдано» в отдельном журнале.
+
+    Исходные суммы платежей и история рейса не удаляются. При ошибке Google
+    отчёт всё равно сверяет отметки с текущими платежами, поэтому дубля нет.
+    """
+    if not old_shipment:
+        return 0
+    shipment_id = s(old_shipment.get("id", "")).strip()
+    old_keys = cash_payment_keys_for_parts(
+        shipment_id, old_shipment.get("payer_type", ""),
+        old_shipment.get("amount", 0), _analytics_car_payments(old_shipment))
+    new_keys = cash_payment_keys_for_parts(
+        shipment_id, new_payer_type, new_amount, new_parts)
+    changed_keys = old_keys - new_keys
+    if not changed_keys:
+        return 0
+    try:
+        ledger = read_all("cash_handovers", fresh=True)
+        confirmed = cash_handover_current(ledger)
+        invalid = [confirmed[key] for key in changed_keys if key in confirmed]
+        if not invalid:
+            return 0
+        headers = SHEET_SCHEMAS["cash_handovers"]
+        rows = []
+        for old_event in invalid:
+            event = dict(old_event)
+            event.update({
+                "id": new_uuid(),
+                "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "action": "superseded",
+                "user_login": s(user_login) or "SYSTEM",
+            })
+            rows.append([event.get(name, "") for name in headers])
+        get_ws_cached("cash_handovers").append_rows(rows, value_input_option="RAW")
+        invalidate_cache("cash_handovers")
+        return len(rows)
+    except Exception as exc:
+        _log_system_error("retire_cash_handover", "cash_handovers", exc)
+        return 0
 
 
 def build_driver_cash_report(trips, shipments, surrendered_keys=None):
@@ -5774,6 +5868,11 @@ def render_driver_cash_report(trips, shipments):
     """Управление наличными к сдаче, без корректировки исходных оплат."""
     handover_rows = read_all("cash_handovers")
     handed_over = cash_handover_current(handover_rows)
+    # Отметки по прежнему ФИО/сумме скрываются даже после правки таблицы
+    # вручную. В архиве сохраняются только актуальные подтверждённые суммы.
+    live_keys = cash_current_payment_keys(shipments)
+    handed_over = {key: event for key, event in handed_over.items()
+                   if key in live_keys}
     summary, details = build_driver_cash_report(trips, shipments, handed_over)
     user = st.session_state["user"]
     can_confirm = s(user.get("role", "")) in ("admin", "director")
