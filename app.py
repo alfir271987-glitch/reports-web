@@ -1,6 +1,7 @@
 # ============================================================
-# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.17.15
+# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.17.16
 # Streamlit + Google Sheets
+# v2.17.16: кнопка «Наличные к сдаче», отметки «Сдано» и журнал сдачи в отдельном листе.
 # v2.17.15: сводка наличных по ФИО получателя (только активные и завершённые рейсы).
 # v2.17.10: функционал v2.17.9 сохранён без изменений;
 #           убран голубой фон интерфейса; основной фон нейтральный бело-серый;
@@ -71,6 +72,12 @@ SHEET_SCHEMAS = {
                          "cancelled"],
     "audit_log": ["id", "ts", "login", "role", "action", "details"],
     "act_log": ["id", "ts", "login", "trip_id", "shipment_id", "client"],
+    # Только журнал фактической сдачи наличных. Исходные платежи не меняются.
+    "cash_handovers": ["id", "ts", "action", "payment_key", "trip_id",
+                       "trip_number", "shipment_id", "payment_number",
+                       "recipient", "amount", "payment_date",
+                       "tractor", "driver", "route", "car_model",
+                       "vin", "client", "user_login"],
 }
 
 ROLES = ["admin", "director", "logist", "dispatcher"]
@@ -5605,61 +5612,76 @@ def inject_responsive_ui_css():
 # ============================================================
 
 # ============================================================
-# СВОДКА НАЛИЧНЫХ У ПОЛУЧАТЕЛЕЙ — v2.17.15
-# Только реальные введённые платежи типа "нал"; без дополнительных колонок.
+# НАЛИЧНЫЕ К СДАЧЕ — v2.17.16
+# Новый cash_handovers — журнал СОБЫТИЙ, старые оплаты не изменяются.
 # ============================================================
 
-def build_driver_cash_report(trips, shipments):
-    """Группирует записанные наличные по полю «Кому» на активных и завершённых рейсах.
+def cash_payment_key(detail):
+    """Устойчивый ключ одного платежа, не зависит от рейса после переноса.
 
-    Не считает эквайринг, безнал, архив, удалённые рейсы, следы переносов
-    и дубли автомобилей. Суммы платежей ограничены стоимостью перевозки
-    той же проверкой, что и в годовой аналитике. Дата для этой сводки
-    не обязательна: она нужна для месячной аналитики, но не для контроля
-    выданных водителям наличных.
+    Сумма и получатель входят в ключ: при их исправлении платёж снова появится
+    в контроле к сдаче, чтобы старая отметка не скрыла уже другую сумму.
+    Изменение только даты не сбрасывает подтверждённую сдачу.
     """
+    shipment_id = s(detail.get("shipment_id", "")).strip()
+    number = int(to_float(detail.get("payment_number", 0)))
+    cents = int(round(money_value(detail.get("amount", 0)) * 100))
+    recipient = re.sub(r"\s+", " ", s(detail.get("person", "")).strip()).casefold()
+    content = "|".join([shipment_id, str(number), str(cents), recipient])
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def cash_handover_current(rows):
+    """Последнее событие для каждого платежа: surrendered или restored.
+
+    Поддержка возврата ошибочно отмеченных записей без удаления истории.
+    """
+    current = {}
+    for row in rows or []:
+        key = s(row.get("payment_key", "")).strip()
+        action = s(row.get("action", "")).strip()
+        if key and action in ("surrendered", "restored"):
+            current[key] = dict(row) if action == "surrendered" else None
+    return {key: event for key, event in current.items() if event is not None}
+
+
+def build_driver_cash_report(trips, shipments, surrendered_keys=None):
+    """Сводка только НЕСДАННЫХ наличных по активным и завершённым рейсам.
+
+    Платежи с пометкой «Сдано» не попадают сюда, но остаются исходными
+    платежами в рейсах и продолжают учитываться в финансовой аналитике.
+    """
+    surrendered_keys = set(surrendered_keys or ())
     eligible_trips = {}
     for trip in trips or []:
         if is_deleted(trip.get("deleted_at", "")) or is_archived(trip.get("archived", "0")):
             continue
         tid = s(trip.get("id", "")).strip()
-        if not tid:
-            continue
-        eligible_trips[tid] = (
-            trip, "Завершённый" if check_completed(trip.get("completed", "0")) else "Активный"
-        )
+        if tid:
+            eligible_trips[tid] = (
+                trip, "Завершённый" if check_completed(trip.get("completed", "0")) else "Активный"
+            )
 
     cars_by_trip, _, _ = _analytics_unique_shipments_by_trip(shipments or [])
-    groups = {}
-    details = []
+    groups, details = {}, []
     for tid, (trip, trip_status) in eligible_trips.items():
         for car in cars_by_trip.get(tid, []):
             if s(car.get("payer_type", "")).strip().casefold() != "нал":
+                continue
+            shipment_id = s(car.get("id", "")).strip()
+            if not shipment_id:
                 continue
             for part_no, payment in enumerate(_analytics_car_payments(car), start=1):
                 amount = money_value(payment.get("amount", 0))
                 if amount <= 0.01:
                     continue
                 person = re.sub(r"\s+", " ", s(payment.get("paid_to", "")).strip())
-                key = person.casefold() if person else "__NO_RECIPIENT__"
-                if key not in groups:
-                    groups[key] = {
-                        "person": person or "⚠️ Получатель не указан",
-                        "active": 0.0,
-                        "completed": 0.0,
-                        "total": 0.0,
-                        "count": 0,
-                        "missing": not bool(person),
-                    }
-                g = groups[key]
-                g["active" if trip_status == "Активный" else "completed"] += amount
-                g["total"] += amount
-                g["count"] += 1
-                details.append({
+                detail = {
                     "person": person or "⚠️ Получатель не указан",
                     "status": trip_status,
                     "trip_number": s(trip.get("trip_number", "")).strip() or "—",
                     "trip_id": tid,
+                    "shipment_id": shipment_id,
                     "tractor": s(trip.get("tractor_number", "")).strip(),
                     "driver": s(trip.get("driver", "")).strip(),
                     "route": s(trip.get("route", "")).strip(),
@@ -5669,87 +5691,201 @@ def build_driver_cash_report(trips, shipments):
                     "payment_number": part_no,
                     "date": s(payment.get("date", "")).strip(),
                     "amount": amount,
-                })
-
-    summary = sorted(groups.values(), key=lambda g: (-g["total"], g["person"].casefold()))
-    for g in summary:
+                }
+                detail["payment_key"] = cash_payment_key(detail)
+                if detail["payment_key"] in surrendered_keys:
+                    continue
+                key = person.casefold() if person else "__NO_RECIPIENT__"
+                if key not in groups:
+                    groups[key] = {
+                        "person": person or "⚠️ Получатель не указан",
+                        "active": 0.0, "completed": 0.0, "total": 0.0,
+                        "count": 0, "missing": not bool(person),
+                    }
+                group = groups[key]
+                group["active" if trip_status == "Активный" else "completed"] += amount
+                group["total"] += amount
+                group["count"] += 1
+                details.append(detail)
+    summary = sorted(groups.values(), key=lambda group: (-group["total"], group["person"].casefold()))
+    for group in summary:
         for field in ("active", "completed", "total"):
-            g[field] = money_value(g[field])
-    details.sort(key=lambda r: (r["person"].casefold(), r["trip_number"], r["payment_number"]))
+            group[field] = money_value(group[field])
+    details.sort(key=lambda row: (row["person"].casefold(), row["trip_number"], row["payment_number"]))
     return summary, details
 
 
+def record_cash_handover(entries, action, user):
+    """Записывает один или несколько событий одной операцией; история неизменяемая.
+
+    Повторное нажатие проверяется на свежих данных. Ошибки записи не скрываются.
+    """
+    role = s(user.get("role", ""))
+    if role not in ("admin", "director"):
+        raise PermissionError("Подтверждать сдачу денег могут администратор и директор.")
+    if action not in ("surrendered", "restored"):
+        raise ValueError("Недопустимое действие журнала наличных")
+    ledger = read_all("cash_handovers", fresh=True)
+    current = cash_handover_current(ledger)
+    rows = []
+    for entry in entries:
+        key = s(entry.get("payment_key", "")).strip()
+        if not key:
+            continue
+        if action == "surrendered" and key in current:
+            continue
+        if action == "restored" and key not in current:
+            continue
+        if action == "surrendered" and s(entry.get("person", "")).startswith("⚠️"):
+            raise ValueError("Сначала заполните поле «Кому» у платежа автомобиля.")
+        rows.append({
+            "id": new_uuid(),
+            "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "action": action,
+            "payment_key": key,
+            "trip_id": s(entry.get("trip_id", "")),
+            "trip_number": s(entry.get("trip_number", "")),
+            "shipment_id": s(entry.get("shipment_id", "")),
+            "payment_number": s(entry.get("payment_number", "")),
+            "recipient": s(entry.get("person", entry.get("recipient", ""))),
+            "amount": money_value(entry.get("amount", 0)),
+            "payment_date": s(entry.get("date", entry.get("payment_date", ""))),
+            "tractor": s(entry.get("tractor", "")),
+            "driver": s(entry.get("driver", "")),
+            "route": s(entry.get("route", "")),
+            "car_model": s(entry.get("car", entry.get("car_model", ""))),
+            "vin": s(entry.get("vin", "")),
+            "client": s(entry.get("client", "")),
+            "user_login": s(user.get("login", "")),
+        })
+    if not rows:
+        return 0
+    headers = SHEET_SCHEMAS["cash_handovers"]
+    ws = get_ws_cached("cash_handovers")
+    ws.append_rows([[row.get(h, "") for h in headers] for row in rows], value_input_option="RAW")
+    invalidate_cache("cash_handovers")
+    total = money_value(sum(money_value(row["amount"]) for row in rows))
+    log_action(s(user.get("login", "")), role, "cash_" + action,
+               "платежей: " + s(len(rows)) + " | сумма: " + fmt_money(total) + " ₽")
+    return len(rows)
+
+
 def render_driver_cash_report(trips, shipments):
-    """Управленческая расшифровка полученных водителями наличных без изменения базы."""
-    summary, details = build_driver_cash_report(trips, shipments)
-    st.markdown("### 💵 Наличные у водителей — активные и завершённые рейсы")
-    st.caption(
-        "Суммируются только фактически введённые платежи с типом «нал» по полю «Кому». "
-        "Архив, эквайринг, безнал и технические строки переносов исключены. "
-        "Дата платежа для этого отчёта не обязательна."
-    )
+    """Управление наличными к сдаче, без корректировки исходных оплат."""
+    handover_rows = read_all("cash_handovers")
+    handed_over = cash_handover_current(handover_rows)
+    summary, details = build_driver_cash_report(trips, shipments, handed_over)
+    user = st.session_state["user"]
+    can_confirm = s(user.get("role", "")) in ("admin", "director")
+
+    st.markdown("### 💵 Наличные к сдаче")
+    st.caption("Активные и завершённые рейсы. Только наличные (по полю «Кому»). "
+               "Здесь показываются ещё не сданные платежи; исходные оплаты не меняются.")
     if not summary:
-        st.info("В активных и завершённых рейсах нет записанных наличных платежей.")
-        return
+        st.success("Нет несданных наличных по активным и завершённым рейсам.")
+    for group_index, group in enumerate(summary):
+        key = s(group["person"]).casefold()
+        group_details = [row for row in details if s(row["person"]).casefold() == key]
+        with st.expander(
+            "👤 " + group["person"] + " — к сдаче " + fmt_money(group["total"]) + " ₽ "
+            "· платежей: " + s(group["count"]),
+            expanded=False,
+        ):
+            st.caption("Активные: " + fmt_money(group["active"]) + " ₽ | "
+                       "Завершённые: " + fmt_money(group["completed"]) + " ₽")
+            for row in group_details:
+                info_col, button_col = st.columns([5, 1])
+                with info_col:
+                    st.markdown(
+                        "**Рейс №" + s(row["trip_number"]) + "** · "
+                        + s(row["tractor"]) + " · " + s(row["driver"]) + " · "
+                        + s(row["status"]) + " · **Платёж №" + s(row["payment_number"])
+                        + ": " + fmt_money(row["amount"]) + " ₽**"
+                    )
+                    st.caption(
+                        "Маршрут: " + (s(row["route"]) or "—")
+                        + " | Авто: " + (s(row["car"]) or "—")
+                        + " | VIN: " + (s(row["vin"]) or "—")
+                        + " | Клиент: " + (s(row["client"]) or "—")
+                        + " | Дата получения: " + (s(row["date"]) or "не указана")
+                    )
+                with button_col:
+                    if st.button(
+                        "✅ Сдано", key="cash_done_" + row["payment_key"],
+                        disabled=not can_confirm or group["missing"],
+                        use_container_width=True,
+                        help="Отметить, что этот платёж фактически сдан в кассу",
+                    ):
+                        try:
+                            count = record_cash_handover([row], "surrendered", user)
+                            if count:
+                                st.toast("Сдача наличных записана", icon="✅")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error("Не удалось сохранить сдачу наличных: " + s(exc))
+            if can_confirm and not group["missing"] and len(group_details) > 1:
+                confirm_key = "cash_confirm_all_" + str(group_index)
+                st.checkbox("Подтверждаю, что вся указанная сумма сдана в кассу", key=confirm_key)
+                if st.button("✅ Сдано всё по " + group["person"],
+                             key="cash_done_all_" + str(group_index),
+                             disabled=not st.session_state.get(confirm_key, False)):
+                    try:
+                        count = record_cash_handover(group_details, "surrendered", user)
+                        if count:
+                            st.toast("Записана сдача " + s(count) + " платежей", icon="✅")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error("Не удалось сохранить сдачу наличных: " + s(exc))
 
-    active_total = money_value(sum(g["active"] for g in summary))
-    completed_total = money_value(sum(g["completed"] for g in summary))
-    unassigned_total = money_value(sum(g["total"] for g in summary if g["missing"]))
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Наличные · активные", fmt_money(active_total) + " ₽")
-    c2.metric("Наличные · завершённые", fmt_money(completed_total) + " ₽")
-    c3.metric("Всего записано наличными", fmt_money(active_total + completed_total) + " ₽")
+    if any(group["missing"] for group in summary):
+        st.warning("Некоторые наличные записаны без получателя. "
+                   "Сначала заполните «Кому» в рейсе → Оплата → платёж автомобиля.")
+    if not can_confirm:
+        st.info("Отмечать «Сдано» могут администратор и директор. Вам доступен просмотр.")
 
-    st.dataframe(
-        pd.DataFrame([
-            {
-                "Кому (ФИО из платежа)": g["person"],
-                "Активные рейсы": fmt_money(g["active"]) + " ₽",
-                "Завершённые рейсы": fmt_money(g["completed"]) + " ₽",
-                "Всего получено": fmt_money(g["total"]) + " ₽",
-                "Платежей": g["count"],
-            }
-            for g in summary
-        ]),
-        use_container_width=True,
-        hide_index=True,
-    )
-    if unassigned_total > 0.01:
-        st.warning(
-            "У платежей на " + fmt_money(unassigned_total) + " ₽ не заполнено поле «Кому». "
-            "Откройте расшифровку ниже и укажите получателя в оплате автомобиля."
-        )
-
-    with st.expander("🔎 Из каких рейсов и автомобилей сложились суммы наличных", expanded=False):
-        st.dataframe(
-            pd.DataFrame([
-                {
-                    "Кому": r["person"],
-                    "№ рейса": r["trip_number"],
-                    "Статус": r["status"],
-                    "Тягач": r["tractor"],
-                    "Водитель рейса": r["driver"],
-                    "Маршрут": r["route"],
-                    "Автомобиль": r["car"],
-                    "VIN": r["vin"],
-                    "Клиент": r["client"],
-                    "Платёж №": r["payment_number"],
-                    "Дата платежа": r["date"] or "—",
-                    "Сумма": fmt_money(r["amount"]) + " ₽",
-                }
-                for r in details
-            ]),
-            use_container_width=True,
-            hide_index=True,
-        )
-        st.caption("Данные берутся из раздела «Рейс → Оплата → Платёж №1/2/3 → Кому». "
-                   "Если ФИО написано по-разному, исправьте его в платеже для объединения строк.")
-
-    st.caption(
-        "Важно: отчёт показывает, **кому записаны наличные**, но не подтверждает, "
-        "что они уже сданы в кассу. Для учёта фактической сдачи нужна отдельная отметка «Сдано»."
-    )
+    with st.expander("📜 История сданных наличных", expanded=False):
+        history = sorted(handed_over.values(),
+                         key=lambda row: s(row.get("ts", "")), reverse=True)
+        if not history:
+            st.caption("Подтверждённых сдач пока нет.")
+        else:
+            for record in history:
+                c1, c2 = st.columns([5, 1])
+                with c1:
+                    st.markdown(
+                        "**Рейс №" + s(record.get("trip_number", "—"))
+                        + " · " + s(record.get("recipient", "—"))
+                        + " · " + fmt_money(record.get("amount", 0)) + " ₽**"
+                    )
+                    st.caption(
+                        "Платёж №" + s(record.get("payment_number", ""))
+                        + " | Тягач: " + s(record.get("tractor", ""))
+                        + " | Авто: " + s(record.get("car_model", ""))
+                        + " | Сдано: " + s(record.get("ts", ""))
+                        + " | Принял отметку: " + s(record.get("user_login", ""))
+                    )
+                with c2:
+                    if st.button("↩️ Вернуть", key="cash_restore_" + s(record["payment_key"]),
+                                 disabled=not can_confirm, help="Отменить ошибочную отметку «Сдано»"):
+                        try:
+                            count = record_cash_handover([record], "restored", user)
+                            if count:
+                                st.toast("Платёж возвращён в список к сдаче", icon="↩️")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error("Не удалось отменить отметку: " + s(exc))
     st.divider()
+
+
+def render_cash_handover_toggle(trips, shipments):
+    """Показывает только одну компактную кнопку вместо трёх верхних KPI."""
+    opened = bool(st.session_state.get("cash_handover_open", False))
+    if st.button("💵 Наличные к сдаче" + (" ▲ Свернуть" if opened else " ▼ Показать"),
+                 key="toggle_cash_handover", use_container_width=False):
+        st.session_state["cash_handover_open"] = not opened
+        st.rerun()
+    if st.session_state.get("cash_handover_open", False):
+        render_driver_cash_report(trips, shipments)
 
 
 def main_page():
@@ -5946,9 +6082,9 @@ def main_page():
     shipments = get_shipments()
     transfer_history = get_transfer_history()
 
-    # Общая сводка по ФИО получателей наличных, независимо от выбранного фильтра.
+    # Наличные к сдаче по активным/завершённым: кнопка вместо верхней строки с KPI.
     if view_mode in ("active", "completed"):
-        render_driver_cash_report(trips, shipments)
+        render_cash_handover_toggle(trips, shipments)
 
     col_p1, col_p2, col_p3 = st.columns([1, 1, 4])
     with col_p1:
