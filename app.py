@@ -1,6 +1,7 @@
 # ============================================================
-# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.17.14
+# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.17.15
 # Streamlit + Google Sheets
+# v2.17.15: сводка наличных по ФИО получателя (только активные и завершённые рейсы).
 # v2.17.10: функционал v2.17.9 сохранён без изменений;
 #           убран голубой фон интерфейса; основной фон нейтральный бело-серый;
 #           зелёный используется для успешных/оплаченных состояний, красный — для долга/ошибок.
@@ -5603,6 +5604,154 @@ def inject_responsive_ui_css():
 # v2.15.0: верхняя навигация + компактная мобильная карточка
 # ============================================================
 
+# ============================================================
+# СВОДКА НАЛИЧНЫХ У ПОЛУЧАТЕЛЕЙ — v2.17.15
+# Только реальные введённые платежи типа "нал"; без дополнительных колонок.
+# ============================================================
+
+def build_driver_cash_report(trips, shipments):
+    """Группирует записанные наличные по полю «Кому» на активных и завершённых рейсах.
+
+    Не считает эквайринг, безнал, архив, удалённые рейсы, следы переносов
+    и дубли автомобилей. Суммы платежей ограничены стоимостью перевозки
+    той же проверкой, что и в годовой аналитике. Дата для этой сводки
+    не обязательна: она нужна для месячной аналитики, но не для контроля
+    выданных водителям наличных.
+    """
+    eligible_trips = {}
+    for trip in trips or []:
+        if is_deleted(trip.get("deleted_at", "")) or is_archived(trip.get("archived", "0")):
+            continue
+        tid = s(trip.get("id", "")).strip()
+        if not tid:
+            continue
+        eligible_trips[tid] = (
+            trip, "Завершённый" if check_completed(trip.get("completed", "0")) else "Активный"
+        )
+
+    cars_by_trip, _, _ = _analytics_unique_shipments_by_trip(shipments or [])
+    groups = {}
+    details = []
+    for tid, (trip, trip_status) in eligible_trips.items():
+        for car in cars_by_trip.get(tid, []):
+            if s(car.get("payer_type", "")).strip().casefold() != "нал":
+                continue
+            for part_no, payment in enumerate(_analytics_car_payments(car), start=1):
+                amount = money_value(payment.get("amount", 0))
+                if amount <= 0.01:
+                    continue
+                person = re.sub(r"\s+", " ", s(payment.get("paid_to", "")).strip())
+                key = person.casefold() if person else "__NO_RECIPIENT__"
+                if key not in groups:
+                    groups[key] = {
+                        "person": person or "⚠️ Получатель не указан",
+                        "active": 0.0,
+                        "completed": 0.0,
+                        "total": 0.0,
+                        "count": 0,
+                        "missing": not bool(person),
+                    }
+                g = groups[key]
+                g["active" if trip_status == "Активный" else "completed"] += amount
+                g["total"] += amount
+                g["count"] += 1
+                details.append({
+                    "person": person or "⚠️ Получатель не указан",
+                    "status": trip_status,
+                    "trip_number": s(trip.get("trip_number", "")).strip() or "—",
+                    "trip_id": tid,
+                    "tractor": s(trip.get("tractor_number", "")).strip(),
+                    "driver": s(trip.get("driver", "")).strip(),
+                    "route": s(trip.get("route", "")).strip(),
+                    "car": s(car.get("car_model", "")).strip(),
+                    "vin": s(car.get("vin", "")).strip(),
+                    "client": s(car.get("client", "")).strip(),
+                    "payment_number": part_no,
+                    "date": s(payment.get("date", "")).strip(),
+                    "amount": amount,
+                })
+
+    summary = sorted(groups.values(), key=lambda g: (-g["total"], g["person"].casefold()))
+    for g in summary:
+        for field in ("active", "completed", "total"):
+            g[field] = money_value(g[field])
+    details.sort(key=lambda r: (r["person"].casefold(), r["trip_number"], r["payment_number"]))
+    return summary, details
+
+
+def render_driver_cash_report(trips, shipments):
+    """Управленческая расшифровка полученных водителями наличных без изменения базы."""
+    summary, details = build_driver_cash_report(trips, shipments)
+    st.markdown("### 💵 Наличные у водителей — активные и завершённые рейсы")
+    st.caption(
+        "Суммируются только фактически введённые платежи с типом «нал» по полю «Кому». "
+        "Архив, эквайринг, безнал и технические строки переносов исключены. "
+        "Дата платежа для этого отчёта не обязательна."
+    )
+    if not summary:
+        st.info("В активных и завершённых рейсах нет записанных наличных платежей.")
+        return
+
+    active_total = money_value(sum(g["active"] for g in summary))
+    completed_total = money_value(sum(g["completed"] for g in summary))
+    unassigned_total = money_value(sum(g["total"] for g in summary if g["missing"]))
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Наличные · активные", fmt_money(active_total) + " ₽")
+    c2.metric("Наличные · завершённые", fmt_money(completed_total) + " ₽")
+    c3.metric("Всего записано наличными", fmt_money(active_total + completed_total) + " ₽")
+
+    st.dataframe(
+        pd.DataFrame([
+            {
+                "Кому (ФИО из платежа)": g["person"],
+                "Активные рейсы": fmt_money(g["active"]) + " ₽",
+                "Завершённые рейсы": fmt_money(g["completed"]) + " ₽",
+                "Всего получено": fmt_money(g["total"]) + " ₽",
+                "Платежей": g["count"],
+            }
+            for g in summary
+        ]),
+        use_container_width=True,
+        hide_index=True,
+    )
+    if unassigned_total > 0.01:
+        st.warning(
+            "У платежей на " + fmt_money(unassigned_total) + " ₽ не заполнено поле «Кому». "
+            "Откройте расшифровку ниже и укажите получателя в оплате автомобиля."
+        )
+
+    with st.expander("🔎 Из каких рейсов и автомобилей сложились суммы наличных", expanded=False):
+        st.dataframe(
+            pd.DataFrame([
+                {
+                    "Кому": r["person"],
+                    "№ рейса": r["trip_number"],
+                    "Статус": r["status"],
+                    "Тягач": r["tractor"],
+                    "Водитель рейса": r["driver"],
+                    "Маршрут": r["route"],
+                    "Автомобиль": r["car"],
+                    "VIN": r["vin"],
+                    "Клиент": r["client"],
+                    "Платёж №": r["payment_number"],
+                    "Дата платежа": r["date"] or "—",
+                    "Сумма": fmt_money(r["amount"]) + " ₽",
+                }
+                for r in details
+            ]),
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.caption("Данные берутся из раздела «Рейс → Оплата → Платёж №1/2/3 → Кому». "
+                   "Если ФИО написано по-разному, исправьте его в платеже для объединения строк.")
+
+    st.caption(
+        "Важно: отчёт показывает, **кому записаны наличные**, но не подтверждает, "
+        "что они уже сданы в кассу. Для учёта фактической сдачи нужна отдельная отметка «Сдано»."
+    )
+    st.divider()
+
+
 def main_page():
     inject_responsive_ui_css()
 
@@ -5796,6 +5945,10 @@ def main_page():
     trips = get_trips()
     shipments = get_shipments()
     transfer_history = get_transfer_history()
+
+    # Общая сводка по ФИО получателей наличных, независимо от выбранного фильтра.
+    if view_mode in ("active", "completed"):
+        render_driver_cash_report(trips, shipments)
 
     col_p1, col_p2, col_p3 = st.columns([1, 1, 4])
     with col_p1:
