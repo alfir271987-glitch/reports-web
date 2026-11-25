@@ -1,142 +1,128 @@
-                if not is_trace_row(_car):
-                    total_paid_value += calculate_financials(_car)["paid_value"]
+# ============================================================
+# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.17.19
+# Streamlit + Google Sheets
+# v2.17.19: город доставки и ФИО клиента в заголовках автомобилей и платежей.
+# v2.17.17: пересчёт по актуальному «Кому», аннулирование старых отметок сдачи
+#           при изменении суммы/получателя и обновление полей редактора.
+# v2.17.18: аудит пропущенных наличных, архив, поиск по ФИО, защита от VIN-дедупликации.
+# v2.17.15: сводка наличных по ФИО получателя (только активные и завершённые рейсы).
+# v2.17.10: функционал v2.17.9 сохранён без изменений;
+#           убран голубой фон интерфейса; основной фон нейтральный бело-серый;
+#           зелёный используется для успешных/оплаченных состояний, красный — для долга/ошибок.
+# ============================================================
 
-            trip_ctx = {
-                "trip": t,
-                "trip_id": trip_id,
-                "trip_number": trip_number,
-                "tractor": tractor,
-                "driver": driver,
-                "route": route,
-                "dep": dep,
-                "ret": ret,
-                "loading_from": loading_from,
-                "loading_contract_number": loading_contract_number,
-                "payment_date": payment_date,
-                "payment_comment": payment_comment,
-                "trip_completed": trip_completed,
-                "trip_completed_at": trip_completed_at,
-                "trip_inv_num": trip_inv_num,
-                "trip_inv_date": trip_inv_date,
-                "cars": cars,
-                "trips": trips,
-                "shipments": shipments,
-                "transfer_history": transfer_history,
-                "total": total,
-                "total_advance": total_advance,
-                "total_paid_value": total_paid_value,
-                "total_debt": total_debt,
-                "total_nds": total_nds,
-                "active_count": active_count,
-                "issued_count": issued_count,
-                "outgoing_count": outgoing_count,
-                "incoming_count": incoming_count,
-                "incoming_on_route": incoming_on_route,
-                "total_in_route": total_in_route,
-                "free_pos": free_pos,
-                "has_nds": has_nds,
-                "payments_info": payments_info,
-                "view_mode": view_mode,
-                "role": role,
-                "user_login": u["login"],
-            }
+import streamlit as st
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+from datetime import datetime, timedelta
+import hashlib
+import hmac
+import uuid
+import os
+import time
+from pathlib import Path
+import re
+import html
+import pandas as pd
+import altair as alt
 
-            render_trip_workspace(trip_ctx)
+SHEET_ID = "1MHslz3VRowoOLtS_AAQ5h-tFm-fIXBN8noqtyQpmKLw"
+CRED_FILE = "gifted-mountain-508410-s3-96f38b5a0f63.json"
 
-            st.markdown("---")
+SCOPES = [
+    "https://spreadsheets.google.com/feeds",
+    "https://www.googleapis.com/auth/drive",
+]
 
-    # ============================================================
-    # ИТОГИ
-    # ============================================================
-    st.markdown("---")
+SHEET_SCHEMAS = {
+    "users": ["login", "password_hash", "role", "full_name", "active",
+              "failed_attempts", "locked_until"],
+    # A=id, B=tractor_number, C=driver, D=route, E=date_departure, F=date_return,
+    # G=created_by, H=created_at, I=archived, J=completed, K=completed_at,
+    # L=invoice_number, M=invoice_date, N=deleted_at, O=loading_from,
+    # P=payment_date, Q=payment_comment,
+    # R=pay1_amount, S=pay1_date, T=pay1_comment,
+    # U=pay2_amount, V=pay2_date, W=pay2_comment,
+    # X=pay3_amount, Y=pay3_date, Z=pay3_comment,
+    # AA=loading_contract_number, AB=trip_number
+    "trips": ["id", "tractor_number", "driver", "route",
+              "date_departure", "date_return", "created_by", "created_at",
+              "archived", "completed", "completed_at",
+              "invoice_number", "invoice_date", "deleted_at",
+              "loading_from",
+              "payment_date", "payment_comment",
+              "pay1_amount", "pay1_date", "pay1_comment",
+              "pay2_amount", "pay2_date", "pay2_comment",
+              "pay3_amount", "pay3_date", "pay3_comment",
+              "loading_contract_number", "trip_number"],
+    "shipments": ["id", "trip_id", "position", "car_model", "client",
+                  "amount", "date_pay", "paid_to",
+                  "delivery_city", "vin",
+                  "advance", "advance_date",
+                  "payer_type", "customer", "contract_number",
+                  "nds_amount", "amount_no_nds",
+                  "created_by", "created_at", "issued", "issued_ever",
+                  "paid", "archived", "paid_amount",
+                  "invoice_number", "invoice_date",
+                  "transferred_to_trip", "transferred_at",
+                  "transferred_from_trip",
+                  "advance_2", "advance_date_2", "paid_to_2",
+                  "car_pay1_amount", "car_pay1_date", "car_pay1_to", "car_pay1_comment",
+                  "car_pay2_amount", "car_pay2_date", "car_pay2_to", "car_pay2_comment",
+                  "car_pay3_amount", "car_pay3_date", "car_pay3_to", "car_pay3_comment"],
+    "transfer_history": ["id", "ts", "shipment_id", "from_trip", "to_trip",
+                         "from_position", "to_position", "user_login", "note",
+                         "cancelled"],
+    "audit_log": ["id", "ts", "login", "role", "action", "details"],
+    "act_log": ["id", "ts", "login", "trip_id", "shipment_id", "client"],
+    # Только журнал фактической сдачи наличных. Исходные платежи не меняются.
+    "cash_handovers": ["id", "ts", "action", "payment_key", "trip_id",
+                       "trip_number", "shipment_id", "payment_number",
+                       "recipient", "amount", "payment_date",
+                       "tractor", "driver", "route", "car_model",
+                       "vin", "client", "user_login"],
+}
 
-    totals_data = compute_grand_totals(trips, shipments)
+ROLES = ["admin", "director", "logist", "dispatcher"]
+ROLE_LABELS = {
+    "admin": "Администратор",
+    "director": "Директор",
+    "logist": "Логист",
+    "dispatcher": "Диспетчер",
+}
+VIEW_LABELS = {
+    "active": "🚛 Активные рейсы",
+    "completed": "✅ Завершённые рейсы",
+    "archive": "📦 Архив",
+}
+PAYER_TYPES = ["нал", "эквайринг", "безнал с НДС 22%"]
+NDS_RATE = 0.22
+NDS_PAYER = "безнал с НДС 22%"
+MAX_CARS = 8
+CACHE_TTL = 300
+LOGIN_MAX_ATTEMPTS = 5
+LOGIN_LOCK_MINUTES = 15
 
-    spacer, totals = st.columns([1, 2])
-    with totals:
-        debt_nal = totals_data["debt_nal"]
-        debt_beznal = totals_data["debt_beznal"]
-        nds_beznal = totals_data["nds_beznal"]
-
-        st.markdown(
-            '<div style="background:#f5f5f5; border:1px solid #cccccc; '
-            'border-radius:8px; padding:14px 18px; font-size:14px;">'
-
-            '<div style="font-size:18px; font-weight:bold; margin-bottom:8px;">'
-            'Итого</div>'
-
-            '<div style="display:flex; justify-content:space-between; margin:4px 0; flex-wrap:wrap;">'
-            '<span>Активных рейсов:</span><b>'
-            + s(totals_data["active_trips"]) + '</b></div>'
-
-            '<div style="display:flex; justify-content:space-between; margin:4px 0; flex-wrap:wrap;">'
-            '<span>Авто:</span><b>'
-            + s(totals_data["active_cars"]) + '</b></div>'
-
-            '<div style="display:flex; justify-content:space-between; margin:4px 0; flex-wrap:wrap;">'
-            '<span>Общая оплата (по активным рейсам):</span><b style="color:#2e7d32;">'
-            + fmt_money(totals_data["total_paid"]) + ' ₽</b></div>'
-
-            '<div style="display:flex; justify-content:space-between; margin:4px 0; '
-            'border-top:1px solid #cccccc; padding-top:6px; flex-wrap:wrap;">'
-            '<span><b>Задолженность нал / эквайринг</b> (активные):</span>'
-            '<b style="color:' + ("#c62828" if debt_nal > 0.01 else "#2e7d32") + ';">'
-            + fmt_money(debt_nal) + ' ₽</b></div>'
-
-            '<div style="display:flex; justify-content:space-between; margin:4px 0; flex-wrap:wrap;">'
-            '<span><b>Задолженность безнал (с НДС)</b> '
-            '(активные + завершённые неоплаченные):</span>'
-            '<b style="color:' + ("#c62828" if debt_beznal > 0.01 else "#2e7d32") + ';">'
-            + fmt_money(debt_beznal) + ' ₽</b></div>'
-
-            '<div style="display:flex; justify-content:space-between; margin:4px 0; flex-wrap:wrap;">'
-            '<span><b>НДС 22%</b> (по безналу):</span>'
-            '<b style="color:' + ("#c62828" if nds_beznal > 0.01 else "#2e7d32") + ';">'
-            + fmt_money(nds_beznal) + ' ₽</b></div>'
-
-            '</div>',
-            unsafe_allow_html=True,
-        )
-
-    # Управленческая аналитика — ниже итогов.
-    render_business_analytics(trips, shipments)
+MAX_PAY_SPLITS = 3
+PAY_SPLIT_LABELS = ["аванс", "доплата", "остаток"]
 
 
 # ============================================================
-# ТОЧКА ВХОДА
+# УТИЛИТЫ
 # ============================================================
 
-def main():
-    st.set_page_config(page_title="Учёт рейсов", page_icon="🚛", layout="wide")
+def s(x):
+    if x is None:
+        return ""
+    return str(x)
 
-    if not st.session_state.get("sheets_ready"):
-        try:
-            _gspread_call_with_retry(
-                ensure_sheets_once,
-                operation="проверка структуры Google Sheets",
-                attempts=5,
-            )
-            st.session_state["sheets_ready"] = True
-        except gspread.exceptions.APIError as e:
-            st.error(_google_api_help_text(e, "проверка структуры Google Sheets"))
-            st.info("Данные в Google Sheets не изменялись и не удалялись.")
-            st.stop()
-        except Exception as e:
-            st.error("Ошибка подключения к Google Sheets: "
-                     + type(e).__name__ + ": " + s(e))
-            st.stop()
 
+def to_float(x):
+    if x is None:
+        return 0.0
+    if isinstance(x, (int, float)):
+        return float(x)
     try:
-        ensure_first_admin()
-        if "user" not in st.session_state:
-            login_page()
-        else:
-            main_page()
-    except gspread.exceptions.APIError as e:
-        st.error(_google_api_help_text(e, "работа с Google Sheets"))
-        st.info("Это ошибка доступа/квоты Google API, а не потеря данных приложения.")
-        st.stop()
-
-
-if __name__ == "__main__":
-    main()
+        t = str(x).strip()
+    except Exception:
+        return 0.0
