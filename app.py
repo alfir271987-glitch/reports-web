@@ -1,5 +1,5 @@
 # ============================================================
-# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.17.18
+# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.17.20
 # Streamlit + Google Sheets
 # v2.17.17: пересчёт по актуальному «Кому», аннулирование старых отметок сдачи
 #           при изменении суммы/получателя и обновление полей редактора.
@@ -3871,7 +3871,10 @@ def render_trip_cars_section(ctx):
         sid = s(car.get("id"))
         client = s(car.get("client", "")) or s(car.get("customer", "")) or "—"
         title = ("Поз. " + s(car.get("position", "")) + " · "
-                 + s(car.get("car_model", "")) + " · " + status)
+                 + s(car.get("car_model", ""))
+                 + " · " + (s(car.get("delivery_city", "")).strip() or "Город не указан")
+                 + " · " + (s(car.get("client", "")).strip() or s(car.get("customer", "")).strip() or "ФИО не указано")
+                 + " · " + status)
 
         with st.expander(title, expanded=False):
             st.markdown(
@@ -4134,6 +4137,8 @@ def render_trip_payment_section(ctx):
         title_status = "✅ оплачено" if fin["debt"] <= 0.01 else "🔴 долг " + fmt_money(fin["debt"]) + " ₽"
         with st.expander(
             "Поз. " + s(car.get("position", "")) + " · " + s(car.get("car_model", ""))
+            + " · " + (s(car.get("delivery_city", "")).strip() or "Город не указан")
+            + " · " + (s(car.get("client", "")).strip() or s(car.get("customer", "")).strip() or "ФИО не указано")
             + " · " + title_status,
             expanded=False,
         ):
