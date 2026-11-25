@@ -1,5 +1,5 @@
 # ============================================================
-# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.17.22
+# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.17.23
 # Streamlit + Google Sheets
 # v2.17.17: пересчёт по актуальному «Кому», аннулирование старых отметок сдачи
 #           при изменении суммы/получателя и обновление полей редактора.
@@ -6259,6 +6259,12 @@ def render_maintenance(user):
     div[data-testid="stFormSubmitButton"] button p {color:white!important;}
     .maint-summary {padding:18px;border:1px solid #dce3ed;border-radius:12px;background:#edf3fc;min-height:145px;}
     .maint-summary b {color:#174b91;}
+    .maint-history {overflow-x:auto;border:1px solid #d3dbe6;border-radius:8px;background:white;margin-bottom:8px;}
+    .maint-history table {width:100%;border-collapse:collapse;font-size:13px;color:#202124;margin:0;}
+    .maint-history th {background:#f0f3f8;font-weight:650;text-align:left;}
+    .maint-history th,.maint-history td {padding:9px 8px;border:1px solid #e1e5eb;vertical-align:top;overflow-wrap:anywhere;}
+    .maint-history th:first-child,.maint-history td:first-child {white-space:nowrap;}
+    .maint-history tbody tr:nth-child(even) {background:#fafbfd;}
     .maint-tire {padding:14px;border:1px solid #cde5d1;border-radius:10px;background:#edf7ee;}
     </style>""", unsafe_allow_html=True)
     st.header("🔧 Учёт ремонтов и ТО")
@@ -6361,13 +6367,28 @@ def render_maintenance(user):
                     st.rerun()
     with right:
         st.subheader("История обслуживания")
-        history=st.radio("Журнал",["ТО и ремонт","Замена резины","Все записи"],horizontal=True,key="maint_history_"+vehicle_id+unit)
+        history=st.radio("Журнал",["История ремонтов и ТО","Замена резины","Все записи"],horizontal=True,key="maint_history_"+vehicle_id+unit)
         search=st.text_input("Поиск по записям",key="maint_history_search_"+vehicle_id+unit).strip().casefold()
-        visible=[r for r in previous if (history=="Все записи" or (history=="Замена резины" and r.get("category")=="Шины") or (history=="ТО и ремонт" and r.get("category") in ("ТО","Текущий ремонт"))) and (not search or search in " ".join(s(v) for v in r.values()).casefold())]
+        visible=[r for r in previous if (history=="Все записи" or (history=="Замена резины" and r.get("category")=="Шины") or (history=="История ремонтов и ТО" and r.get("category") in ("ТО","Текущий ремонт"))) and (not search or search in " ".join(s(v) for v in r.values()).casefold())]
         cols={"date":"Дата","mileage":"Пробег, км","category":"Вид работ","parts":"Что меняли","work":"Работы","tire_size":"Размер шин","tire_brand":"Производитель","tire_position":"Ось","tire_count":"Кол-во","comment":"Примечание","mechanic":"Механик"}
         if visible:
             df=pd.DataFrame([{label:r.get(key,"") for key,label in cols.items()} for r in visible])
-            st.dataframe(df,use_container_width=True,hide_index=True)
+            # Компактная таблица как на макете; подробные поля остаются в CSV.
+            headings = ["Дата", "Пробег, км", "Вид работ", "Описание", "Сотрудник"]
+            if history == "Замена резины":
+                headings = ["Дата", "Пробег, км", "Размер шин", "Ось", "Описание", "Сотрудник"]
+            rows_html = []
+            for r in visible:
+                description = " · ".join(dict.fromkeys(s(r.get(k)).strip() for k in ("parts", "work") if s(r.get(k)).strip()))
+                if r.get("category") == "Шины":
+                    description = " · ".join(v for v in [description, s(r.get("tire_size")), s(r.get("tire_brand")), (s(r.get("tire_count")) + " шт.") if to_float(r.get("tire_count")) > 0 else ""] if v)
+                cells = [r.get("date"), km(r.get("mileage")).replace(" км", ""), r.get("category"), description, r.get("mechanic")]
+                if history == "Замена резины":
+                    cells = [r.get("date"), km(r.get("mileage")).replace(" км", ""), r.get("tire_size"), r.get("tire_position"), description, r.get("mechanic")]
+                rows_html.append("<tr>" + "".join("<td>" + esc(v or "—") + "</td>" for v in cells) + "</tr>")
+            st.markdown('<div class="maint-history"><table><thead><tr>' + "".join("<th>" + esc(h) + "</th>" for h in headings) + '</tr></thead><tbody>' + "".join(rows_html) + '</tbody></table></div>', unsafe_allow_html=True)
+            with st.expander("Подробные сведения о работах"):
+                st.dataframe(df,use_container_width=True,hide_index=True)
             st.download_button("Скачать журнал (CSV для Excel)",df.to_csv(index=False,sep=";").encode("utf-8-sig"),"maintenance.csv","text/csv")
         else: st.info("Записей нет.")
         st.markdown('<div class="maint-tire"><b>◉ Последняя замена резины</b><br><br>Дата: '+esc(last_tire.get("date") or "—")+' · Пробег: '+esc(km(last_tire.get("mileage")))+'<br>Размер: '+esc(last_tire.get("tire_size") or "—")+' · Производитель: '+esc(last_tire.get("tire_brand") or "—")+'<br>Ось: '+esc(last_tire.get("tire_position") or "—")+'</div>',unsafe_allow_html=True)
@@ -6380,19 +6401,32 @@ def main_page():
     role = u["role"]
     role_label = ROLE_LABELS.get(role, role)
 
-    st.sidebar.markdown("## 🚛 Учёт перевозок")
-    st.sidebar.markdown(
-        "**" + s(u["full_name"]) + "**  \n"
-        "Роль: **" + role_label + "**"
-    )
+    # Проверяем актуальные права до отображения любой навигации.
+    current_user = next((row for row in read_all("users")
+                         if s(row.get("login")) == s(u.get("login"))), None)
+    if not current_user or not is_active(current_user) or current_user.get("role") not in ROLES:
+        logout()
+        return
+    role = current_user["role"]
+    u = {"login": current_user["login"], "role": role, "full_name": current_user["full_name"]}
+    st.session_state["user"] = u
+    role_label = ROLE_LABELS.get(role, role)
 
-    # Механик не попадает в разделы рейсов, оплат и администрирования.
+    # Отдельная рабочая область: не вызываем загрузку рейсов или финансов.
     if role == "mechanic":
-        st.sidebar.markdown("### 🔧 Учёт ремонтов и ТО")
+        st.sidebar.markdown("## OkiCar")
+        st.sidebar.markdown("🔧 **Учёт ремонтов и ТО**")
+        st.sidebar.markdown("---")
+        st.sidebar.write(s(u["full_name"]))
+        st.sidebar.caption("Роль: Механик")
         if st.sidebar.button("🚪 Выйти", key="mechanic_logout", use_container_width=True):
             logout()
+            return
         render_maintenance(u)
         return
+
+    st.sidebar.markdown("## 🚛 Учёт перевозок")
+    st.sidebar.markdown("**" + s(u["full_name"]) + "**  \nРоль: **" + role_label + "**")
     if role in ("admin", "director"):
         section = st.sidebar.radio("Раздел приложения", ["Рейсы и перевозки", "🔧 Учёт ремонтов"], key="main_app_section")
         if section == "🔧 Учёт ремонтов":
