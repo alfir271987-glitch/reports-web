@@ -1,5 +1,5 @@
 # ============================================================
-# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.17.20
+# УЧЁТ РЕЙСОВ И ПЕРЕВОЗОК — v2.17.22
 # Streamlit + Google Sheets
 # v2.17.17: пересчёт по актуальному «Кому», аннулирование старых отметок сдачи
 #           при изменении суммы/получателя и обновление полей редактора.
@@ -34,6 +34,8 @@ SCOPES = [
 ]
 
 SHEET_SCHEMAS = {
+    "maintenance_fleet": ["id", "kind", "plate", "trailer", "model", "created_at", "created_by", "year", "photo_url"],
+    "maintenance_records": ["id", "date", "created_at", "fleet_id", "kind", "plate", "trailer", "unit", "target_plate", "mileage", "category", "parts", "work", "tire_size", "tire_brand", "tire_position", "tire_count", "comment", "mechanic", "created_by"],
     "users": ["login", "password_hash", "role", "full_name", "active",
               "failed_attempts", "locked_until"],
     # A=id, B=tractor_number, C=driver, D=route, E=date_departure, F=date_return,
@@ -82,12 +84,13 @@ SHEET_SCHEMAS = {
                        "vin", "client", "user_login"],
 }
 
-ROLES = ["admin", "director", "logist", "dispatcher"]
+ROLES = ["admin", "director", "logist", "dispatcher", "mechanic"]
 ROLE_LABELS = {
     "admin": "Администратор",
     "director": "Директор",
     "logist": "Логист",
     "dispatcher": "Диспетчер",
+    "mechanic": "Механик",
 }
 VIEW_LABELS = {
     "active": "🚛 Активные рейсы",
@@ -2603,7 +2606,7 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
                        total_in_route=None,
                        loading_from="", loading_contract_number="",
                        payment_date="", payment_comment="",
-                       payments_info=None):
+                       payments_info=None, delivery_cities=None):
     if active_count == 0 and issued_count == 0 and not has_transfers and incoming_count == 0:
         bg, bd = "#f8fafc", "#cbd5e1"
         payment_status_html = ""
@@ -2637,7 +2640,6 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
         if s(loading_contract_number):
             loading_title += " · договор № " + s(loading_contract_number)
         title_parts.append(loading_title)
-    title_parts.append(s(route))
     title_parts.append("выезд " + s(dep))
     title = " — ".join([p for p in title_parts if p])
     if ret:
@@ -2727,6 +2729,16 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
             '</div>'
         )
 
+    from html import escape as escape_html
+    route_text = s(route).strip()
+    if not route_text:
+        destinations = list(dict.fromkeys(s(c).strip() for c in (delivery_cities or []) if s(c).strip()))
+        route_label = "Города доставки" if destinations else "Маршрут"
+        route_text = " · ".join(destinations) or "Не указан"
+    else:
+        route_label = "Маршрут"
+    route_html = ('<div style="margin-top:5px;font-size:14px;font-weight:700;color:#202124;">'
+                  '📍 ' + route_label + ': ' + escape_html(route_text) + '</div>')
     loading_html = ""
     if s(loading_from):
         contract_html = (
@@ -2810,7 +2822,7 @@ def render_trip_header(trip_id, tractor, driver, route, dep, ret,
         '</div>'
         '<div>' + payment_status_html + badges + completed_html + '</div>'
         '</div>'
-        + loading_html +
+        + route_html + loading_html +
         '<div style="color:#333; margin-top:4px; display:flex; '
         'align-items:center; flex-wrap:wrap;">'
         '<div>' + stats + '</div>'
@@ -3239,7 +3251,7 @@ def admin_panel():
         with st.form("add_user"):
             new_login = st.text_input("Логин")
             new_pwd = st.text_input("Пароль", type="password")
-            new_role = st.selectbox("Роль", ROLES)
+            new_role = st.selectbox("Роль", ROLES, format_func=lambda r: ROLE_LABELS.get(r, r))
             new_name = st.text_input("ФИО")
             ok = st.form_submit_button("Создать")
         if ok:
@@ -6219,6 +6231,148 @@ def render_cash_handover_toggle(trips, shipments):
         render_driver_cash_report(trips, shipments)
 
 
+def maintenance_plate(value):
+    # Единый поиск независимо от пробелов, регистра и похожих латинских букв.
+    return re.sub(r"\s+", "", s(value).upper()).translate(str.maketrans("ABEKMHOPCTYX", "АВЕКМНОРСТУХ"))
+
+
+def maintenance_now():
+    from datetime import timezone
+    return datetime.now(timezone(timedelta(hours=5)))
+
+
+def render_maintenance(user):
+    role = user.get("role")
+    if role not in ("mechanic", "admin", "director"):
+        st.error("Нет доступа к учёту ремонтов")
+        return
+    editable = role in ("mechanic", "admin")
+    st.markdown("""<style>
+    .stApp {background:#f5f7fb;}
+    section[data-testid="stSidebar"] {background:#eef3fa;}
+    div[data-testid="stForm"] {background:#fff;border:1px solid #dce3ed;border-radius:12px;padding:16px;}
+    div[data-testid="stRadio"] div[role="radiogroup"] {background:#fff;gap:6px;flex-wrap:wrap;}
+    div[data-testid="stRadio"] label {padding:6px 10px;border:1px solid #dce3ed;border-radius:7px;}
+    div[data-testid="stRadio"] label:has(input:checked) {background:#dceaff;border-color:#1765db;}
+    div[data-testid="stRadio"] label:has(input:checked) p {color:#1455aa;font-weight:700;}
+    div[data-testid="stFormSubmitButton"] button {background:#0965df!important;color:white!important;border-radius:8px;}
+    div[data-testid="stFormSubmitButton"] button p {color:white!important;}
+    .maint-summary {padding:18px;border:1px solid #dce3ed;border-radius:12px;background:#edf3fc;min-height:145px;}
+    .maint-summary b {color:#174b91;}
+    .maint-tire {padding:14px;border:1px solid #cde5d1;border-radius:10px;background:#edf7ee;}
+    </style>""", unsafe_allow_html=True)
+    st.header("🔧 Учёт ремонтов и ТО")
+    st.caption(maintenance_now().strftime("%d.%m.%Y · %H:%M") + " (Уфа) · " + s(user.get("full_name")))
+    fleet = read_all("maintenance_fleet")
+    records = read_all("maintenance_records")
+    kind = st.radio("Тип техники", ["Самосвал", "Сцепка"], horizontal=True, key="maint_kind")
+    if editable:
+        with st.expander("➕ Добавить ТС"):
+            with st.form("maint_add_fleet", clear_on_submit=False):
+                a,b = st.columns(2)
+                plate = a.text_input("Г/н самосвала" if kind == "Самосвал" else "Г/н тягача")
+                trailer = b.text_input("Г/н полуприцепа") if kind == "Сцепка" else ""
+                model = a.text_input("Марка / модель")
+                year = b.text_input("Год выпуска (необязательно)")
+                photo = st.text_input("Ссылка на фотографию техники (HTTPS, необязательно)")
+                add = st.form_submit_button("Добавить технику")
+            if add:
+                plate, trailer = maintenance_plate(plate), maintenance_plate(trailer)
+                if not plate or (kind == "Сцепка" and (not trailer or trailer == plate)):
+                    st.error("Укажите государственные номера техники.")
+                elif photo.strip() and not photo.strip().startswith("https://"):
+                    st.error("Ссылка на фото должна начинаться с https://")
+                elif year.strip() and not re.fullmatch(r"[0-9]{4}", year.strip()):
+                    st.error("Укажите год четырьмя цифрами.")
+                elif any(s(r.get("kind")) == kind and maintenance_plate(r.get("plate")) == plate and maintenance_plate(r.get("trailer")) == trailer for r in read_all("maintenance_fleet", fresh=True)):
+                    st.warning("Такая техника уже есть.")
+                else:
+                    append_row("maintenance_fleet", {"id":new_uuid(),"kind":kind,"plate":plate,"trailer":trailer,"model":model.strip(),"year":year.strip(),"photo_url":photo.strip(),"created_at":maintenance_now().isoformat(),"created_by":user["login"]})
+                    log_action(user["login"],role,"maintenance_fleet_add",plate + " / " + trailer)
+                    st.rerun()
+    group = [r for r in fleet if s(r.get("kind")) == kind and s(r.get("id"))]
+    query = st.text_input("Поиск по г/н тягача, самосвала или полуприцепа", key="maint_plate_search")
+    q = maintenance_plate(query)
+    matching = sorted([r for r in group if not q or q in maintenance_plate(r.get("plate")) or q in maintenance_plate(r.get("trailer"))], key=lambda r:(s(r.get("plate")),s(r.get("trailer"))))
+    if not matching:
+        st.info("Нет техники по выбранному фильтру. Добавьте ТС." if editable else "Нет техники по выбранному фильтру.")
+        return
+    choices = {s(r["id"]):r for r in matching}
+    def fleet_label(key):
+        r=choices[key]
+        return s(r.get("plate")) + (" / " + s(r.get("trailer")) if kind == "Сцепка" else "")
+    # Горизонтальные вкладки-переключатели: отображается только выбранная техника.
+    vehicle_id = st.radio("Государственный номер",list(choices),format_func=fleet_label,horizontal=True,key="maint_vehicle_tabs_"+kind)
+    vehicle=choices[vehicle_id]
+    unit=st.radio("Обслуживаемая техника",["Тягач","Полуприцеп"] if kind=="Сцепка" else ["Самосвал"],horizontal=True,key="maint_unit_"+vehicle_id)
+    target=maintenance_plate(vehicle.get("trailer") if unit=="Полуприцеп" else vehicle.get("plate"))
+    previous=sorted([r for r in records if target and maintenance_plate(r.get("target_plate"))==target],key=lambda r:s(r.get("created_at")),reverse=True)
+    last=previous[0] if previous else {}
+    last_to=next((r for r in previous if r.get("category")=="ТО"),{})
+    last_tire=next((r for r in previous if r.get("category")=="Шины"),{})
+    def esc(v): return html.escape(s(v))
+    def km(v): return (f"{int(to_float(v)):,}".replace(","," ")+" км") if s(v).strip() else "—"
+    photo_col, details_col, summary_col=st.columns([1.2,1.7,2.7])
+    with photo_col:
+        photo=s(vehicle.get("photo_url")).strip()
+        if photo.startswith("https://"):
+            st.markdown('<img src="'+esc(photo)+'" style="width:100%;max-height:160px;object-fit:cover;border-radius:10px;" alt="Фото техники">',unsafe_allow_html=True)
+        else:
+            st.markdown('<div style="background:#e5eaf1;border-radius:10px;text-align:center;padding:32px 8px;font-size:36px;">🚛</div>',unsafe_allow_html=True)
+            st.caption("Фото не добавлено")
+    with details_col:
+        st.subheader(target)
+        st.write(unit + " · " + (s(vehicle.get("model")) or "Модель не указана"))
+        if vehicle.get("year"): st.caption("Год выпуска: " + s(vehicle.get("year")))
+        st.markdown("**Последний записанный пробег:** " + km(last.get("mileage")))
+    with summary_col:
+        st.markdown('<div class="maint-summary"><b>ⓘ Последнее ТО</b><br><br>Дата: '+esc(last_to.get("date") or "—")+'<br>Пробег: '+esc(km(last_to.get("mileage")))+'<br>Работы: '+esc(last_to.get("work") or last_to.get("parts") or "—")+'</div>',unsafe_allow_html=True)
+    if editable:
+        if st.session_state.pop("maint_saved",False): st.success("Запись сохранена")
+        left,right=st.columns([1,1.25])
+    else:
+        left=None; right=st.container()
+    if editable:
+        with left:
+            st.subheader("➕ Добавить запись")
+            category=st.radio("Вид работ",["ТО","Текущий ремонт","Шины"],horizontal=True,key="maint_category_"+vehicle_id+unit)
+            with st.form("maint_record_"+vehicle_id+unit+category,clear_on_submit=True):
+                st.caption("Дата автоматически: "+maintenance_now().strftime("%d.%m.%Y"))
+                mileage=st.number_input("Пробег, км",min_value=0,max_value=20000000,step=1,value=None)
+                parts=st.text_area("Что меняли / запчасти",height=85)
+                work=st.text_area("Какие работы проводили",height=85)
+                tire_size=tire_brand=tire_position=""; tire_count=0
+                if category=="Шины":
+                    a,b=st.columns(2)
+                    tire_size=a.text_input("Размер резины",placeholder="385/55 R22.5")
+                    tire_brand=b.text_input("Производитель шин")
+                    tire_position=a.text_input("Ось / место установки")
+                    tire_count=b.number_input("Количество шин",min_value=1,max_value=40,step=1)
+                comment=st.text_area("Примечание",height=85)
+                save=st.form_submit_button("💾 Сохранить запись",use_container_width=True)
+            if save:
+                if mileage is None or (category!="Шины" and not (parts.strip() or work.strip())) or (category=="Шины" and not tire_size.strip()):
+                    st.error("Укажите пробег, работы или детали; для шин обязателен размер.")
+                else:
+                    now=maintenance_now()
+                    append_row("maintenance_records",{"id":new_uuid(),"date":now.strftime("%d.%m.%Y"),"created_at":now.isoformat(),"fleet_id":vehicle_id,"kind":kind,"plate":maintenance_plate(vehicle.get("plate")),"trailer":maintenance_plate(vehicle.get("trailer")),"unit":unit,"target_plate":target,"mileage":int(mileage),"category":category,"parts":parts.strip(),"work":work.strip(),"tire_size":tire_size.strip(),"tire_brand":tire_brand.strip(),"tire_position":tire_position.strip(),"tire_count":tire_count,"comment":comment.strip(),"mechanic":user["full_name"],"created_by":user["login"]})
+                    log_action(user["login"],role,"maintenance_record_add",target+" / "+category)
+                    st.session_state["maint_saved"]=True
+                    st.rerun()
+    with right:
+        st.subheader("История обслуживания")
+        history=st.radio("Журнал",["ТО и ремонт","Замена резины","Все записи"],horizontal=True,key="maint_history_"+vehicle_id+unit)
+        search=st.text_input("Поиск по записям",key="maint_history_search_"+vehicle_id+unit).strip().casefold()
+        visible=[r for r in previous if (history=="Все записи" or (history=="Замена резины" and r.get("category")=="Шины") or (history=="ТО и ремонт" and r.get("category") in ("ТО","Текущий ремонт"))) and (not search or search in " ".join(s(v) for v in r.values()).casefold())]
+        cols={"date":"Дата","mileage":"Пробег, км","category":"Вид работ","parts":"Что меняли","work":"Работы","tire_size":"Размер шин","tire_brand":"Производитель","tire_position":"Ось","tire_count":"Кол-во","comment":"Примечание","mechanic":"Механик"}
+        if visible:
+            df=pd.DataFrame([{label:r.get(key,"") for key,label in cols.items()} for r in visible])
+            st.dataframe(df,use_container_width=True,hide_index=True)
+            st.download_button("Скачать журнал (CSV для Excel)",df.to_csv(index=False,sep=";").encode("utf-8-sig"),"maintenance.csv","text/csv")
+        else: st.info("Записей нет.")
+        st.markdown('<div class="maint-tire"><b>◉ Последняя замена резины</b><br><br>Дата: '+esc(last_tire.get("date") or "—")+' · Пробег: '+esc(km(last_tire.get("mileage")))+'<br>Размер: '+esc(last_tire.get("tire_size") or "—")+' · Производитель: '+esc(last_tire.get("tire_brand") or "—")+'<br>Ось: '+esc(last_tire.get("tire_position") or "—")+'</div>',unsafe_allow_html=True)
+
+
 def main_page():
     inject_responsive_ui_css()
 
@@ -6231,6 +6385,21 @@ def main_page():
         "**" + s(u["full_name"]) + "**  \n"
         "Роль: **" + role_label + "**"
     )
+
+    # Механик не попадает в разделы рейсов, оплат и администрирования.
+    if role == "mechanic":
+        st.sidebar.markdown("### 🔧 Учёт ремонтов и ТО")
+        if st.sidebar.button("🚪 Выйти", key="mechanic_logout", use_container_width=True):
+            logout()
+        render_maintenance(u)
+        return
+    if role in ("admin", "director"):
+        section = st.sidebar.radio("Раздел приложения", ["Рейсы и перевозки", "🔧 Учёт ремонтов"], key="main_app_section")
+        if section == "🔧 Учёт ремонтов":
+            if st.sidebar.button("🚪 Выйти", key="maintenance_logout", use_container_width=True):
+                logout()
+            render_maintenance(u)
+            return
 
     current_view = st.session_state.get("view_mode", "active")
     view_options = ["active", "completed", "archive"]
@@ -6604,6 +6773,7 @@ def main_page():
                 payment_date=payment_date,
                 payment_comment=payment_comment,
                 payments_info=payments_info,
+                delivery_cities=[x.get("delivery_city", "") for x in cars if not is_trace_row(x)],
             )
 
             open_key = "open_details_" + s(trip_id)
